@@ -1,0 +1,308 @@
+---
+title: "Malta Citizen Survey — Results"
+author: "Mariana Mauriño"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    code_folding: hide
+    number_sections: true
+---
+
+> Standalone survey-results notebook. Mirrors the "Citizen Survey Analysis"
+> section of `Malta_MCDA_260702_realloc.Rmd` (the canonical Malta MCDA
+> notebook) so the survey statistics can be viewed/rendered on their own,
+> without needing to run the full MCDA pipeline. Not part of the MCDA
+> weighting step itself — see `Malta_MCDA_260702_realloc.Rmd` for how these
+> results are turned into WLC weights.
+>
+> The "Green space behaviour" section below is **not** in
+> `Malta_MCDA_260702_realloc.Rmd` (which only analyses demographics + budget
+> allocation) — it's added here to match `Klagenfurt_MCDA_260520.Rmd`, which
+> does analyse the equivalent `visit-frequency`/`visit-reasons`/`green-nearby`
+> columns for Klagenfurt. The Malta survey has the same columns; they just
+> weren't analysed in the canonical Malta notebook.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 12,
+  fig.height = 6
+)
+
+library(tidyverse)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+```
+
+# Citizen Survey Analysis
+
+## Sample description
+
+The survey used a **budget-allocation method**: each respondent distributed a hypothetical €1,000 across 10 criteria for prioritizing green-space interventions.
+
+```{r load-survey}
+survey <- read_csv(
+  here::here("data/malta/maltasurvey_jun26.csv")
+)
+
+budget_cols <- c("Lack-recreational-facilities", "overcrowding", "poor-accessibility",
+                 "lack-blue-spaces", "poor-airquality", "noise-pollution",
+                 "urban-heat", "lack-street-greenery", "grey-infrastracture",
+                 "traffic-dominance")
+```
+
+```{r sample-description}
+cat("Total responses:", nrow(survey), "\n\n")
+
+survey_sums <- survey %>%
+  rowwise() %>%
+  mutate(total = sum(c_across(all_of(budget_cols)))) %>%
+  ungroup()
+
+cat("All budgets sum to €1,000:", all(survey_sums$total == 1000), "\n\n")
+```
+
+```{r demographics, fig.height=8}
+p_age <- ggplot(survey, aes(x = `age-group`)) +
+  geom_bar(fill = "#5DCAA5") +
+  labs(title = "Age group", x = NULL, y = "Count") +
+  theme_minimal()
+
+p_gender <- ggplot(survey, aes(x = gender)) +
+  geom_bar(fill = "#85B7EB") +
+  labs(title = "Gender", x = NULL, y = "Count") +
+  theme_minimal()
+
+p_resident <- ggplot(survey, aes(x = resident)) +
+  geom_bar(fill = "#F0997B") +
+  labs(title = "Residency status", x = NULL, y = "Count") +
+  theme_minimal()
+
+p_language <- ggplot(survey, aes(x = language)) +
+  geom_bar(fill = "#AFA9EC") +
+  labs(title = "Survey language", x = NULL, y = "Count") +
+  theme_minimal()
+
+(p_age + p_gender) / (p_resident + p_language) +
+  plot_annotation(title = paste0("Survey sample demographics (n = ", nrow(survey), ")"))
+```
+
+## Green space behaviour
+
+```{r green-space-behaviour, fig.height=9}
+freq_labels <- c("0" = "Never", "1" = "Once/week", "2-4" = "2–4×/week", "5-7" = "Daily")
+
+p_freq <- survey %>%
+  filter(!is.na(`visit-frequency`)) %>%
+  mutate(freq = factor(`visit-frequency`, levels = names(freq_labels), labels = freq_labels)) %>%
+  count(freq) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  ggplot(aes(x = freq, y = n)) +
+  geom_col(fill = "#5DCAA5") +
+  geom_text(aes(label = paste0(n, "\n(", pct, "%)")), vjust = -0.3, size = 3.2) +
+  labs(title = "How often do you visit green spaces?", x = NULL, y = "Respondents") +
+  ylim(0, max(table(survey$`visit-frequency`)) * 1.25) +
+  theme_minimal()
+
+p_nearby <- survey %>%
+  count(`green-nearby`) %>%
+  filter(!is.na(`green-nearby`)) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  ggplot(aes(x = `green-nearby`, y = n, fill = `green-nearby`)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = paste0(n, "\n(", pct, "%)")), vjust = -0.3, size = 3.2) +
+  scale_fill_manual(values = c("yes" = "#5DCAA5", "no" = "#D85A30")) +
+  labs(title = "Green space within walking distance?", x = NULL, y = "Respondents") +
+  theme_minimal()
+
+reasons_df <- survey %>%
+  filter(!is.na(`visit-reasons`)) %>%
+  mutate(
+    Relaxation = str_detect(`visit-reasons`, "relax"),
+    Social     = str_detect(`visit-reasons`, "friends"),
+    Sport      = str_detect(`visit-reasons`, "sport")
+  )
+
+p_reasons <- reasons_df %>%
+  summarise(Relaxation = sum(Relaxation),
+            Social     = sum(Social),
+            Sport      = sum(Sport)) %>%
+  pivot_longer(everything(), names_to = "reason", values_to = "n") %>%
+  mutate(pct = round(100 * n / nrow(reasons_df), 1)) %>%
+  ggplot(aes(x = reorder(reason, n), y = n, fill = reason)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = paste0(n, " (", pct, "%)")), hjust = -0.1, size = 3.2) +
+  scale_fill_manual(values = c(Relaxation = "#5DCAA5", Social = "#85B7EB", Sport = "#F0997B")) +
+  coord_flip() +
+  ylim(0, nrow(reasons_df) * 1.15) +
+  labs(title = "Why do you visit green spaces?",
+       subtitle = paste0("Multiple answers allowed; n = ", nrow(reasons_df), " with response"),
+       x = NULL, y = "Respondents") +
+  theme_minimal()
+
+p_combos <- survey %>%
+  filter(!is.na(`visit-reasons`)) %>%
+  count(`visit-reasons`, sort = TRUE) %>%
+  mutate(pct = round(100 * n / sum(n), 1),
+         lab = str_replace_all(`visit-reasons`, ", ", " + ")) %>%
+  ggplot(aes(x = reorder(lab, n), y = n)) +
+  geom_col(fill = "#AFA9EC") +
+  geom_text(aes(label = paste0(n, " (", pct, "%)")), hjust = -0.1, size = 3.2) +
+  coord_flip() +
+  ylim(0, max(table(survey$`visit-reasons`)) * 1.25) +
+  labs(title = "Reason combinations", x = NULL, y = "Respondents") +
+  theme_minimal()
+
+(p_freq + p_nearby) / (p_reasons + p_combos) +
+  plot_annotation(title = paste0("Green space behaviour and context — Malta (n = ", nrow(survey), ")"))
+```
+
+Neighbourhood of residence is broken out into its own figure below — 41 distinct
+neighbourhoods made it unreadably cramped as the third row of the combined plot above.
+
+```{r neighbourhood-plot, fig.height=8, fig.width=8}
+neigh_counts <- survey %>%
+  filter(!is.na(neighborhood)) %>%
+  count(neighborhood, sort = TRUE)
+
+n_singleton <- sum(neigh_counts$n == 1)
+other_label <- paste0("Other (", n_singleton, " neighbourhoods, 1 each)")
+
+neigh_named <- neigh_counts %>% filter(n > 1)
+neigh_levels <- c(other_label, rev(neigh_named$neighborhood))
+
+p_neigh <- neigh_named %>%
+  bind_rows(tibble(neighborhood = other_label, n = n_singleton)) %>%
+  mutate(neighborhood = factor(neighborhood, levels = neigh_levels),
+         is_other = neighborhood == other_label) %>%
+  ggplot(aes(x = neighborhood, y = n, fill = is_other)) +
+  geom_col() +
+  geom_text(aes(label = n), hjust = -0.2, size = 3) +
+  coord_flip() +
+  scale_fill_manual(values = c(`FALSE` = "#AFA9EC", `TRUE` = "#B0B0B0"), guide = "none") +
+  ylim(0, max(neigh_named$n, n_singleton) * 1.1) +
+  labs(title = "Neighbourhood of residence",
+       subtitle = paste0(dplyr::n_distinct(survey$neighborhood[!is.na(survey$neighborhood)]),
+                          " neighbourhoods, n = ", sum(!is.na(survey$neighborhood)), " respondents"),
+       x = NULL, y = "Respondents") +
+  theme_minimal()
+
+p_neigh
+```
+
+```{r green-space-behaviour-summary}
+cat("=== Visit frequency ===\n")
+survey %>%
+  filter(!is.na(`visit-frequency`)) %>%
+  count(`visit-frequency`) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  kable(col.names = c("Times/week", "n", "%"),
+        caption = "Green space visit frequency") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE) %>%
+  print()
+
+cat("\n=== Green space nearby ===\n")
+survey %>%
+  count(`green-nearby`) %>%
+  filter(!is.na(`green-nearby`)) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  kable(col.names = c("Nearby", "n", "%"),
+        caption = "Green space within walking distance") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE) %>%
+  print()
+
+cat("\n=== Visit frequency × nearby (cross-tab) ===\n")
+survey %>%
+  filter(!is.na(`green-nearby`), !is.na(`visit-frequency`)) %>%
+  count(`green-nearby`, `visit-frequency`) %>%
+  group_by(`green-nearby`) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  ungroup() %>%
+  kable(col.names = c("Nearby", "Frequency", "n", "%"),
+        caption = "Visit frequency by green space proximity") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE) %>%
+  print()
+```
+
+## Budget allocations
+
+```{r budget-summary}
+budget_summary <- survey %>%
+  select(all_of(budget_cols)) %>%
+  pivot_longer(everything(), names_to = "criterion", values_to = "allocation") %>%
+  group_by(criterion) %>%
+  summarise(
+    mean_alloc   = mean(allocation),
+    median_alloc = median(allocation),
+    sd_alloc     = sd(allocation),
+    min_alloc    = min(allocation),
+    max_alloc    = max(allocation),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_alloc)) %>%
+  mutate(weight_pct = round(100 * mean_alloc / sum(mean_alloc), 1))
+
+budget_summary %>%
+  mutate(across(where(is.numeric), ~round(., 1))) %>%
+  kable(caption = "Citizen budget allocations (€1,000 distributed across 10 criteria)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+```{r budget-plot, fig.height=6}
+survey %>%
+  select(all_of(budget_cols)) %>%
+  pivot_longer(everything(), names_to = "criterion", values_to = "allocation") %>%
+  mutate(criterion = str_replace_all(criterion, "-", " ") %>% str_to_title()) %>%
+  ggplot(aes(x = reorder(criterion, allocation, FUN = median), y = allocation)) +
+  geom_boxplot(fill = "#5DCAA5", alpha = 0.7, outlier.size = 1) +
+  coord_flip() +
+  labs(title = "Distribution of citizen budget allocations per criterion",
+       subtitle = paste0("n = ", nrow(survey), " respondents, €1,000 each"),
+       x = NULL, y = "Budget allocated (€)") +
+  theme_minimal()
+```
+
+## Are citizen weights significantly different from equal?
+
+```{r weight-significance}
+sig_results <- map_dfr(budget_cols, function(col) {
+  test <- t.test(survey[[col]], mu = 100)
+  tibble(
+    criterion = col,
+    mean      = mean(survey[[col]]),
+    ci_lower  = test$conf.int[1],
+    ci_upper  = test$conf.int[2],
+    p_value   = test$p.value,
+    sig       = ifelse(test$p.value < 0.05, "*", "")
+  )
+}) %>%
+  arrange(desc(mean))
+
+sig_results %>%
+  mutate(across(where(is.numeric), ~round(., 2))) %>%
+  kable(caption = "One-sample t-test: mean allocation vs €100 (equal weights)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+```{r weight-significance-plot, fig.height=6}
+sig_results %>%
+  mutate(criterion = str_replace_all(criterion, "-", " ") %>% str_to_title()) %>%
+  ggplot(aes(x = reorder(criterion, mean), y = mean)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2) +
+  geom_hline(yintercept = 100, linetype = "dashed", color = "#D85A30") +
+  coord_flip() +
+  labs(title = "Mean budget allocation with 95% confidence intervals",
+       subtitle = "Dashed line = equal weight (€100). CI outside = significantly different.",
+       x = NULL, y = "Mean allocation (€)") +
+  theme_minimal()
+```

@@ -1,0 +1,656 @@
+---
+title: "GoGreenNext MCDA — Main-text and Supplementary Tables"
+author: "Mariana Mauriño"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    theme: flatly
+    code_folding: hide
+    number_sections: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  warning = FALSE,
+  message = FALSE
+)
+
+library(knitr)
+library(kableExtra)
+library(dplyr)
+library(readr)
+
+data_dir <- here::here("data/malta")
+
+# ── try loading each required .rds object ─────────────────────────────────────
+load_rds <- function(name, path) {
+  if (file.exists(path)) {
+    readRDS(path)
+  } else {
+    message(sprintf("MISSING: %s (%s)", name, path))
+    NULL
+  }
+}
+
+malta_survey_summary <- load_rds("malta_survey_summary",
+                                  file.path(data_dir, "outputs", "malta_survey_summary.rds"))
+klag_survey_summary  <- load_rds("klag_survey_summary",
+                                  file.path(data_dir, "outputs", "klag_survey_summary.rds"))
+malta_sensitivity    <- load_rds("malta_sensitivity",
+                                  file.path(data_dir, "malta_sensitivity.rds"))
+klag_sensitivity     <- load_rds("klag_sensitivity",
+                                  file.path(data_dir, "klag_sensitivity.rds"))
+
+# ── track which objects are present ───────────────────────────────────────────
+obj_status <- list(
+  malta_survey_summary = !is.null(malta_survey_summary),
+  klag_survey_summary  = !is.null(klag_survey_summary),
+  malta_sensitivity    = !is.null(malta_sensitivity),
+  klag_sensitivity     = !is.null(klag_sensitivity)
+)
+
+# ── shared helpers ─────────────────────────────────────────────────────────────
+format_pval <- function(p) {
+  ifelse(is.na(p), "—",
+         ifelse(p < 0.001, "<0.001", sprintf("%.2f", p)))
+}
+
+# alternating grey on odd body rows
+shade_rows <- function(kbl, n, colour = "#F2F2F2") {
+  row_spec(kbl, row = seq(1, n, by = 2), background = colour)
+}
+
+booktabs_style <- function(kbl, font = 9) {
+  kable_styling(kbl,
+    bootstrap_options = c("striped", "hover"),
+    full_width        = FALSE,
+    font_size         = font
+  )
+}
+```
+
+---
+
+# Build status
+
+```{r status-checklist, results='asis'}
+# ── print checklist ────────────────────────────────────────────────────────────
+cat("<div style='font-family:monospace; border:1px solid #ccc; padding:12px; background:#fafafa;'>\n")
+cat("<strong>Object availability</strong><br><br>\n")
+
+check <- function(ok, name) {
+  icon <- if (ok) "&#9989;" else "&#10060;"
+  cat(sprintf("%s &nbsp; <code>%s</code><br>\n", icon, name))
+}
+for (nm in names(obj_status)) check(obj_status[[nm]], nm)
+
+if (!all(unlist(obj_status))) {
+  cat("<br><strong>Required <code>saveRDS()</code> calls — add to the indicated notebook then re-knit:</strong><br><br>\n")
+
+  if (!obj_status$malta_survey_summary) {
+    cat("<em>→ Malta_MCDA_260504.Rmd — after the <code>weight-significance</code> chunk:</em><br>\n")
+    cat("<pre>")
+    cat("malta_survey_summary <- map_dfr(budget_cols, function(col) {\n")
+    cat("  test <- t.test(survey[[col]], mu = 100)\n")
+    cat("  tibble(\n")
+    cat("    criterion  = col,\n")
+    cat("    mean_alloc = mean(survey[[col]]) / 10,   # % of €1,000\n")
+    cat("    ci_lower   = test$conf.int[1] / 10,\n")
+    cat("    ci_upper   = test$conf.int[2] / 10,\n")
+    cat("    t_stat     = as.numeric(test$statistic),\n")
+    cat("    p_value    = test$p.value,\n")
+    cat("    direction  = ifelse(mean(survey[[col]]) > 100, '↑', '↓')\n")
+    cat("  )\n")
+    cat("}) %>% arrange(desc(mean_alloc))\n")
+    cat("saveRDS(malta_survey_summary,\n")
+    cat("        file.path(data_dir, 'malta_survey_summary.rds'))\n")
+    cat("</pre>\n")
+    cat("Note: <code>criterion</code> should be a human-readable label (e.g. 'Street greenery',\n")
+    cat("not the raw column name). Recode before saving if needed.<br><br>\n")
+  }
+
+  if (!obj_status$klag_survey_summary) {
+    cat("<em>→ Klagenfurt_MCDA_260520.Rmd — after the <code>weight-significance</code> chunk:</em><br>\n")
+    cat("<pre>")
+    cat("klag_survey_summary <- map_dfr(budget_cols, function(col) {\n")
+    cat("  test <- t.test(survey_clean[[col]], mu = 1000000 / length(budget_cols))\n")
+    cat("  tibble(\n")
+    cat("    criterion  = col,\n")
+    cat("    mean_alloc = mean(survey_clean[[col]], na.rm = TRUE) / 10000,  # % of €1,000,000\n")
+    cat("    ci_lower   = test$conf.int[1] / 10000,\n")
+    cat("    ci_upper   = test$conf.int[2] / 10000,\n")
+    cat("    t_stat     = as.numeric(test$statistic),\n")
+    cat("    p_value    = test$p.value,\n")
+    cat("    direction  = ifelse(mean(survey_clean[[col]], na.rm=TRUE) > 1000000/6, '↑', '↓')\n")
+    cat("  )\n")
+    cat("}) %>% arrange(desc(mean_alloc))\n")
+    cat("saveRDS(klag_survey_summary,\n")
+    cat("        file.path(data_dir, 'klag_survey_summary.rds'))\n")
+    cat("</pre>\n")
+    cat("Note: recode <code>criterion</code> to human-readable labels before saving.<br><br>\n")
+  }
+
+  if (!obj_status$malta_sensitivity) {
+    cat("<em>→ Malta_MCDA_260504.Rmd — replace the <code>sensitivity-summary-table</code> chunk body with:</em><br>\n")
+    cat("<pre>")
+    cat("malta_sensitivity <- tibble(\n")
+    cat("  test_name = c(\n")
+    cat("    '±20% weight perturbation (range)',\n")
+    cat("    'WLC without traffic (9 criteria)',\n")
+    cat("    'Traffic: categorical vs log',\n")
+    cat("    'E2SFCA vs Euclidean distance',\n")
+    cat("    'Citizen vs equal weights'\n")
+    cat("  ),\n")
+    cat("  spearman_r = c(\n")
+    cat("    paste0(round(min(sensitivity_results$spearman_r), 3), '–',\n")
+    cat("           round(max(sensitivity_results$spearman_r), 3)),\n")
+    cat("    as.character(round(r_no_traffic_s, 3)),\n")
+    cat("    as.character(round(r_traffic_sens, 3)),   # or NA_character_ if not computed\n")
+    cat("    as.character(round(r_suff_s, 3)),\n")
+    cat("    as.character(round(r_equal_sens, 3))\n")
+    cat("  ),\n")
+    cat("  class_agreement = c(\n")
+    cat("    paste0(round(min(sensitivity_results$top_q_overlap), 1), '–',\n")
+    cat("           round(max(sensitivity_results$top_q_overlap), 1), '%'),\n")
+    cat("    paste0(agree_no_traffic_s, '%'),\n")
+    cat("    paste0(agree_traffic_sens, '%'),   # or NA_character_ if not computed\n")
+    cat("    paste0(agree_suff_s, '%'),\n")
+    cat("    paste0(agree_equal_sens, '%')\n")
+    cat("  )\n")
+    cat(")\n")
+    cat("saveRDS(malta_sensitivity,\n")
+    cat("        file.path(data_dir, 'malta_sensitivity.rds'))\n")
+    cat("</pre>\n")
+  }
+
+  if (!obj_status$klag_sensitivity) {
+    cat("<em>→ Klagenfurt_MCDA_260520.Rmd — replace the <code>sensitivity-summary-k</code> chunk body with:</em><br>\n")
+    cat("<pre>")
+    cat("klag_sensitivity <- tibble(\n")
+    cat("  test_name = c(\n")
+    cat("    '±20% weight perturbation (range)',\n")
+    cat("    'WLC without traffic (6 criteria)',\n")
+    cat("    'Traffic: categorical vs log',\n")
+    cat("    'Income: raw vs population-weighted',\n")
+    cat("    'Citizen vs equal weights'\n")
+    cat("  ),\n")
+    cat("  spearman_r = c(\n")
+    cat("    paste0(round(min(sensitivity_results$spearman_r), 3), '–',\n")
+    cat("           round(max(sensitivity_results$spearman_r), 3)),\n")
+    cat("    as.character(round(r_no_traffic_k, 3)),\n")
+    cat("    as.character(round(r_traffic_k, 3)),\n")
+    cat("    as.character(round(r_income_k, 3)),\n")
+    cat("    as.character(round(r_equal_k, 3))\n")
+    cat("  ),\n")
+    cat("  class_agreement = c(\n")
+    cat("    paste0(round(min(sensitivity_results$top_q_overlap), 1), '–',\n")
+    cat("           round(max(sensitivity_results$top_q_overlap), 1), '%'),\n")
+    cat("    paste0(agree_no_traffic_k, '%'),\n")
+    cat("    paste0(agree_traffic_k, '%'),\n")
+    cat("    paste0(agree_income_k, '%'),\n")
+    cat("    paste0(agree_equal_k, '%')\n")
+    cat("  )\n")
+    cat(")\n")
+    cat("saveRDS(klag_sensitivity,\n")
+    cat("        file.path(data_dir, 'klag_sensitivity.rds'))\n")
+    cat("</pre>\n")
+  }
+}
+
+cat("</div>\n")
+```
+
+---
+
+# Table 1 — Criteria and Indicators
+
+```{r table1}
+t1_data <- tibble(
+  Criterion = c(
+    "Urban heat",
+    "Street greenery",
+    "Grey infrastructure",
+    "Traffic",
+    "Air quality — NO\\u2082",
+    "Air quality — PM\\u2082.\\u2085",
+    "Low income",
+    "Blue space access",
+    "Green space proximity",
+    "Green space overcrowding",
+    "Recreational facilities",
+    "Noise"
+  ),
+  Cities = c(
+    "Both",
+    "Both",
+    "Malta",
+    "Both",
+    "Both",
+    "Klagenfurt",
+    "Klagenfurt",
+    "Both",
+    "Both",
+    "Malta",
+    "Both",
+    "Malta"
+  ),
+  Indicator = c(
+    "Land Surface Temperature (°C, annual mean)",
+    "Street tree cover (%)",
+    "Imperviousness density (%)",
+    "Traffic volume (major roads)",
+    "Annual mean NO₂ (µg/m³)",
+    "Annual mean PM₂.₅ (µg/m³)",
+    "Spatially weighted median household income (€)",
+    "Euclidean distance to nearest blue space (m)",
+    "Minimum walking-network distance to nearest public green space (min)",
+    "Per-person availability of green space (m²/person)",
+    "Distance to nearest recreational facility (m)",
+    "Environmental noise exposure — Lden (dB)"
+  ),
+  `Processing method` = c(
+    "Landsat 8 USGS via Google Earth Engine, 2021; resampled to 100m grid",
+    "Urban Atlas 2018 street tree layer; percentage per grid cell; no further processing",
+    "Urban Atlas 2021; mean imperviousness per grid cell",
+    "Open Transport Map 2015 (Malta); [TODO Klagenfurt source]; categorical normalization: none / moderate / high",
+    "ERA passive diffusion network (Malta); EXPANSE/ELAPSE LUR models (Klagenfurt); 2018 and 2021",
+    "EXPANSE/ELAPSE LUR models; 2018 and 2021",
+    "AMDC / Statistik Austria 2022; population-weighted median per grid cell",
+    "EU-Hydro via EXPANSE Project 2011",
+    "ATGreen Engine; Urban Atlas 2018 green-space classes; 5/10/15-min budgets at 5 km/h",
+    "ATGreen Engine E2SFCA; OSM green spaces ≥500 m²; nested 3-band weights (1.0/0.7/0.4); PRELIMINARY — Euclidean proxy",
+    "OpenStreetMap 2024; Euclidean distance to nearest OSM leisure/sport tag",
+    "ERA strategic noise maps 2021; rasterized to 100m grid"
+  )
+)
+
+tbl1 <- kable(
+  t1_data,
+  format    = "html",
+  booktabs  = TRUE,
+  linesep   = "",
+  escape    = FALSE,
+  caption   = "Table 1. Spatial indicators used in the multi-criteria framework. All indicators harmonized to a common 100 m × 100 m grid. Full data-source provenance is given in Supplementary Table S1.",
+  col.names = c("Criterion", "Cities", "Indicator", "Processing method")
+) %>%
+  booktabs_style() %>%
+  row_spec(0, background = "#595959", color = "white", bold = TRUE) %>%
+  shade_rows(nrow(t1_data)) %>%
+  column_spec(1, width = "20%") %>%
+  column_spec(2, width = "10%") %>%
+  column_spec(3, width = "30%") %>%
+  column_spec(4, width = "40%")
+
+tbl1
+
+footnote(
+  tbl1,
+  general = "ATGreen = routing-based accessibility engine. ERA = Environment and Resources Authority (Malta). EXPANSE/ELAPSE = EU-funded land-use regression model projects. OSM = OpenStreetMap. PRELIMINARY: the per-person availability indicator currently uses a Euclidean-distance proxy pending the network-routed E2SFCA pipeline.",
+  general_title = "",
+  footnote_as_chunk = TRUE
+)
+
+save_kable(tbl1, "Table1_criteria_indicators.html", self_contained = TRUE)
+```
+
+---
+
+# Table 2 — Top-quintile indicator contributions
+
+```{r table2-topquintile, results='asis'}
+library(sf)
+library(purrr)
+
+outputs_dir <- file.path(data_dir, "outputs")
+
+# ── load grids and survey summaries ──────────────────────────────────────────
+# Reallocated population version (canonical for Malta; same criteria and priority_citizen as
+# the non reallocated file, checked 2026-11-03)
+malta_grid <- readRDS(file.path(data_dir, "malta_mcda_processed_realloc.rds"))
+klag_grid  <- readRDS(here::here("data/klagenfurt/klagenfurt_mcda_priority_may.rds"))
+malta_srv  <- readRDS(file.path(outputs_dir, "malta_survey_summary.rds"))
+klag_srv   <- readRDS(file.path(outputs_dir, "klag_survey_summary.rds"))
+
+# ── indicator → norm-column mappings \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# Malta: survey_criterion uses dot-encoded names (read.csv converts hyphens)
+malta_map <- tibble::tribble(
+  ~display_label,              ~norm_col,         ~survey_criterion,
+  "Urban heat",                "norm_lst",         "urban.heat",
+  "Street greenery",           "norm_tree",        "lack.street.greenery",
+  "Grey infrastructure",       "norm_imd",         "grey.infrastracture",
+  "Traffic",                   "norm_traffic",     "traffic.dominance",
+  "Air quality (NO2)",         "norm_no2",         "poor.airquality",
+  "Noise",                     "norm_Lden",        "noise.pollution",
+  "Green space proximity",     "norm_green_time",  "poor.accessibility",
+  "Blue space access",         "norm_dist_bs",     "lack.blue.spaces",
+  "Recreational facilities",   "norm_dist_rec",    "Lack.recreational.facilities",
+  "Green space overcrowding",  "norm_green_suff",  "overcrowding"
+)
+
+# Klagenfurt: air quality weight is split equally between NO2 and PM2.5
+klag_map <- tibble::tribble(
+  ~display_label,                ~norm_col,              ~survey_criterion,
+  "Urban heat",                  "norm_lst",              "alloc_1_TooHotStreets",
+  "Green space proximity",       "norm_green_time",       "alloc_2_GreenOutOfReach",
+  "Low income",                  "norm_income_weighted",  "alloc_3_LowIncomeNeighborhoods",
+  "Traffic",                     "norm_traffic_cat",      "alloc_4_HighTrafficAreas",
+  "Air quality (NO2)",           "norm_no2",              "alloc_5_PoorAirQuality_half",
+  "Air quality (PM2.5)",         "norm_pm25",             "alloc_5_PoorAirQuality_half",
+  "Blue space access",           "norm_dist_bs",          "alloc_6_DisconnectedNatureWater"
+)
+
+# ── diagnostic: which norm columns are present \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+malta_present <- malta_map$norm_col[malta_map$norm_col %in% names(malta_grid)]
+malta_missing <- malta_map$norm_col[!malta_map$norm_col %in% names(malta_grid)]
+klag_present  <- klag_map$norm_col[klag_map$norm_col  %in% names(klag_grid)]
+klag_missing  <- klag_map$norm_col[!klag_map$norm_col %in% names(klag_grid)]
+
+cat("<div style=\'font-family:monospace;font-size:0.85em;border:1px solid #ccc;",
+    "padding:10px;background:#fafafa;margin-bottom:12px;\'\n>\n")
+cat("<strong>Diagnostic \u2014 norm columns in grid objects</strong><br><br>\n")
+cat("<b>Malta FOUND:</b>", paste(malta_present, collapse=", "), "<br>\n")
+if (length(malta_missing)) {
+  cat("<b style=\'color:#c0392b\'>Malta MISSING:</b>",
+      paste(malta_missing, collapse=", "), "<br>\n")
+  cat("&nbsp;&nbsp;<em>TODO: norm_green_suff is computed inside Malta_MCDA_260504.Rmd",
+      "but not saved to malta_mcda_processed.rds.",
+      "Add norm_green_suff to the saveRDS() call to populate this cell.</em><br>\n")
+} else {
+  cat("Malta MISSING: none<br>\n")
+}
+cat("<b>Klagenfurt FOUND:</b>", paste(klag_present,  collapse=", "), "<br>\n")
+if (length(klag_missing)) {
+  cat("<b style=\'color:#c0392b\'>Klagenfurt MISSING:</b>",
+      paste(klag_missing, collapse=", "), "<br>\n")
+} else {
+  cat("Klagenfurt MISSING: none<br>\n")
+}
+cat("</div>\n")
+
+# ── extract top-quintile cells (quintile 5 of 5) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+malta_q5 <- malta_grid %>%
+  st_drop_geometry() %>%
+  mutate(quintile = ntile(priority_citizen, 5)) %>%
+  filter(quintile == 5)
+
+klag_q5 <- klag_grid %>%
+  st_drop_geometry() %>%
+  mutate(quintile = ntile(priority_citizen, 5)) %>%
+  filter(quintile == 5)
+
+cat(sprintf(
+  "<p style=\'font-size:0.85em;color:#555\'>Top-quintile cells \u2014 Malta: %d &nbsp;|&nbsp; Klagenfurt: %d</p>\n",
+  nrow(malta_q5), nrow(klag_q5)
+))
+
+# ── build weights vectors \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# Malta: one proportion per criterion (sum to 1)
+malta_w <- setNames(malta_srv$mean_pct / 100, malta_srv$criterion)
+
+# Klagenfurt: air quality split 50/50; use a shared pseudo-criterion key
+klag_w_base  <- setNames(klag_srv$mean_pct / 100, klag_srv$criterion)
+klag_aq_half <- as.numeric(klag_w_base["alloc_5_PoorAirQuality"]) / 2
+
+# ── compute mean(norm | Q5) x weight per indicator \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+compute_contributions <- function(map_df, q5_df, w_named, aq_half = NULL) {
+  purrr::pmap_dfr(map_df, function(display_label, norm_col, survey_criterion) {
+    mean_val <- if (norm_col %in% names(q5_df)) {
+      mean(q5_df[[norm_col]], na.rm = TRUE)
+    } else {
+      NA_real_
+    }
+    wt <- if (survey_criterion == "alloc_5_PoorAirQuality_half") {
+      aq_half
+    } else {
+      as.numeric(w_named[survey_criterion])
+    }
+    tibble::tibble(
+      display_label = display_label,
+      norm_col      = norm_col,
+      mean_norm_q5  = mean_val,
+      weight        = wt,
+      contribution  = mean_val * wt
+    )
+  })
+}
+
+malta_contrib <- compute_contributions(malta_map, malta_q5, malta_w)
+klag_contrib  <- compute_contributions(klag_map,  klag_q5,  klag_w_base,
+                                        aq_half = klag_aq_half)
+
+# ── assemble cross-city table \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# Row order: sorted by descending Klagenfurt contribution, Malta-only at bottom
+row_order <- c(
+  "Urban heat",
+  "Blue space access",
+  "Air quality (PM2.5)",
+  "Air quality (NO2)",
+  "Green space proximity",
+  "Low income",
+  "Traffic",
+  "Street greenery",
+  "Grey infrastructure",
+  "Green space overcrowding",
+  "Recreational facilities",
+  "Noise"
+)
+
+malta_vals <- malta_contrib %>%
+  select(display_label, malta_contribution = contribution)
+
+klag_vals <- klag_contrib %>%
+  select(display_label, klag_contribution = contribution)
+
+t2_data <- tibble(display_label = row_order) %>%
+  left_join(malta_vals, by = "display_label") %>%
+  left_join(klag_vals,  by = "display_label") %>%
+  mutate(
+    malta_fmt = dplyr::case_when(
+      is.na(malta_contribution) & display_label == "Green space overcrowding" ~
+        cell_spec("NA", color = "#c0392b", italic = TRUE),
+      is.na(malta_contribution) ~ "\u2014",
+      TRUE ~ sprintf("%.3f", malta_contribution)
+    ),
+    klag_fmt = dplyr::case_when(
+      is.na(klag_contribution) ~ "\u2014",
+      TRUE ~ sprintf("%.3f", klag_contribution)
+    )
+  ) %>%
+  select(Criterion = display_label, Malta = malta_fmt, Klagenfurt = klag_fmt)
+
+# ── render table \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+caption_txt <- paste(
+  "Table 2. Mean contribution of each spatial indicator to the priority score",
+  "within top-quintile cells, by city. Contribution = mean normalized indicator",
+  "value \u00d7 citizen weight, calculated across cells in the highest priority",
+  "quintile (quintile 5 of 5). Dashes indicate criteria not included in that",
+  "city\u2019s framework."
+)
+
+tbl2 <- kable(
+  t2_data,
+  format    = "html",
+  booktabs  = TRUE,
+  linesep   = "",
+  escape    = FALSE,
+  caption   = caption_txt,
+  col.names = c("Criterion", "Malta", "Klagenfurt"),
+  align     = c("l", "r", "r")
+) %>%
+  booktabs_style() %>%
+  row_spec(0, background = "#595959", color = "white", bold = TRUE) %>%
+  shade_rows(nrow(t2_data)) %>%
+  column_spec(1, width = "6cm") %>%
+  column_spec(2:3, width = "3cm")
+
+tbl2
+
+footnote(
+  tbl2,
+  general = paste(
+    "In Klagenfurt, the air quality citizen weight (15.9%) is split equally between",
+    "NO\u2082 and PM\u2082.\u2085 (8.0% each). Top-quintile cells: highest 20% of cells by",
+    "citizen-weighted WLC score within each city.",
+    "Malta per-person availability values are preliminary (Euclidean-distance proxy)."
+  ),
+  general_title     = "",
+  footnote_as_chunk = TRUE
+)
+
+# ── save outputs \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+contribution_table <- tibble(display_label = row_order) %>%
+  left_join(
+    malta_contrib %>% select(display_label, malta_contribution = contribution,
+                              malta_weight = weight, malta_mean_norm = mean_norm_q5),
+    by = "display_label"
+  ) %>%
+  left_join(
+    klag_contrib %>% select(display_label, klag_contribution = contribution,
+                              klag_weight = weight, klag_mean_norm = mean_norm_q5),
+    by = "display_label"
+  )
+
+saveRDS(contribution_table,
+        file.path(outputs_dir, "contribution_table.rds"))
+save_kable(tbl2, "Table2_topquintile.html", self_contained = TRUE)
+```
+
+---
+
+# Supplementary Table S5 — Full citizen allocations
+
+```{r tableS5}
+if (is.null(malta_survey_summary) || is.null(klag_survey_summary)) {
+
+  cat("> **WARNING — Table S5 skipped:** one or both of `malta_survey_summary` and",
+      "`klag_survey_summary` are missing. See the build-status checklist above.\n")
+
+} else {
+
+  bench_malta <- 100 / 10
+  bench_klag  <- 100 / 6
+
+  make_sig_col <- function(df, bench) {
+    df %>%
+      mutate(sig = case_when(
+        mean_pct > bench & p_value < 0.05 ~ cell_spec("\u2191", bold = TRUE),
+        mean_pct < bench & p_value < 0.05 ~ cell_spec("\u2193", bold = TRUE),
+        TRUE ~ ""
+      ))
+  }
+
+  s5_malta <- malta_survey_summary %>%
+    mutate(City = "Malta") %>%
+    make_sig_col(bench_malta) %>%
+    arrange(desc(mean_pct))
+
+  s5_klag <- klag_survey_summary %>%
+    mutate(City = "Klagenfurt") %>%
+    make_sig_col(bench_klag) %>%
+    arrange(desc(mean_pct))
+
+  s5_data <- bind_rows(s5_malta, s5_klag) %>%
+    mutate(
+      mean_pct   = round(mean_pct, 1),
+      ci_lower   = round(ci_lower, 1),
+      ci_upper   = round(ci_upper, 1),
+      t_stat     = round(t_stat, 2),
+      p_fmt      = format_pval(p_value)
+    ) %>%
+    select(
+      City, Criterion = label,
+      `Mean (%)` = mean_pct,
+      `95% CI lower` = ci_lower,
+      `95% CI upper` = ci_upper,
+      `t-statistic`  = t_stat,
+      `p-value`      = p_fmt,
+      `Sig.`         = sig
+    )
+
+  tbl_s5 <- kable(
+    s5_data,
+    format   = "html",
+    booktabs = TRUE,
+    linesep  = "",
+    escape   = FALSE,
+    caption  = "Supplementary Table S5. Full citizen budget allocations and one-sample t-test results for all criteria, both cities."
+  ) %>%
+    booktabs_style() %>%
+    row_spec(0, background = "#595959", color = "white", bold = TRUE) %>%
+    shade_rows(nrow(s5_data)) %>%
+    column_spec(1, width = "12%") %>%
+    column_spec(2, width = "28%") %>%
+    column_spec(3, width = "10%") %>%
+    column_spec(4, width = "12%") %>%
+    column_spec(5, width = "12%") %>%
+    column_spec(6, width = "12%") %>%
+    column_spec(7, width = "10%") %>%
+    column_spec(8, width = "4%")
+
+  tbl_s5
+
+  save_kable(tbl_s5, "TableS5_full_allocations.html", self_contained = TRUE)
+}
+```
+
+---
+
+# Supplementary Table S6 — Sensitivity summary
+
+```{r tableS6}
+if (is.null(malta_sensitivity) || is.null(klag_sensitivity)) {
+
+  cat("> **WARNING — Table S6 skipped:** one or both of `malta_sensitivity` and",
+      "`klag_sensitivity` are missing. See the build-status checklist above.\n")
+
+} else {
+
+  # Combine cities and flag NA cells
+  s6_data <- bind_rows(
+    malta_sensitivity %>% mutate(City = "Malta"),
+    klag_sensitivity  %>% mutate(City = "Klagenfurt")
+  ) %>%
+    select(City, `Sensitivity test` = test_name,
+           `Spearman r` = spearman_r,
+           `Top-quintile class agreement (%)` = class_agreement)
+
+  # Apply yellow highlight to NA cells
+  s6_display <- s6_data %>%
+    mutate(
+      `Spearman r` = ifelse(
+        is.na(`Spearman r`),
+        cell_spec("TODO", background = "#FFFACD", bold = TRUE),
+        `Spearman r`
+      ),
+      `Top-quintile class agreement (%)` = ifelse(
+        is.na(`Top-quintile class agreement (%)`),
+        cell_spec("TODO", background = "#FFFACD", bold = TRUE),
+        `Top-quintile class agreement (%)`
+      )
+    )
+
+  tbl_s6 <- kable(
+    s6_display,
+    format   = "html",
+    booktabs = TRUE,
+    linesep  = "",
+    escape   = FALSE,
+    caption  = "Supplementary Table S6. Summary of sensitivity analyses. Spearman rank correlation between the baseline citizen-weighted priority surface and each alternative specification, across all grid cells. Class agreement = percentage of top-quintile cells in the baseline that remain in the top quintile under the alternative specification."
+  ) %>%
+    booktabs_style() %>%
+    row_spec(0, background = "#595959", color = "white", bold = TRUE) %>%
+    shade_rows(nrow(s6_display)) %>%
+    column_spec(1, width = "12%") %>%
+    column_spec(2, width = "45%") %>%
+    column_spec(3, width = "20%") %>%
+    column_spec(4, width = "23%")
+
+  tbl_s6
+
+  save_kable(tbl_s6, "TableS6_sensitivity_summary.html", self_contained = TRUE)
+}
+```

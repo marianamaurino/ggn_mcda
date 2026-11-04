@@ -1,0 +1,286 @@
+---
+title: "Malta Citizen Survey"
+subtitle: "Results report — citizen priorities for green-space investment"
+author: "Mariana Mauriño"
+date: today
+format:
+  pdf:
+    documentclass: article
+    geometry: margin=1in
+    fontsize: 11pt
+    pdf-engine: xelatex
+    toc: false
+    number-sections: false
+    include-in-header:
+      text: |
+        \usepackage{caption}
+        \captionsetup{labelformat=empty, justification=raggedright, singlelinecheck=false}
+        \makeatletter
+        \newcommand{\subtitle}[1]{\gdef\@subtitle{#1}}
+        \newcommand{\@subtitle}{}
+        \renewcommand{\maketitle}{%
+          \begin{center}
+          {\LARGE \@title \par}
+          \vspace{4pt}
+          {\large \@subtitle \par}
+          \vspace{10pt}
+          {\large \@author \par}
+          \vspace{6pt}
+          {\large \@date \par}
+          \end{center}
+          \vspace{10pt}
+        }
+        \makeatother
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+library(patchwork)
+
+knitr::opts_chunk$set(dev = "cairo_pdf", fig.width = 6.5)
+
+survey <- read_csv(
+  here::here("data/malta/maltasurvey_jun26.csv"),
+  show_col_types = FALSE
+)
+
+budget_cols <- c("Lack-recreational-facilities", "overcrowding", "poor-accessibility",
+                 "lack-blue-spaces", "poor-airquality", "noise-pollution",
+                 "urban-heat", "lack-street-greenery", "grey-infrastracture",
+                 "traffic-dominance")
+
+pretty <- function(x) str_replace_all(x, "-", " ") %>% str_to_title()
+
+n_total <- nrow(survey)
+
+# ── precomputed values used inline in the prose below ──────────────────────
+top_age    <- names(sort(table(survey$`age-group`), decreasing = TRUE))[1]
+pct_age    <- round(100 * max(table(survey$`age-group`)) / n_total)
+pct_female <- round(100 * sum(survey$gender == "female", na.rm = TRUE) / n_total)
+pct_born   <- round(100 * sum(survey$resident == "born", na.rm = TRUE) / n_total)
+pct_en     <- round(100 * sum(survey$language == "en", na.rm = TRUE) / n_total)
+
+pct_weekly_plus <- round(100 * sum(survey$`visit-frequency` %in% c("1", "2-4", "5-7"), na.rm = TRUE) /
+                            sum(!is.na(survey$`visit-frequency`)))
+pct_never       <- round(100 * sum(survey$`visit-frequency` == "0", na.rm = TRUE) /
+                            sum(!is.na(survey$`visit-frequency`)))
+pct_nearby_yes  <- round(100 * sum(survey$`green-nearby` == "yes", na.rm = TRUE) /
+                            sum(!is.na(survey$`green-nearby`)))
+pct_relax_only  <- round(100 * sum(survey$`visit-reasons` == "relax", na.rm = TRUE) /
+                            sum(!is.na(survey$`visit-reasons`)))
+
+neigh_tab   <- sort(table(survey$neighborhood), decreasing = TRUE)
+n_neigh     <- dplyr::n_distinct(survey$neighborhood[!is.na(survey$neighborhood)])
+top_neigh   <- names(neigh_tab)[1]
+top_neigh_n <- unname(neigh_tab[1])
+pct_top5_neigh <- round(100 * sum(neigh_tab[1:5]) / sum(neigh_tab))
+
+budget_summary <- survey %>%
+  select(all_of(budget_cols)) %>%
+  pivot_longer(everything(), names_to = "criterion", values_to = "allocation") %>%
+  group_by(criterion) %>%
+  summarise(mean_alloc = mean(allocation), median_alloc = median(allocation), .groups = "drop") %>%
+  arrange(desc(mean_alloc))
+
+top_criterion     <- pretty(budget_summary$criterion[1])
+top_criterion_mean <- round(budget_summary$mean_alloc[1])
+bottom_criterion   <- pretty(budget_summary$criterion[nrow(budget_summary)])
+bottom_criterion_median <- budget_summary$median_alloc[nrow(budget_summary)]
+
+sig_results <- map_dfr(budget_cols, function(col) {
+  test <- t.test(survey[[col]], mu = 100)
+  tibble(criterion = col, mean = mean(survey[[col]]), p_value = test$p.value)
+}) %>%
+  arrange(desc(mean))
+
+sig_above <- sig_results %>% filter(mean > 100, p_value < 0.05) %>% pull(criterion) %>% pretty()
+sig_below <- sig_results %>% filter(mean < 100, p_value < 0.05) %>% pull(criterion) %>% pretty()
+```
+
+
+
+
+# Introduction
+
+Between the launch of the Malta pilot and June 2026, `r n_total` residents completed a citizen-priority survey for greening interventions investment. Each respondent distributed a hypothetical €1,000 budget across ten criteria describing problems that green-space interventions could address (e.g. lack of street greenery, poor air quality, traffic dominance), and answered a short set of questions, including a general demographic profile and their usage of green space habits. This report summarises the results: who responded, how they currently use green space, and which problems they prioritised for investment.
+
+# Sample and demographics
+
+The sample skews toward the `r top_age` age bracket (`r pct_age`% of respondents), is `r pct_female`% female, and is dominated by long-term residents: `r pct_born`% were born in Malta. Most respondents (`r pct_en`%) took the survey in English rather than Maltese.
+
+```{r demographics, fig.height=5, fig.cap=paste0("**Figure 1.** Respondent demographics (n = ", n_total, "): age group, gender, residency status, and survey language.")}
+p_age <- ggplot(survey, aes(x = `age-group`)) +
+  geom_bar(fill = "#5DCAA5") +
+  labs(title = "Age group", x = NULL, y = "Count") +
+  theme_minimal()
+
+p_gender <- ggplot(survey, aes(x = gender)) +
+  geom_bar(fill = "#85B7EB") +
+  labs(title = "Gender", x = NULL, y = "Count") +
+  theme_minimal()
+
+p_resident <- ggplot(survey, aes(x = resident)) +
+  geom_bar(fill = "#F0997B") +
+  labs(title = "Residency status", x = NULL, y = "Count") +
+  theme_minimal()
+
+p_language <- ggplot(survey, aes(x = language)) +
+  geom_bar(fill = "#AFA9EC") +
+  labs(title = "Survey language", x = NULL, y = "Count") +
+  theme_minimal()
+
+(p_age + p_gender) / (p_resident + p_language)
+```
+
+
+
+
+The sample leans toward established residents rather than recent arrivals.
+
+# Green space use today
+
+Most of the people go to a green space at least once a week (`r pct_weekly_plus`%), while `r pct_never`% report never visiting. More than half of the respondents (`r pct_nearby_yes`%) affirm having a green space within walking distance of home. Relaxation is by far the most common reason for visiting: `r pct_relax_only`% of respondents who gave a reason cited relaxation alone, with socialising and sport mentioned mostly in combination with it rather than on their own.
+
+```{r green-space-behaviour, fig.height=8, fig.cap="**Figure 2.** How often respondents visit green space, whether they have it within walking distance, and why they go."}
+freq_labels <- c("0" = "Never", "1" = "Once/week", "2-4" = "2–4×/week", "5-7" = "Daily")
+
+p_freq <- survey %>%
+  filter(!is.na(`visit-frequency`)) %>%
+  mutate(freq = factor(`visit-frequency`, levels = names(freq_labels), labels = freq_labels)) %>%
+  count(freq) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  ggplot(aes(x = freq, y = n)) +
+  geom_col(fill = "#5DCAA5") +
+  geom_text(aes(label = paste0(n, " (", pct, "%)")), vjust = -0.3, size = 2.8) +
+  labs(x = "Visit frequency", y = "Respondents") +
+  ylim(0, max(table(survey$`visit-frequency`)) * 1.25) +
+  theme_minimal()
+
+p_nearby <- survey %>%
+  count(`green-nearby`) %>%
+  filter(!is.na(`green-nearby`)) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  ggplot(aes(x = `green-nearby`, y = n, fill = `green-nearby`)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = paste0(n, " (", pct, "%)")), vjust = -0.3, size = 2.8) +
+  scale_fill_manual(values = c("yes" = "#5DCAA5", "no" = "#D85A30")) +
+  labs(x = "Green space within walking distance?", y = "Respondents") +
+  theme_minimal()
+
+reasons_df <- survey %>%
+  filter(!is.na(`visit-reasons`)) %>%
+  mutate(
+    Relaxation = str_detect(`visit-reasons`, "relax"),
+    Social     = str_detect(`visit-reasons`, "friends"),
+    Sport      = str_detect(`visit-reasons`, "sport")
+  )
+
+p_reasons <- reasons_df %>%
+  summarise(Relaxation = sum(Relaxation), Social = sum(Social), Sport = sum(Sport)) %>%
+  pivot_longer(everything(), names_to = "reason", values_to = "n") %>%
+  mutate(pct = round(100 * n / nrow(reasons_df), 1)) %>%
+  ggplot(aes(x = reorder(reason, n), y = n, fill = reason)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = paste0(n, " (", pct, "%)")), hjust = -0.1, size = 2.8) +
+  scale_fill_manual(values = c(Relaxation = "#5DCAA5", Social = "#85B7EB", Sport = "#F0997B")) +
+  coord_flip() +
+  ylim(0, nrow(reasons_df) * 1.15) +
+  labs(x = "Reason for visiting (multiple allowed)", y = "Respondents") +
+  theme_minimal()
+
+p_combos <- survey %>%
+  filter(!is.na(`visit-reasons`)) %>%
+  count(`visit-reasons`, sort = TRUE) %>%
+  mutate(pct = round(100 * n / sum(n), 1),
+         lab = str_replace_all(`visit-reasons`, ", ", " + ")) %>%
+  ggplot(aes(x = reorder(lab, n), y = n)) +
+  geom_col(fill = "#AFA9EC") +
+  geom_text(aes(label = paste0(n, " (", pct, "%)")), hjust = -0.1, size = 2.8) +
+  coord_flip() +
+  ylim(0, max(table(survey$`visit-reasons`)) * 1.25) +
+  labs(x = "Reason combination given", y = "Respondents") +
+  theme_minimal()
+
+(p_freq + p_nearby) / (p_reasons + p_combos)
+```
+
+```{r neighbourhood-plot, fig.height=8, fig.cap=paste0("**Figure 3.** Neighbourhood of residence (", n_neigh, " distinct localities, n = ", sum(!is.na(survey$neighborhood)), ").")}
+neigh_counts <- survey %>%
+  filter(!is.na(neighborhood)) %>%
+  count(neighborhood, sort = TRUE)
+
+n_singleton <- sum(neigh_counts$n == 1)
+other_label <- paste0("Other (", n_singleton, " neighbourhoods, 1 each)")
+
+neigh_named <- neigh_counts %>% filter(n > 1)
+neigh_levels <- c(other_label, rev(neigh_named$neighborhood))
+
+neigh_named %>%
+  bind_rows(tibble(neighborhood = other_label, n = n_singleton)) %>%
+  mutate(neighborhood = factor(neighborhood, levels = neigh_levels),
+         is_other = neighborhood == other_label) %>%
+  ggplot(aes(x = neighborhood, y = n, fill = is_other)) +
+  geom_col() +
+  geom_text(aes(label = n), hjust = -0.2, size = 2.6) +
+  coord_flip() +
+  scale_fill_manual(values = c(`FALSE` = "#AFA9EC", `TRUE` = "#B0B0B0"), guide = "none") +
+  ylim(0, max(neigh_named$n, n_singleton) * 1.1) +
+  labs(x = NULL, y = "Respondents") +
+  theme_minimal()
+```
+
+
+
+
+Respondents came from `r n_neigh` different localities, but the distribution is uneven: `r top_neigh` alone accounts for `r top_neigh_n` responses, and the top five localities together account for `r pct_top5_neigh`% of the sample. Most localities are represented by only one or two respondents, so neighbourhood-level breakdowns should be treated as indicative rather than statistically robust.
+
+# Budget priorities
+
+```{r budget-plot, fig.height=5, fig.cap=paste0("**Figure 4.** Distribution of budget allocations per criterion (n = ", n_total, " respondents, €1,000 each).")}
+survey %>%
+  select(all_of(budget_cols)) %>%
+  pivot_longer(everything(), names_to = "criterion", values_to = "allocation") %>%
+  mutate(criterion = pretty(criterion)) %>%
+  ggplot(aes(x = reorder(criterion, allocation, FUN = median), y = allocation)) +
+  geom_boxplot(fill = "#5DCAA5", alpha = 0.7, outlier.size = 1) +
+  coord_flip() +
+  labs(x = NULL, y = "Budget allocated (€)") +
+  theme_minimal()
+```
+
+
+
+
+`r top_criterion` drew the largest median allocation, and its mean allocation (€`r top_criterion_mean`) is well above the €100 that an equal 10-way split would give each criterion. At the other end, `r bottom_criterion` was allocated almost nothing by most respondents (median €`r bottom_criterion_median`), most people gave it no budget at all, rather than a small-but-nonzero amount.
+
+```{r weight-significance-plot, fig.height=5, fig.cap="**Figure 5.** Mean budget allocation per criterion, with 95% confidence intervals. The dashed line marks the €100 equal-weight benchmark (ten criteria splitting €1,000 evenly)."}
+sig_results %>%
+  mutate(criterion = pretty(criterion)) %>%
+  left_join(
+    map_dfr(budget_cols, function(col) {
+      test <- t.test(survey[[col]], mu = 100)
+      tibble(criterion = pretty(col), ci_lower = test$conf.int[1], ci_upper = test$conf.int[2])
+    }),
+    by = "criterion"
+  ) %>%
+  ggplot(aes(x = reorder(criterion, mean), y = mean)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2) +
+  geom_hline(yintercept = 100, linetype = "dashed", color = "#D85A30") +
+  coord_flip() +
+  labs(x = NULL, y = "Mean allocation (€)") +
+  theme_minimal()
+```
+
+
+
+
+Citizens did not spread their budget evenly across the ten criteria. Allocations to `r paste(sig_above, collapse = ", ")` were significantly **above** the €100 equal-weight benchmark (one-sample t-test, p \< 0.05); allocations to `r paste(sig_below, collapse = ", ")` were significantly **below** it, being highly zero-inflated. The remaining criteria were not significantly different from an even split, meaning citizens showed no strong preference either way for those.
+
+# Summary
+
+The Malta survey sample is small (`r n_total` respondents). Most respondents are established residents (`r pct_born`% born in Malta, most of the remainder resident 10+ years), which is arguably a strength for a priority-elicitation exercise like this one: these are people with direct, lived knowledge of the areas they were asked to prioritise, not passers-through. The main caveat is geographic rather than demographic: respondents came from `r n_neigh` different localities, but the top five account for `r pct_top5_neigh`% of the sample. Within that sample, green space is already frequently used and mostly for relaxation, and citizen budget priorities cluster clearly around street greenery, grey infrastructure, and air quality, with blue-space access a consistent low priority. These patterns feed the citizen-weighted multicriteria decision analysis to build a greening priority area map.

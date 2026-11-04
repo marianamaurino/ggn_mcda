@@ -1,0 +1,542 @@
+---
+title: "Correlations and standarization"
+author: "Mariana Mauriño"
+date: "2026-04-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 8
+)
+```
+
+## Correlations
+
+```{r}
+#Load libraries
+library(tidyverse)
+library(readr)
+library(sf)
+library(ggcorrplot)
+library(skimr)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+# Paths
+data_dir <- here::here("data/malta")
+out_dir  <- here::here("output/correlations")
+
+
+# Create output folder if it doesn't exist
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Load data
+data <- readRDS(file.path(data_dir, "malta_master_full.rds"))
+colnames(data)
+
+```
+
+<!-- NO2 raster re-extraction + malta_master_full.rds overwrite chunk removed 2026-08-13.
+     It re-extracted no2_avg_21 from the raw raster and wrote the result back over the
+     shared malta_master_full.rds. That extraction is now done correctly and persisted by
+     malta_build_master.Rmd (the canonical builder) -- the master file already loaded above
+     has a correct no2_avg_21 and no longer carries the old no2_avg_18 this chunk compared
+     against. Re-running it would have silently overwritten the file that 9 other live
+     notebooks depend on with a redundant, separately-computed extraction. -->
+
+```{r}
+# Define the MCDA variables, their labels, units, and direction
+# Direction: "benefit" = higher value = higher priority for greening
+#            "cost"    = lower value  = higher priority for greening
+var_info <- tibble::tribble(
+  ~var,             ~label,                        ~unit,     ~direction,
+  "lst",            "Land Surface Temperature",    "°C",      "benefit",
+  "imd",            "Imperviousness Density",      "%",       "benefit",
+  "dist_bs",        "Distance to Blue Space",      "m",       "benefit",
+  "Lden",           "Noise Pollution",             "dB",      "benefit",
+  "new_trafficvol", "Traffic Volume",              "count",   "benefit",
+  "no2_avg_21",     "NO2 (annual mean 2021)",      "µg/m³",   "benefit",
+  "perc_tree",      "Street Tree Cover",           "%",       "cost",
+  "recreation_m2",  "Recreation Space",            "m²",      "cost"
+)
+# Extract only the MCDA variables as a plain data frame (drop geometry)
+mcda_vars <- var_info$var
+df <- data %>%
+  st_drop_geometry() %>%
+  select(all_of(c("ID", "gid", mcda_vars)))
+```
+
+```{r}
+desc_stats <- df %>%
+  select(all_of(mcda_vars)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  group_by(variable) %>%
+  summarise(
+    n_valid   = sum(!is.na(value)),
+    n_missing = sum(is.na(value)),
+    min       = min(value, na.rm = TRUE),
+    p2        = quantile(value, 0.02, na.rm = TRUE),
+    q1        = quantile(value, 0.25, na.rm = TRUE),
+    median    = median(value, na.rm = TRUE),
+    mean      = mean(value, na.rm = TRUE),
+    q3        = quantile(value, 0.75, na.rm = TRUE),
+    p98       = quantile(value, 0.98, na.rm = TRUE),
+    max       = max(value, na.rm = TRUE),
+    sd        = sd(value, na.rm = TRUE),
+    skewness  = (mean(value, na.rm = TRUE) - median(value, na.rm = TRUE)) / sd(value, na.rm = TRUE),
+    .groups   = "drop"
+  ) %>%
+  left_join(var_info, by = c("variable" = "var")) %>%
+  relocate(label, unit, .after = variable)
+
+desc_stats %>%
+  mutate(across(where(is.numeric), ~round(., 2))) %>%
+  kable(caption = "Descriptive statistics of MCDA input variables") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) #"striped" — alternating row colors (grey/white) for readability, "hover" — highlights the row when you hover over it with the mouse, "condensed" — reduces padding for a more compact table. full_width = FALSE — table doesn't stretch to fill the whole page
+
+```
+```{r}
+#explore traffic variable to decide the cut offs
+# Basic summary of non-missing values only
+traffic_valid <- data %>%
+  st_drop_geometry() %>%
+  filter(!is.na(new_trafficvol) & new_trafficvol > 0)
+
+cat("Cells with traffic data:", nrow(traffic_valid), 
+    "out of", nrow(data), 
+    paste0("(", round(100 * nrow(traffic_valid) / nrow(data), 1), "%)"))
+
+summary(traffic_valid$new_trafficvol)
+```
+
+
+```{r}
+# Histogram of non-zero values
+ggplot(traffic_valid, aes(x = new_trafficvol)) +
+  geom_histogram(bins = 50, fill = "#5DCAA5", color = "white") +
+  labs(title = "Traffic volume: distribution of non-zero cells",
+       x = "Traffic volume", y = "Frequency") +
+  theme_minimal()
+```
+
+
+```{r}
+# Same but log scale (likely very skewed)
+ggplot(traffic_valid, aes(x = new_trafficvol)) +
+  geom_histogram(bins = 50, fill = "#85B7EB", color = "white") +
+  scale_x_log10() +
+  labs(title = "Traffic volume: log scale",
+       x = "Traffic volume (log)", y = "Frequency") +
+  theme_minimal()
+```
+
+
+```{r}
+# Map it spatially to see the road network pattern
+ggplot(data) +
+  geom_sf(aes(fill = new_trafficvol), color = NA) +
+  scale_fill_viridis_c(option = "inferno", na.value = "grey90", 
+                       trans = "log10", name = "Traffic\n(log)") +
+  labs(title = "Traffic volume: spatial distribution") +
+  theme_void()
+```
+
+
+```{r}
+# Check for natural breaks visually
+ggplot(traffic_valid, aes(x = new_trafficvol)) +
+  geom_density(fill = "#5DCAA5", alpha = 0.5) +
+  scale_x_log10() +
+  labs(title = "Density plot (log scale): look for natural groupings",
+       x = "Traffic volume (log)") +
+  theme_minimal()
+```
+
+```{r}
+data %>%
+  filter(new_trafficvol > 472) %>%
+  select(gid, new_trafficvol, lst, imd, perc_tree) %>%
+  st_drop_geometry()
+```
+
+```{r}
+# Highlight cells above p98 for traffic
+ggplot() +
+  geom_sf(data = data, fill = "grey90", color = NA) +
+  geom_sf(data = data %>% filter(new_trafficvol > 472),
+          aes(fill = new_trafficvol), color = NA) +
+  scale_fill_viridis_c(option = "inferno", name = "Traffic\nvolume") +
+  labs(title = "Traffic volume: cells above p98 (472)") +
+  theme_void()
+```
+```{r}
+# Highlight cells above p98 for tree cover
+ggplot() +
+  geom_sf(data = data, fill = "grey90", color = NA) +
+  geom_sf(data = data %>% filter(perc_tree > 14.18),
+          aes(fill = perc_tree), color = NA) +
+  scale_fill_viridis_c(option = "mako", direction = -1, name = "Tree\ncover (%)") +
+  labs(title = "Tree cover: cells above p98 (14.18%)") +
+  theme_void()
+```
+
+```{r}
+##Going back to Correlations
+df_long <- df %>%
+  select(all_of(mcda_vars)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  left_join(var_info, by = c("variable" = "var"))
+
+ggplot(df_long, aes(x = value)) +
+  geom_histogram(bins = 50, fill = "#5DCAA5", color = "white", alpha = 0.8) +
+  facet_wrap(~ paste0(label, " (", unit, ")"), scales = "free", ncol = 2) +
+  labs(
+    title = "Distribution of MCDA input variables: Malta",
+    x = "Value",
+    y = "Frequency"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(strip.text = element_text(face = "bold", size = 9))
+
+ggsave(file.path(out_dir, "histograms_malta.png"), width = 10, height = 10, dpi = 150)
+```
+
+```{r}
+ggplot(df_long, aes(y = value)) +
+  geom_boxplot(fill = "#85B7EB", alpha = 0.7, outlier.colour = "#D85A30", outlier.size = 1) +
+  facet_wrap(~ paste0(label, " (", unit, ")"), scales = "free", ncol = 2) +
+  labs(
+    title = "Boxplots of MCDA input variables: Malta",
+    subtitle = "Orange dots = statistical outliers (beyond 1.5 x IQR)",
+    y = "Value"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    strip.text = element_text(face = "bold", size = 9),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+ggsave(file.path(out_dir, "boxplots_malta.png"), width = 10, height = 10, dpi = 150)
+
+```
+```{r}
+data <- data %>%
+  mutate(new_trafficvol = replace_na(new_trafficvol, 0))
+library(ggcorrplot)
+
+# Define variable sets
+vars_full    <- c("lst", "imd", "dist_bs", "Lden", "new_trafficvol", "no2_avg_21", "perc_tree", "recreation_m2")
+vars_no_rec  <- c("lst", "imd", "dist_bs", "Lden", "new_trafficvol", "no2_avg_21", "perc_tree")
+vars_minimal <- c("lst", "imd", "dist_bs", "Lden", "new_trafficvol", "no2_avg_21")
+
+# Labels for readable plots
+labs <- c(lst = "LST", imd = "Imperviousness", dist_bs = "Dist. Blue Space",
+          Lden = "Noise", new_trafficvol = "Traffic", no2_avg_21 = "NO2",
+          perc_tree = "Tree Cover", recreation_m2 = "Recreation")
+
+# Function to compute and plot
+run_cor <- function(data, vars, title) {
+  df_cor <- data %>% st_drop_geometry() %>% select(all_of(vars)) %>% drop_na()
+  mat <- cor(df_cor, method = "spearman")
+  rownames(mat) <- labs[rownames(mat)]
+  colnames(mat) <- labs[colnames(mat)]
+  
+  ggcorrplot(mat, type = "lower", lab = TRUE, lab_size = 3.5,
+             colors = c("#D85A30", "white", "#1D9E75"),
+             title = title,
+             ggtheme = theme_minimal(base_size = 11))
+}
+
+# Run all three
+p1 <- run_cor(data, vars_full,    "Spearman: all 8 variables")
+p2 <- run_cor(data, vars_no_rec,  "Spearman: without recreation")
+p3 <- run_cor(data, vars_minimal, "Spearman: without recreation & tree cover")
+
+p1 
+p2
+p3
+```
+
+<!-- The two chunks below are the pre-E2SFCA accessibility attempts (nearest_green_m,
+     green_ha_5/10/15min from a since-superseded accessibility run). Kept as comments for
+     history -- E2SFCA (next chunk) is what the notebook settled on and what the live MCDA
+     pipeline (Malta_MCDA_260702_realloc.Rmd) actually uses.
+
+# ##I am going to join accessibility metrics
+# library(arrow)
+# library(sf)
+#
+# # Load the accessibility metrics
+# access <- read_parquet("/PROJECTES/HIA/GreenSpace/GoGreenNext/ggn_analysis/output/accessibility/malta/maps/final_metrics.parquet")
+#
+# # Make sure types match (unit_id is string, gid might be numeric)
+# access$unit_id <- as.character(access$unit_id)
+# data$gid <- as.character(data$gid)
+#
+# # Join
+# data <- data %>%
+#   left_join(
+#     access %>% select(unit_id, nearest_green_m, nearest_green_min,
+#                        green_ha_5min, green_ha_10min, green_ha_15min),
+#     by = c("gid" = "unit_id")
+#   )
+#
+# cat("Matched:", sum(!is.na(data$nearest_green_m)), "out of", nrow(data), "\n")
+#
+# ggplot(data) +
+#   geom_sf(aes(fill = nearest_green_min), color = NA) +
+#   scale_fill_viridis_c(option = "mako", na.value = "grey90", name = "Minutes to\ngreen space") +
+#   labs(title = "Walking time to nearest green space: Malta") +
+#   theme_void()
+-->
+
+```{r}
+# Green space sufficiency: E2SFCA Gaussian (final choice, matches Malta_MCDA_260702_realloc.Rmd)
+library(arrow)
+
+exposure_e2sfca <- read_parquet(
+  here::here("analysis/exposure/final_metrics.parquet")
+) %>%
+  st_drop_geometry() %>%
+  mutate(unit_id = as.character(unit_id)) %>%
+  select(unit_id, green_m2_e2sfca_per_person_gauss, green_m2_e2sfca_per_person)
+
+data$gid <- as.character(data$gid)
+data <- data %>%
+  left_join(exposure_e2sfca, by = c("gid" = "unit_id"))
+
+cat("Matched:", sum(!is.na(data$green_m2_e2sfca_per_person_gauss)), "out of", nrow(data), "\n")
+summary(data$green_m2_e2sfca_per_person_gauss)
+```
+
+```{r}
+ggplot(data) +
+  geom_sf(aes(fill = pmin(green_m2_e2sfca_per_person_gauss,
+                          quantile(green_m2_e2sfca_per_person_gauss, 0.98, na.rm = TRUE))),
+          color = NA) +
+  scale_fill_viridis_c(option = "mako", direction = -1, na.value = "grey90",
+                       name = "m²/person\n(E2SFCA, p98 capped)") +
+  labs(title = "Green space sufficiency (E2SFCA Gaussian): Malta") +
+  theme_void()
+```
+
+
+```{r}
+vars_with_access <- c("lst", "imd", "dist_bs", "Lden", "new_trafficvol",
+                       "no2_avg_21", "perc_tree", "green_m2_e2sfca_per_person_gauss")
+
+labs <- c(lst = "LST", imd = "Imperviousness", dist_bs = "Dist. Blue Space",
+          Lden = "Noise", new_trafficvol = "Traffic", no2_avg_21 = "NO2",
+          perc_tree = "Tree Cover", green_m2_e2sfca_per_person_gauss = "Green Sufficiency (E2SFCA)")
+
+run_cor(data, vars_with_access, "Spearman: 8 variables incl. accessibility")
+```
+```{r}
+# Cells in master data but NOT in E2SFCA (unrouted cells / no population)
+missing <- data %>%
+  filter(is.na(green_m2_e2sfca_per_person_gauss))
+
+cat("Missing:", nrow(missing), "out of", nrow(data), "\n")
+
+# Map them to see where they are
+ggplot() +
+  geom_sf(data = data, fill = "grey90", color = NA) +
+  geom_sf(data = missing, fill = "#D85A30", color = NA) +
+  labs(title = paste0("Grid cells without E2SFCA data (n=", nrow(missing), ")")) +
+  theme_void()
+```
+
+```{r}
+# Normalization functions
+normalize_minmax <- function(x, lower = NULL, upper = NULL) {
+  if (is.null(lower)) lower <- min(x, na.rm = TRUE)
+  if (is.null(upper)) upper <- max(x, na.rm = TRUE)
+  x <- pmin(x, upper)
+  x <- pmax(x, lower)
+  (x - lower) / (upper - lower)
+}
+
+normalize_fuzzy <- function(x, onset, saturation) {
+  out <- (x - onset) / (saturation - onset)
+  out <- pmin(pmax(out, 0), 1)
+  out
+}
+
+# All normalized to [0,1] where 1 = highest priority for greening
+```
+
+
+```{r}
+data <- data %>%
+  mutate(
+    # Capped at p98, used as relative indicator of intra-urban 
+    # thermal variation since no absolute health thresholds 
+    # exist for satellite-derived LST
+    norm_lst = normalize_minmax(lst,
+                                lower = min(lst, na.rm = TRUE),
+                                upper = quantile(lst, 0.98, na.rm = TRUE)),
+    
+    norm_imd = normalize_minmax(imd, lower = 0, upper = 100),
+    
+    norm_dist_bs = normalize_minmax(dist_bs,
+                                     lower = 0,
+                                     upper = quantile(dist_bs, 0.98, na.rm = TRUE)),
+    
+    norm_Lden = normalize_minmax(Lden,
+                                  lower = min(Lden, na.rm = TRUE),
+                                  upper = quantile(Lden, 0.98, na.rm = TRUE)),
+    
+    # Log transform reflects diminishing marginal health impact 
+    # at higher volumes (Weber-Fechner, community severance).
+    # Capped at p98: beyond 472 vehicles the difference in 
+    # health and perception effects is negligible
+    norm_traffic = {
+      cap <- 472
+      x <- pmin(new_trafficvol, cap)
+      log(x + 1) / log(cap + 1)
+    },
+    
+    norm_no2 = normalize_minmax(no2_avg_21,
+                                 lower = min(no2_avg_21, na.rm = TRUE),
+                                 upper = quantile(no2_avg_21, 0.98, na.rm = TRUE)),
+    
+    # Inverted: more trees = less priority. Capped at p98 (14.18%):
+    # cells above are parks/golf, already captured by other variables
+    norm_tree = 1 - normalize_minmax(perc_tree, lower = 0, upper = 14.18),
+    
+    # Inverted: less green per person = higher priority. Capped at p98; NAs
+    # (unrouted cells, no population) replaced with 0 — neutral on this criterion.
+    # Matches Malta_MCDA_260702_realloc.Rmd's norm_green_exp exactly.
+    norm_green_exp = replace_na(
+      1 - normalize_minmax(green_m2_e2sfca_per_person_gauss,
+                           lower = 0,
+                           upper = quantile(green_m2_e2sfca_per_person_gauss,
+                                            0.98, na.rm = TRUE)),
+      0)
+  )
+
+# Check
+norm_vars <- c("norm_lst", "norm_imd", "norm_dist_bs", "norm_Lden",
+               "norm_traffic", "norm_no2", "norm_tree", "norm_green_exp")
+
+data %>% st_drop_geometry() %>% select(all_of(norm_vars)) %>% summary()
+```
+
+```{r}
+# ---- Histograms of normalized variables ----
+data %>%
+  st_drop_geometry() %>%
+  select(all_of(norm_vars)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 50, fill = "#5DCAA5", color = "white") +
+  facet_wrap(~ variable, scales = "free_y", ncol = 2) +
+  labs(title = "Normalized variables (0 = low priority, 1 = high priority)",
+       x = "Priority score", y = "Frequency") +
+  theme_minimal()
+```
+
+
+```{r}
+# ---- Maps of normalized variables ----
+walk(norm_vars, function(v) {
+  p <- ggplot(data) +
+    geom_sf(aes(fill = .data[[v]]), color = NA) +
+    scale_fill_viridis_c(option = "magma", na.value = "grey90", limits = c(0, 1)) +
+    labs(title = v) +
+    theme_void()
+  print(p)
+})
+
+```
+
+
+----WEIGHTED LINEAR COMBINATION---
+```{r}
+raw_weights <- c(
+  norm_tree       = 148.26,
+  norm_imd        = 128.44,
+  norm_traffic    = 116.33,
+  norm_no2        = 115.41,
+  norm_lst        = 96.70,
+  norm_Lden       = 88.62,
+  norm_green_exp  = 87.71,
+  norm_dist_bs    = 29.72
+)
+
+# Rescale to sum to 1 (excluding overcrowding and recreation)
+weights <- raw_weights / sum(raw_weights)
+round(weights, 3)
+```
+
+```{r}
+# Weighted priority score
+data <- data %>%
+  mutate(
+    priority_weighted = weights["norm_tree"]       * norm_tree +
+                        weights["norm_imd"]        * norm_imd +
+                        weights["norm_traffic"]    * norm_traffic +
+                        weights["norm_no2"]        * norm_no2 +
+                        weights["norm_lst"]        * norm_lst +
+                        weights["norm_Lden"]       * norm_Lden +
+                        weights["norm_green_exp"]  * norm_green_exp +
+                        weights["norm_dist_bs"]    * norm_dist_bs
+  )
+ # Equal weights: just the mean
+data <- data %>%
+  mutate(priority_equal = rowMeans(across(all_of(norm_vars)), na.rm = TRUE))
+```
+
+
+```{r}
+# Compare equal vs citizen weights
+library(patchwork)
+
+p1 <- ggplot(data) +
+  geom_sf(aes(fill = priority_equal), color = NA) +
+  scale_fill_viridis_c(option = "magma", na.value = "grey90", limits = c(0, 1)) +
+  labs(title = "Equal weights") +
+  theme_void()
+
+p2 <- ggplot(data) +
+  geom_sf(aes(fill = priority_weighted), color = NA) +
+  scale_fill_viridis_c(option = "magma", na.value = "grey90", limits = c(0, 1)) +
+  labs(title = "Citizen weights") +
+  theme_void()
+
+p1 + p2
+```
+```{r}
+cor(data$priority_equal, data$priority_weighted, use = "complete.obs")
+
+# Where do they actually differ?
+data <- data %>%
+  mutate(weight_diff = priority_weighted - priority_equal)
+
+ggplot(data) +
+  geom_sf(aes(fill = weight_diff), color = NA) +
+  scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#b2182b",
+                       midpoint = 0, name = "Citizen - Equal") +
+  labs(title = "Difference: citizen weights minus equal weights",
+       subtitle = "Red = citizen weights give higher priority, blue = lower") +
+  theme_void()
+```
+```{r}
+# What's driving the difference? Map the biggest weight changes
+# Blue space: dropped from 0.125 to 0.037
+# Tree cover: rose from 0.125 to 0.183
+
+ggplot(data) +
+  geom_sf(aes(fill = norm_dist_bs), color = NA) +
+  scale_fill_viridis_c(option = "mako", na.value = "grey90") +
+  labs(title = "Distance to blue space (the downweighted variable)") +
+  theme_void()
+```
+
+

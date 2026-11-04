@@ -1,0 +1,388 @@
+---
+title: "Figures 3 & 4 — GoGreenNext MCDA"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+    theme: flatly
+---
+
+## Build checklist
+
+Required files (all paths relative to `BASE = /PROJECTES/HIA/GreenSpace/GoGreenNext/MCDA`):
+
+| File | Status |
+|------|--------|
+| `Data/citydata/maltasurvey_jun26.csv` | `r if(file.exists(here::here("data/malta/maltasurvey_jun26.csv"))) "✓" else "**MISSING**"` |
+| `Data/citydata/klagenfurtsurvey_responses260907.csv` | `r if(file.exists(here::here("data/klagenfurt/klagenfurtsurvey_responses260907.csv"))) "✓" else "**MISSING**"` |
+| `Data/citydata/malta_mcda_processed_realloc.rds` | `r if(file.exists(here::here("data/malta/malta_mcda_processed_realloc.rds"))) "✓" else "**MISSING**"` |
+| `Data/citydata/klagenfurt_mcda_priority_may.rds` | `r if(file.exists(here::here("data/klagenfurt/klagenfurt_mcda_priority_may.rds"))) "✓" else "**MISSING**"` |
+| `Data/citydata/malta_union_boundary.rds` | `r if(file.exists(here::here("data/malta/malta_union_boundary.rds"))) "✓" else "**MISSING**"` |
+| `Data/citydata/klagenfurt_boundary.rds` | `r if(file.exists(here::here("data/klagenfurt/klagenfurt_boundary.rds"))) "✓" else "**MISSING**"` |
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.align = "center")
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(sf)
+library(patchwork)
+
+BASE      <- here::here()
+DATA      <- file.path(BASE, "data/malta")
+DATA_KLAG <- file.path(BASE, "data/klagenfurt")
+OUT       <- file.path(DATA, "outputs")
+dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
+
+# ── shared theme ─────────────────────────────────────────────────────────────
+map_theme_fig <- function() {
+  theme_void() +
+    theme(
+      legend.position   = "right",
+      legend.title      = element_text(size = 7, face = "bold", colour = "#2B2D2B"),
+      legend.text       = element_text(size = 6.5, colour = "#2B2D2B"),
+      plot.title        = element_text(size = 9, face = "bold", colour = "#2C5F2D",
+                                       hjust = 0, margin = margin(b = 3)),
+      plot.background   = element_rect(fill = "white", colour = NA),
+      panel.background  = element_rect(fill = "white", colour = NA),
+      plot.margin       = margin(4, 4, 4, 4)
+    )
+}
+
+bar_theme_fig <- function() {
+  theme_minimal(base_size = 8) +
+    theme(
+      axis.title.x      = element_text(size = 7.5, colour = "#4B4B4B"),
+      axis.title.y      = element_blank(),
+      axis.text.y       = element_text(size = 7,   colour = "#2B2D2B", hjust = 1),
+      axis.text.x       = element_text(size = 6.5, colour = "#4B4B4B"),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor   = element_blank(),
+      panel.grid.major.x = element_line(colour = "grey90", linewidth = 0.3),
+      plot.background   = element_rect(fill = "white", colour = NA),
+      plot.margin       = margin(4, 8, 4, 4)
+    )
+}
+
+# quintile colour ramp (Q1=low priority → Q5=high priority)
+quint_colours <- c(
+  "Q1 (lowest)" = "#1a9641",
+  "Q2"          = "#a6d96a",
+  "Q3"          = "#ffffbf",
+  "Q4"          = "#fdae61",
+  "Q5 (highest)"= "#d73027"
+)
+
+# significance stars
+sig_label <- function(p) {
+  dplyr::case_when(
+    p < 0.001 ~ "***",
+    p < 0.01  ~ "**",
+    p < 0.05  ~ "*",
+    TRUE      ~ "ns"
+  )
+}
+```
+
+---
+
+```{r survey-summaries}
+# ── Malta survey ─────────────────────────────────────────────────────────────
+malta_survey_raw <- read.csv(file.path(DATA, "maltasurvey_jun26.csv"),
+                             stringsAsFactors = FALSE)
+
+malta_budget_cols <- c(
+  "Lack.recreational.facilities", "overcrowding", "poor.accessibility",
+  "lack.blue.spaces", "poor.airquality", "noise.pollution", "urban.heat",
+  "lack.street.greenery", "grey.infrastracture", "traffic.dominance"
+)
+
+malta_labels <- c(
+  "Lack.recreational.facilities" = "Lack of recreational facilities",
+  "overcrowding"                 = "Overcrowding",
+  "poor.accessibility"           = "Poor accessibility",
+  "lack.blue.spaces"             = "Lack of blue spaces",
+  "poor.airquality"              = "Poor air quality",
+  "noise.pollution"              = "Noise pollution",
+  "urban.heat"                   = "Urban heat",
+  "lack.street.greenery"         = "Lack of street greenery",
+  "grey.infrastracture"          = "Grey infrastructure",
+  "traffic.dominance"            = "Traffic dominance"
+)
+
+# convert to % (total = €1,000; equal weight = 10%)
+malta_equal_pct <- 10
+
+malta_survey_pct <- malta_survey_raw %>%
+  dplyr::select(dplyr::all_of(malta_budget_cols)) %>%
+  dplyr::mutate(dplyr::across(dplyr::everything(), ~ . / 10))
+
+malta_n <- nrow(malta_survey_pct)
+
+malta_summary <- purrr::map_dfr(malta_budget_cols, function(col) {
+  vals   <- malta_survey_pct[[col]]
+  tt     <- t.test(vals, mu = malta_equal_pct)
+  tibble::tibble(
+    criterion   = col,
+    label       = malta_labels[col],
+    n           = length(vals),
+    mean_pct    = mean(vals),
+    ci_lower    = tt$conf.int[1],
+    ci_upper    = tt$conf.int[2],
+    t_stat      = as.numeric(tt$statistic),
+    p_value     = tt$p.value,
+    direction   = ifelse(mean(vals) > malta_equal_pct, "above", "below")
+  )
+})
+
+saveRDS(malta_summary, file.path(OUT, "malta_survey_summary.rds"))
+
+# ── Klagenfurt survey ─────────────────────────────────────────────────────────
+klag_survey_raw <- read.csv(file.path(DATA_KLAG, "klagenfurtsurvey_responses260907.csv"),
+                            stringsAsFactors = FALSE)
+
+klag_budget_cols <- c(
+  "alloc_1_TooHotStreets", "alloc_2_GreenOutOfReach",
+  "alloc_3_LowIncomeNeighborhoods", "alloc_4_HighTrafficAreas",
+  "alloc_5_PoorAirQuality", "alloc_6_DisconnectedNatureWater"
+)
+
+klag_labels <- c(
+  "alloc_1_TooHotStreets"             = "Too-hot streets",
+  "alloc_2_GreenOutOfReach"           = "Green out of reach",
+  "alloc_3_LowIncomeNeighborhoods"    = "Low-income neighbourhoods",
+  "alloc_4_HighTrafficAreas"          = "High-traffic areas",
+  "alloc_5_PoorAirQuality"            = "Poor air quality",
+  "alloc_6_DisconnectedNatureWater"   = "Disconnected nature/water"
+)
+
+# replace NA with 0 per CLAUDE.md convention, then convert to %
+# (total = €1,000,000; equal weight = 16.667%)
+klag_equal_pct <- 100 / 6
+
+klag_survey_pct <- klag_survey_raw %>%
+  dplyr::select(dplyr::all_of(klag_budget_cols)) %>%
+  dplyr::mutate(dplyr::across(dplyr::all_of(klag_budget_cols), ~ tidyr::replace_na(., 0))) %>%
+  dplyr::mutate(dplyr::across(dplyr::everything(), ~ . / 10000))
+
+klag_n <- nrow(klag_survey_pct)
+
+klag_summary <- purrr::map_dfr(klag_budget_cols, function(col) {
+  vals <- klag_survey_pct[[col]]
+  tt   <- t.test(vals, mu = klag_equal_pct)
+  tibble::tibble(
+    criterion   = col,
+    label       = klag_labels[col],
+    n           = length(vals),
+    mean_pct    = mean(vals),
+    ci_lower    = tt$conf.int[1],
+    ci_upper    = tt$conf.int[2],
+    t_stat      = as.numeric(tt$statistic),
+    p_value     = tt$p.value,
+    direction   = ifelse(mean(vals) > klag_equal_pct, "above", "below")
+  )
+})
+
+saveRDS(klag_summary, file.path(OUT, "klag_survey_summary.rds"))
+
+cat("Malta n =", malta_n, "| Klagenfurt n =", klag_n, "\n")
+cat("Survey summaries saved to", OUT, "\n")
+```
+
+---
+
+## Figure 3 — Malta: citizen priorities and spatial distribution
+
+```{r fig3-malta, fig.width=7.09, fig.height=3.94}
+# fig.width/height in inches = 180mm × 100mm at 300 dpi display hint
+
+# ── load spatial data ─────────────────────────────────────────────────────────
+# Reallocated population version (canonical for Malta; same criteria and priority_citizen as
+# the non reallocated file, checked 2026-11-03)
+malta_grid    <- readRDS(file.path(DATA, "malta_mcda_processed_realloc.rds"))
+malta_border  <- readRDS(file.path(DATA, "malta_union_boundary.rds"))
+
+# ── panel a: citizen-priorities bar chart ────────────────────────────────────
+malta_plot_df <- malta_summary %>%
+  dplyr::mutate(
+    label    = factor(label, levels = label[order(mean_pct)]),
+    sig      = sig_label(p_value),
+    sig_col  = ifelse(direction == "above", "#1a7a2e", "#b84c4c")
+  )
+
+p_malta_bar <- ggplot(malta_plot_df,
+                      aes(x = mean_pct, y = label, colour = direction)) +
+  geom_vline(xintercept = malta_equal_pct,
+             linetype = "dashed", colour = "#888888", linewidth = 0.4) +
+  geom_segment(aes(x = ci_lower, xend = ci_upper, y = label, yend = label),
+               linewidth = 0.5, alpha = 0.7) +
+  geom_point(size = 2.2) +
+  geom_text(aes(x = ci_upper + 0.35, label = sig),
+            size = 2.2, hjust = 0, colour = "#4B4B4B") +
+  scale_colour_manual(
+    values = c("above" = "#1a7a2e", "below" = "#b84c4c"),
+    guide  = "none"
+  ) +
+  scale_x_continuous(
+    name   = "Mean budget allocation (%)",
+    limits = c(NA, max(malta_plot_df$ci_upper) + 1.5),
+    expand = expansion(mult = c(0.02, 0.01))
+  ) +
+  labs(title = "(a) Citizen priorities — Malta",
+       subtitle = paste0("n = ", malta_n,
+                         "  ·  equal weight = ", malta_equal_pct, "%",
+                         "  ·  dashed line = equal weight")) +
+  bar_theme_fig() +
+  theme(plot.subtitle = element_text(size = 6, colour = "#6B7280",
+                                     margin = margin(b = 4)))
+
+# ── panel b: quintile priority map ───────────────────────────────────────────
+malta_map_df <- malta_grid %>%
+  dplyr::mutate(
+    quint = dplyr::ntile(priority_citizen, 5),
+    quint_label = dplyr::case_when(
+      quint == 1 ~ "Q1 (lowest)",
+      quint == 5 ~ "Q5 (highest)",
+      TRUE       ~ paste0("Q", quint)
+    ),
+    quint_label = factor(quint_label,
+                         levels = c("Q1 (lowest)", "Q2", "Q3", "Q4", "Q5 (highest)"))
+  )
+
+malta_border_sf <- sf::st_sf(geometry = malta_border, crs = 3035)
+
+p_malta_map <- ggplot(malta_map_df) +
+  geom_sf(aes(fill = quint_label), colour = NA) +
+  geom_sf(data = malta_border_sf, fill = NA, colour = "#2B2D2B", linewidth = 0.4) +
+  scale_fill_manual(
+    values = quint_colours,
+    name   = "Priority\nquintile",
+    drop   = FALSE
+  ) +
+  labs(title = "(b) Priority map — Malta") +
+  map_theme_fig()
+
+# ── combine with patchwork ───────────────────────────────────────────────────
+fig3 <- p_malta_bar + p_malta_map +
+  plot_layout(widths = c(1.1, 0.9))
+
+fig3
+
+# ── export ───────────────────────────────────────────────────────────────────
+ggsave(file.path(OUT, "Figure3_Malta.png"), fig3,
+       width = 180, height = 100, units = "mm", dpi = 300, bg = "white")
+ggsave(file.path(OUT, "Figure3_Malta.pdf"), fig3,
+       width = 180, height = 100, units = "mm", bg = "white")
+cat("Saved Figure3_Malta.png and Figure3_Malta.pdf\n")
+```
+
+**Figure 3.** Citizen priorities and spatial priority distribution for Malta (*n* = `r malta_n`).
+*(a)* Mean budget allocation (%) per criterion derived from the participatory survey (dots with 95% confidence intervals). The dashed reference line marks the equal-weight allocation (10% per criterion). Criteria coloured green were allocated significantly more than equal weight; red, significantly less. Significance symbols: \*\*\* *p* < 0.001, \*\* *p* < 0.01, \* *p* < 0.05, ns = not significant (one-sample *t*-test vs. equal weight).
+*(b)* Spatial distribution of the citizen-weighted composite priority score, classified into five quintiles (Q1 = lowest priority, Q5 = highest priority) across the 100 × 100 m grid.
+
+---
+
+## Figure 4 — Klagenfurt: citizen priorities and spatial distribution
+
+```{r fig4-klagenfurt, fig.width=7.09, fig.height=3.15}
+# fig.width/height in inches = 180mm × 80mm
+
+# ── load spatial data ─────────────────────────────────────────────────────────
+klag_grid   <- readRDS(file.path(DATA_KLAG, "klagenfurt_mcda_priority_may.rds"))
+klag_border <- readRDS(file.path(DATA_KLAG, "klagenfurt_boundary.rds"))
+
+# ── panel a: citizen-priorities bar chart ────────────────────────────────────
+klag_plot_df <- klag_summary %>%
+  dplyr::mutate(
+    label   = factor(label, levels = label[order(mean_pct)]),
+    sig     = sig_label(p_value),
+    sig_col = ifelse(direction == "above", "#1a7a2e", "#b84c4c")
+  )
+
+p_klag_bar <- ggplot(klag_plot_df,
+                     aes(x = mean_pct, y = label, colour = direction)) +
+  geom_vline(xintercept = klag_equal_pct,
+             linetype = "dashed", colour = "#888888", linewidth = 0.4) +
+  geom_segment(aes(x = ci_lower, xend = ci_upper, y = label, yend = label),
+               linewidth = 0.5, alpha = 0.7) +
+  geom_point(size = 2.2) +
+  geom_text(aes(x = ci_upper + 0.3, label = sig),
+            size = 2.2, hjust = 0, colour = "#4B4B4B") +
+  scale_colour_manual(
+    values = c("above" = "#1a7a2e", "below" = "#b84c4c"),
+    guide  = "none"
+  ) +
+  scale_x_continuous(
+    name   = "Mean budget allocation (%)",
+    limits = c(NA, max(klag_plot_df$ci_upper) + 1.2),
+    expand = expansion(mult = c(0.02, 0.01))
+  ) +
+  labs(title = "(a) Citizen priorities — Klagenfurt",
+       subtitle = paste0("n = ", klag_n,
+                         "  ·  equal weight = ", round(klag_equal_pct, 1), "%",
+                         "  ·  dashed line = equal weight")) +
+  bar_theme_fig() +
+  theme(plot.subtitle = element_text(size = 6, colour = "#6B7280",
+                                     margin = margin(b = 4)))
+
+# ── panel b: quintile priority map ───────────────────────────────────────────
+klag_map_df <- klag_grid %>%
+  dplyr::mutate(
+    quint = dplyr::ntile(priority_citizen, 5),
+    quint_label = dplyr::case_when(
+      quint == 1 ~ "Q1 (lowest)",
+      quint == 5 ~ "Q5 (highest)",
+      TRUE       ~ paste0("Q", quint)
+    ),
+    quint_label = factor(quint_label,
+                         levels = c("Q1 (lowest)", "Q2", "Q3", "Q4", "Q5 (highest)"))
+  )
+
+p_klag_map <- ggplot(klag_map_df) +
+  geom_sf(aes(fill = quint_label), colour = NA) +
+  geom_sf(data = klag_border, fill = NA, colour = "#2B2D2B", linewidth = 0.4) +
+  scale_fill_manual(
+    values = quint_colours,
+    name   = "Priority\nquintile",
+    drop   = FALSE
+  ) +
+  labs(title = "(b) Priority map — Klagenfurt") +
+  map_theme_fig()
+
+# ── combine with patchwork ───────────────────────────────────────────────────
+fig4 <- p_klag_bar + p_klag_map +
+  plot_layout(widths = c(1, 1))
+
+fig4
+
+# ── export ───────────────────────────────────────────────────────────────────
+ggsave(file.path(OUT, "Figure4_Klagenfurt.png"), fig4,
+       width = 180, height = 80, units = "mm", dpi = 300, bg = "white")
+ggsave(file.path(OUT, "Figure4_Klagenfurt.pdf"), fig4,
+       width = 180, height = 80, units = "mm", bg = "white")
+cat("Saved Figure4_Klagenfurt.png and Figure4_Klagenfurt.pdf\n")
+```
+
+**Figure 4.** Citizen priorities and spatial priority distribution for Klagenfurt (*n* = `r klag_n`).
+*(a)* Mean budget allocation (%) per criterion (dots with 95% confidence intervals). The dashed reference line marks the equal-weight allocation (16.7% per criterion). Significance symbols as in Figure 3.
+*(b)* Spatial distribution of the citizen-weighted composite priority score in quintiles across the 100 × 100 m grid.
+
+---
+
+```{r session-info, echo=TRUE}
+cat("Outputs written to:", OUT, "\n")
+cat("Files:\n")
+cat(" -", file.path(OUT, "malta_survey_summary.rds"), "\n")
+cat(" -", file.path(OUT, "klag_survey_summary.rds"), "\n")
+cat(" -", file.path(OUT, "Figure3_Malta.png"), "\n")
+cat(" -", file.path(OUT, "Figure3_Malta.pdf"), "\n")
+cat(" -", file.path(OUT, "Figure4_Klagenfurt.png"), "\n")
+cat(" -", file.path(OUT, "Figure4_Klagenfurt.pdf"), "\n")
+sessionInfo()
+```

@@ -1,0 +1,1482 @@
+---
+title: "MCDA Priority Map – Klagenfurt"
+author: "Mariana Mauriño"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 12,
+  fig.height = 6
+)
+```
+
+# 0. Setup
+
+```{r libraries-and-paths}
+library(tidyverse)
+library(sf)
+library(terra)
+library(arrow)
+library(ggcorrplot)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+library(readxl)
+
+data_dir     <- here::here("data/klagenfurt")
+ggn_data_dir <- here::here("data")
+out_dir      <- file.path(data_dir, "correlations")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+klagenfurt <- readRDS(file.path(data_dir, "klagenfurt_master_full.rds"))
+klag_border <- readRDS(file.path(data_dir, "klagenfurt_boundary.rds"))
+cat("Columns:", ncol(klagenfurt), "| Rows:", nrow(klagenfurt), "\n")
+```
+
+
+# 1. Data Preparation
+
+## 1.1 Join Accessibility Metrics
+
+Walking time to nearest green space comes from a network analysis on the street grid.
+The green space definition is still preliminary (class: urban green areas public access, forests, herbaceous vegetation and wetlands from Urban Atlas 2021) and will be revised with
+a more conservative classification. Cells without population (airports, large parks, etc.)
+are excluded from the network analysis — they don't need a priority score anyway.
+
+```{r join-accessibility}
+access <- read_parquet(
+  here::here("output/accessibility/outputs-accesibility/klagenfurt/new/klagenfurt_nearest_ua2021/results/final_metrics.parquet")
+)
+
+access <- access %>%
+  mutate(
+    unit_id          = as.character(unit_id),
+    nearest_green_min = nearest_green_sec / 60
+  )
+
+klagenfurt$ID <- as.character(klagenfurt$ID)
+
+klagenfurt <- klagenfurt %>%
+  left_join(access %>% select(unit_id, nearest_green_min),
+            by = c("ID" = "unit_id"),
+            suffix = c("_old", ""))
+
+cat("Accessibility matched:", sum(!is.na(klagenfurt$nearest_green_min)),
+    "out of", nrow(klagenfurt), "\n")
+summary(klagenfurt$nearest_green_min)
+```
+
+### Walking time histogram with category thresholds
+
+I use a categorical normalization for walking time: 0–5 min (low priority), 5–10 min,
+10–15 min, and >15 min (highest priority). 
+```{r accessibility-histogram}
+ggplot(klagenfurt %>% st_drop_geometry() %>% filter(!is.na(nearest_green_min)),
+       aes(x = nearest_green_min)) +
+  geom_histogram(bins = 50, fill = "#5DCAA5", color = "white") +
+  geom_vline(xintercept = c(5, 10, 15), linetype = "dashed", color = "#D85A30") +
+  labs(title = "Walking time to nearest green space: Klagenfurt",
+       subtitle = "Dashed lines = category thresholds (5, 10, 15 min)",
+       x = "Minutes", y = "Frequency") +
+  theme_minimal()
+```
+
+
+## 1.2 Join Air Pollution (2021)
+
+I have air pollution data for both 2018 and 2021, but 2021 has incomplete spatial coverage (It does not include the gridcell without population). So I compare the two years:
+if the spatial pattern is stable and only the absolute level shifted,
+I can fill missing 2021 cells using the 2018 values adjusted by the mean difference.
+
+```{r join-air-pollution}
+no2_21  <- read_csv(file.path(ggn_data_dir, "grid_no2_21.csv"))
+pm25_21 <- read_csv(file.path(ggn_data_dir, "grid_pm25_21.csv"))
+
+no2_21$ID  <- as.character(no2_21$ID)
+pm25_21$ID <- as.character(pm25_21$ID)
+
+klagenfurt <- klagenfurt %>%
+  left_join(no2_21  %>% select(ID, no2_avg_21),  by = "ID") %>%
+  left_join(pm25_21 %>% select(ID, pm25_avg_21), by = "ID")
+
+cat("NO2 2021 matched:",  sum(!is.na(klagenfurt$no2_avg_21)),  "out of", nrow(klagenfurt), "\n")
+cat("PM2.5 2021 matched:", sum(!is.na(klagenfurt$pm25_avg_21)), "out of", nrow(klagenfurt), "\n")
+```
+
+### Coverage comparison: 2018 vs 2021
+
+```{r coverage-comparison, fig.height=8}
+p1 <- ggplot(klagenfurt) +
+  geom_sf(aes(fill = no2_avg_18), color = NA) +
+  scale_fill_viridis_c(option = "inferno", na.value = "#D85A30", name = "NO2\nµg/m³") +
+  labs(title = "NO2 2018") + theme_void()
+
+p2 <- ggplot(klagenfurt) +
+  geom_sf(aes(fill = pm25_avg_18), color = NA) +
+  scale_fill_viridis_c(option = "inferno", na.value = "#D85A30", name = "PM2.5\nµg/m³") +
+  labs(title = "PM2.5 2018") + theme_void()
+
+p3 <- ggplot(klagenfurt) +
+  geom_sf(aes(fill = no2_avg_21), color = NA) +
+  scale_fill_viridis_c(option = "inferno", na.value = "#D85A30", name = "NO2\nµg/m³") +
+  labs(title = "NO2 2021 (gaps in orange)") + theme_void()
+
+p4 <- ggplot(klagenfurt) +
+  geom_sf(aes(fill = pm25_avg_21), color = NA) +
+  scale_fill_viridis_c(option = "inferno", na.value = "#D85A30", name = "PM2.5\nµg/m³") +
+  labs(title = "PM2.5 2021 (gaps in orange)") + theme_void()
+
+(p1 + p2) / (p3 + p4)
+```
+
+### Temporal stability check
+
+```{r temporal-comparison}
+both <- klagenfurt %>%
+  st_drop_geometry() %>%
+  filter(!is.na(no2_avg_18) & !is.na(no2_avg_21))
+
+cat("Cells with both years:", nrow(both), "\n\n")
+cat("NO2  — 2018 mean:", round(mean(both$no2_avg_18), 2),
+    "| 2021 mean:", round(mean(both$no2_avg_21), 2),
+    "| r =", round(cor(both$no2_avg_18, both$no2_avg_21), 3),
+    "| Δ =", round(mean(both$no2_avg_21 - both$no2_avg_18), 2), "\n")
+cat("PM2.5 — 2018 mean:", round(mean(both$pm25_avg_18), 2),
+    "| 2021 mean:", round(mean(both$pm25_avg_21), 2),
+    "| r =", round(cor(both$pm25_avg_18, both$pm25_avg_21), 3),
+    "| Δ =", round(mean(both$pm25_avg_21 - both$pm25_avg_18), 2), "\n")
+```
+
+```{r scatterplots-2018-vs-2021}
+p1 <- ggplot(both, aes(x = no2_avg_18, y = no2_avg_21)) +
+  geom_point(alpha = 0.2, size = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "#D85A30", linetype = "dashed") +
+  labs(title = "NO2: 2018 vs 2021", x = "2018", y = "2021") +
+  theme_minimal()
+
+p2 <- ggplot(both, aes(x = pm25_avg_18, y = pm25_avg_21)) +
+  geom_point(alpha = 0.2, size = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "#D85A30", linetype = "dashed") +
+  labs(title = "PM2.5: 2018 vs 2021", x = "2018", y = "2021") +
+  theme_minimal()
+
+p1 + p2
+```
+
+### Gap-filling decision
+The spatial pattern didn't change much between 2018 and 2021 (high correlations), only the
+absolute levels shifted. I use `coalesce()` to fill missing 2021 cells with the 2018 value
+adjusted by the mean difference between years. This creates a "final" variable for each
+pollutant that has complete spatial coverage.- to check-
+
+```{r gap-filling}
+klagenfurt <- klagenfurt %>%
+  mutate(
+    no2_final  = coalesce(no2_avg_21, no2_avg_18 - 3.35),
+    pm25_final = coalesce(pm25_avg_21, pm25_avg_18 - 0.97)
+  )
+
+cat("NO2 still missing:",  sum(is.na(klagenfurt$no2_final)), "\n")
+cat("PM2.5 still missing:", sum(is.na(klagenfurt$pm25_final)), "\n")
+```
+
+```{r final-pollution-maps}
+p1 <- ggplot(klagenfurt) +
+  geom_sf(aes(fill = no2_final), color = NA) +
+  scale_fill_viridis_c(option = "inferno", na.value = "#D85A30", name = "NO2\nµg/m³") +
+  labs(title = "NO2 final (gap-filled)") + theme_void()
+
+p2 <- ggplot(klagenfurt) +
+  geom_sf(aes(fill = pm25_final), color = NA) +
+  scale_fill_viridis_c(option = "inferno", na.value = "#D85A30", name = "PM2.5\nµg/m³") +
+  labs(title = "PM2.5 final (gap-filled)") + theme_void()
+
+p1 + p2
+```
+
+
+## 1.3 Fill Traffic NAs
+Traffic volume data only exists for cells on major roads. Cells without major roads are
+not "missing" — they genuinely have no major-road traffic. I fill them with 0, but I will try to find the way they reflect low traffic, and not necessary 0.
+
+```{r fill-traffic}
+cat("Traffic NAs before:", sum(is.na(klagenfurt$new_trafficvol)), "\n")
+klagenfurt <- klagenfurt %>%
+  mutate(new_trafficvol = replace_na(new_trafficvol, 0))
+cat("Traffic NAs after:", sum(is.na(klagenfurt$new_trafficvol)), "\n")
+```
+
+```{r}
+ses <- st_read(file.path(data_dir, "klagenfurt_grid_100m_income.geojson"))
+
+# Inspect
+glimpse(ses)
+st_crs(ses)
+```
+
+```{r}
+# Quick distribution check
+summary(ses$income)
+summary(ses$income_weighted)
+
+# Join both columns by ID
+klagenfurt <- klagenfurt %>%
+  left_join(
+    ses %>% st_drop_geometry() %>% select(ID, income, income_weighted),
+    by = "ID"
+  )
+
+cat("Income matched:", sum(!is.na(klagenfurt$income)), "out of", nrow(klagenfurt), "\n")
+cat("Income_weighted matched:", sum(!is.na(klagenfurt$income_weighted)), "out of", nrow(klagenfurt), "\n")
+
+# Common limits across both variables
+shared_limits <- range(c(klagenfurt$income, klagenfurt$income_weighted), 
+                       na.rm = TRUE)
+
+# Common breaks
+shared_breaks <- pretty(shared_limits, n = 5)
+
+p1 <- ggplot(klagenfurt) +
+  geom_sf(aes(fill = income), color = NA) +
+  scale_fill_viridis_c(option = "rocket", direction = -1, 
+                       na.value = "grey90",
+                       name = "€",
+                       limits = shared_limits,
+                       breaks = shared_breaks) +
+  labs(title = "Income (raw)") +
+  theme_void()
+
+p2 <- ggplot(klagenfurt) +
+  geom_sf(aes(fill = income_weighted), color = NA) +
+  scale_fill_viridis_c(option = "rocket", direction = -1, 
+                       na.value = "grey90",
+                       name = "€",
+                       limits = shared_limits,
+                       breaks = shared_breaks) +
+  labs(title = "Income (spatially weighted)") +
+  theme_void()
+
+# Use a single shared legend
+p1 + p2 + plot_layout(guides = "collect")
+```
+
+```{r}
+klagenfurt %>%
+  st_drop_geometry() %>%
+  select(income, income_weighted) %>%
+  pivot_longer(everything()) %>%
+  ggplot(aes(x = value, fill = name)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("income" = "#5DCAA5", "income_weighted" = "#85B7EB")) +
+  labs(title = "Income distribution at 100 m grid",
+       x = "€ per cell", y = "Density", fill = NULL) +
+  theme_minimal()
+
+quantile(klagenfurt$income, c(0, 0.05, 0.25, 0.5, 0.75, 0.95, 1), na.rm = TRUE)
+```
+```{r}
+length(unique(na.omit(klagenfurt$income)))
+length(unique(na.omit(klagenfurt$income_weighted)))
+```
+
+## 1.4 Variable Definitions
+
+All six MCDA input variables. Direction = "benefit" means higher values → worse conditions → higher priority for greening intervention.
+
+"Vulnerable population" is the 6th criterion from the survey but I don't have
+the spatial data for it yet. It will be added later (composite index from elderly people and SES)
+
+```{r variable-info}
+var_info <- tibble::tribble(
+  ~var,                ~label,                     ~unit,   ~direction,
+  "lst",               "Land Surface Temperature", "°C",    "benefit",
+  "dist_bs",           "Distance to Blue Space",   "m",     "benefit",
+  "new_trafficvol",    "Traffic Volume",            "count", "benefit",
+  "no2_final",         "NO2 (annual mean)",         "µg/m³", "benefit",
+  "pm25_final",        "PM2.5 (annual mean)",       "µg/m³", "benefit",
+  "nearest_green_min", "Time to Green Space",       "min",   "benefit"
+)
+```
+
+
+# 2. Descriptive Statistics
+
+```{r descriptive-stats}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 14, fig.height = 6
+)
+mcda_vars <- var_info$var
+
+desc_stats <- klagenfurt %>%
+  st_drop_geometry() %>%
+  select(all_of(mcda_vars)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  group_by(variable) %>%
+  summarise(
+    n_valid   = sum(!is.na(value)),
+    n_missing = sum(is.na(value)),
+    min       = min(value, na.rm = TRUE),
+    p2        = quantile(value, 0.02, na.rm = TRUE),
+    q1        = quantile(value, 0.25, na.rm = TRUE),
+    median    = median(value, na.rm = TRUE),
+    mean      = mean(value, na.rm = TRUE),
+    q3        = quantile(value, 0.75, na.rm = TRUE),
+    p98       = quantile(value, 0.98, na.rm = TRUE),
+    max       = max(value, na.rm = TRUE),
+    sd        = sd(value, na.rm = TRUE),
+    skewness  = (mean(value, na.rm = TRUE) - median(value, na.rm = TRUE)) / sd(value, na.rm = TRUE),
+    .groups   = "drop"
+  ) %>%
+  left_join(var_info, by = c("variable" = "var")) %>%
+  relocate(label, unit, .after = variable)
+
+desc_stats %>%
+  mutate(across(where(is.numeric), ~round(., 2))) %>%
+  kable(caption = "Descriptive statistics of MCDA input variables") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+```
+
+
+# 3. Variable Exploration
+
+## 3.1 Distributions
+
+```{r histograms, fig.height=10}
+klagenfurt %>%
+  st_drop_geometry() %>%
+  select(all_of(mcda_vars)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  left_join(var_info, by = c("variable" = "var")) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 50, fill = "#5DCAA5", color = "white", alpha = 0.8) +
+  facet_wrap(~ paste0(label, " (", unit, ")"), scales = "free", ncol = 2) +
+  labs(title = "Distribution of MCDA input variables: Klagenfurt",
+       x = "Value", y = "Frequency") +
+  theme_minimal(base_size = 11) +
+  theme(strip.text = element_text(face = "bold", size = 9))
+```
+
+```{r boxplots, fig.height=10}
+klagenfurt %>%
+  st_drop_geometry() %>%
+  select(all_of(mcda_vars)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  left_join(var_info, by = c("variable" = "var")) %>%
+  ggplot(aes(y = value)) +
+  geom_boxplot(fill = "#85B7EB", alpha = 0.7, outlier.colour = "#D85A30", outlier.size = 1) +
+  facet_wrap(~ paste0(label, " (", unit, ")"), scales = "free", ncol = 2) +
+  labs(title = "Boxplots of MCDA input variables: Klagenfurt",
+       subtitle = "Orange dots = statistical outliers (beyond 1.5 × IQR)",
+       y = "Value") +
+  theme_minimal(base_size = 11) +
+  theme(strip.text = element_text(face = "bold", size = 9),
+        axis.text.x = element_blank(), axis.ticks.x = element_blank())
+```
+#not sure if just with normalizing isfine for this outliers.
+
+## 3.2 Traffic Volume 
+Only ~10% of cells have any traffic data (major roads only), so the distribution is extremely zero-inflated. Among non-zero cells, the
+log-scale density reveals a bimodal shape — a small cluster of low-traffic cells and a large peak around 500–1000 vehicles.
+
+I explored two normalization approaches:
+
+1. **Categorical** (main): collapse into 3 levels based on natural breaks
+2. **Log capped at p98** (sensitivity): continuous but handles zeros and outliers
+
+```{r traffic-overview, fig.height=4}
+#I am keeping just major roads, that means, take out all the gridcells where traffic=0. The big green bar at the left isn't zeros, it's the very small non-zero values (like 1–20).
+traffic_valid <- klagenfurt %>%
+  st_drop_geometry() %>%
+  filter(new_trafficvol > 0)
+
+cat("Cells with traffic data:", nrow(traffic_valid),
+    "out of", nrow(klagenfurt),
+    paste0("(", round(100 * nrow(traffic_valid) / nrow(klagenfurt), 1), "%)"), "\n")
+
+p1 <- ggplot(traffic_valid, aes(x = new_trafficvol)) +
+  geom_histogram(bins = 50, fill = "#5DCAA5", color = "white") +
+  labs(title = "Raw distribution (non-zero only)", x = "Traffic volume", y = "Frequency") +
+  theme_minimal()
+
+p2 <- ggplot(traffic_valid, aes(x = new_trafficvol)) +
+  geom_histogram(bins = 50, fill = "#85B7EB", color = "white") +
+  scale_x_log10() +
+  labs(title = "Log scale (non-zero only)", x = "Traffic volume (log)", y = "Frequency") +
+  theme_minimal()
+
+p1 + p2
+```
+
+### Density with classification cutoffs
+After inspecting the density, I grouped cells without a major road (=0) with low-traffic roads (≤ 50 vehicles). Then a second cutoff at 564 (the 98th percentile)-
+```{r}
+ggplot(traffic_valid, aes(x = new_trafficvol)) +
+  geom_histogram(bins = 50, fill = "#5DCAA5", color = "white") +
+  geom_vline(xintercept = c(50, 564), color = "red", linetype = "dashed") +
+  labs(title = "Traffic volume (cells with major roads)",
+       subtitle = "Dashed lines = category boundaries (50, 564)",
+       x = "Traffic volume", y = "Frequency") +
+  theme_minimal()
+``` 
+
+
+```{r traffic-density}
+ggplot(traffic_valid, aes(x = new_trafficvol)) +
+  geom_density(fill = "#5DCAA5", alpha = 0.5) +
+  geom_vline(xintercept = c(50, 564), color = "red", linetype = "dashed") +
+  scale_x_log10() +
+  labs(title = "Traffic volume density (log scale): classification cutoffs",
+       subtitle = "Dashed lines = category boundaries (7, 564)",
+       x = "Traffic volume (log scale)") +
+  theme_minimal()
+```
+
+### Traffic maps: raw, log, and categorical
+
+```{r traffic-maps, fig.height=12}
+p_raw <- ggplot(klagenfurt) +
+  geom_sf(aes(fill = new_trafficvol), color = NA) +
+  scale_fill_viridis_c(option = "magma", name = "Count", na.value = "grey85") +
+  labs(title = "Raw") + theme_void()
+
+p_log <- ggplot(klagenfurt) +
+  geom_sf(aes(fill = log1p(new_trafficvol)), color = NA) +
+  scale_fill_viridis_c(option = "magma", name = "log(count)",
+                       labels = function(x) round(expm1(x))) +
+  labs(title = "Log scale") + theme_void()
+
+klagenfurt <- klagenfurt %>%
+  mutate(traffic_cat_label = case_when(
+    new_trafficvol <= 50   ~ "No major road / negligible",
+    new_trafficvol <= 564 ~ "Medium",
+    TRUE                  ~ "High (above p98)"
+  ) %>% factor(levels = c("No major road / negligible", "Medium", "High (above p98)")))
+
+p_cat <- ggplot() +
+  geom_sf(data = klagenfurt, aes(fill = traffic_cat_label), color = NA) +
+  geom_sf(data = klag_border,
+          fill = NA, color = "#4a4a4a", linewidth = 0.35) +
+  scale_fill_manual(values = c("No major road / negligible" = "#f0f0f0",
+                               "Medium" = "#d7301f",
+                               "High (above p98)" = "#3d0000"),
+                    name = "Category") +
+  labs(title = "Categorical (main approach)") + theme_void()
+
+p_raw / p_log / p_cat +
+  plot_annotation(title = "Traffic Volume – Klagenfurt: three normalization approaches")
+```
+
+### Extreme cells (above p98)
+
+Cells above p98 (~564 vehicles).  need to checked with Google Maps 
+```{r traffic-extremes}
+ggplot() +
+  geom_sf(data = klagenfurt, fill = "grey90", color = NA) +
+  geom_sf(data = klagenfurt %>% filter(new_trafficvol > 564),
+          aes(fill = new_trafficvol), color = NA) +
+  scale_fill_viridis_c(option = "inferno", name = "Traffic\nvolume") +
+  labs(title = "Traffic volume: cells above p98 (564)") +
+  theme_void()
+```
+
+
+# 4. Correlation Analysis
+
+Spearman rank correlation between the raw MCDA variables. I use Spearman because most
+variables don't follow a normal distribution. The goal is to check for redundancy:
+if two variables have |r| > 0.70, they may be measuring the same spatial dimension
+and I need to decide how to handle that.
+
+**Key findings:**
+
+- NO2 and PM2.5 have r = 0.77, which is above the 0.70 threshold. Since both represent
+  "air pollution", I treat them as sub-indicators of a single criterion and split the
+  citizen-derived air pollution weight equally between them.
+- LST correlates moderately with time to green (0.67) and NO2 (0.64). These are expected
+  (heat islands lack vegetation and have traffic) but the variables capture different
+  dimensions (thermal stress vs. accessibility vs. air quality), so I keep all three.
+- Distance to blue space is essentially independent of everything else (~0). Good — it
+  adds unique spatial information.
+- Traffic is weakly correlated with other variables (max r = 0.36 with NO2). Expected
+  since only 10% of cells have traffic data.
+
+```{r correlation-function}
+cor_labs <- c(lst               = "LST",
+              dist_bs           = "Dist. Blue Space",
+              new_trafficvol    = "Traffic",
+              no2_final         = "NO2",
+              nearest_green_min = "Time to Green",
+              pm25_final        = "PM2.5")
+
+run_cor <- function(df, vars, title) {
+  df_cor <- df %>% st_drop_geometry() %>% select(all_of(vars)) %>% drop_na()
+  cat("Complete cases for correlation:", nrow(df_cor), "\n")
+  mat <- cor(df_cor, method = "spearman")
+  rownames(mat) <- cor_labs[rownames(mat)]
+  colnames(mat) <- cor_labs[colnames(mat)]
+  ggcorrplot(mat, type = "lower", lab = TRUE, lab_size = 3.5,
+             colors = c("#D85A30", "white", "#1D9E75"),
+             title = title,
+             ggtheme = theme_minimal(base_size = 11))
+}
+```
+
+```{r correlation-plot}
+mcda_vars_cor <- c("lst", "dist_bs", "new_trafficvol", "no2_final",
+                   "nearest_green_min", "pm25_final")
+
+run_cor(klagenfurt, mcda_vars_cor, "Spearman correlation – Klagenfurt MCDA inputs")
+```
+
+Makes sense. There is a strong correlation between NO2 and PM2.5, which are both indicators of air pollution. Still I think it worth using a composite indicator (dividing the weight for air pollution equally between both variables) 
+# 5. Normalization
+All variables are normalized to [0, 1] where **1 = highest priority for greening**.
+Normalization strategy per variable (decided after examining the distributions above):
+| Variable | Method | Rationale |
+|----------|--------|-----------|
+| LST | min-max, capped at p98 | Near-normal distribution. No absolute health threshold for satellite-derived LST, so treated as relative intra-urban variation. |
+| Dist. blue space | min-max, capped at p98 | Skewness = 0.11 (essentially symmetric), so log is unnecessary — tested and confirmed it distorts the distribution. |
+| NO2 | log + min-max, capped at p98 | Right-skewed, log compresses the tail and spreads the bulk. |
+| PM2.5 | min-max, capped at p98 | Narrow range (7.5–16 µg/m³), near-normal. |
+| Time to green | Categorical (0–5, 5–10, 10–15, >15 min) | Extremely right-skewed (most cells < 5 min). The health-relevant distinction is between "easily walkable" and "not". |
+| Traffic | Categorical (≤50 = 0, 50–564 = 0.5, >564 = 1) | 90% zero-inflated. Only 10% of cells have major road data. Bimodal among non-zero cells. |
+
+Traffic sensitivity analysis: log of values capped at p98 (continuous alternative).
+
+```{r normalization}
+normalize_minmax <- function(x, lower = NULL, upper = NULL) {
+  if (is.null(lower)) lower <- min(x, na.rm = TRUE)
+  if (is.null(upper)) upper <- max(x, na.rm = TRUE)
+  x <- pmin(x, upper)
+  x <- pmax(x, lower)
+  (x - lower) / (upper - lower)
+}
+
+p98_traffic <- quantile(klagenfurt$new_trafficvol, 0.98, na.rm = TRUE)
+
+klagenfurt <- klagenfurt %>%
+  mutate(
+    # ── Heat ──────────────────────────────────────────────────
+    norm_lst = normalize_minmax(lst,
+                                lower = min(lst, na.rm = TRUE),
+                                upper = quantile(lst, 0.98, na.rm = TRUE)),
+
+    # ── Distance to blue space ────────────────────────────────
+    norm_dist_bs = normalize_minmax(dist_bs,
+                                    lower = 0,
+                                    upper = quantile(dist_bs, 0.98, na.rm = TRUE)),
+
+    # ── NO2 ───────────────────────────────────────────────────
+    norm_no2 = normalize_minmax(log1p(no2_final),
+                                lower = log1p(min(no2_final, na.rm = TRUE)),
+                                upper = log1p(quantile(no2_final, 0.98, na.rm = TRUE))),
+
+    # ── PM2.5 ─────────────────────────────────────────────────
+    norm_pm25 = normalize_minmax(pm25_final,
+                                 lower = min(pm25_final, na.rm = TRUE),
+                                 upper = quantile(pm25_final, 0.98, na.rm = TRUE)),
+
+    # ── Accessibility: time to green space ────────────────────
+    norm_green_time = case_when(
+      nearest_green_min <= 5  ~ 0.00,
+      nearest_green_min <= 10 ~ 0.33,
+      nearest_green_min <= 15 ~ 0.67,
+      TRUE                    ~ 1.00
+    ),
+
+    # ── Traffic: MAIN (categorical) ───────────────────────────
+    norm_traffic_cat = case_when(
+      new_trafficvol <= 7    ~ 0.0,
+      new_trafficvol <= 564  ~ 0.5,
+      TRUE                   ~ 1.0
+    ),
+
+    # ── Traffic: SENSITIVITY (log capped at p98) ──────────────
+    norm_traffic_log = normalize_minmax(log1p(pmin(new_trafficvol, p98_traffic)),
+                                        lower = 0,
+                                        upper = log1p(p98_traffic)),
+
+    # ── SES: Income (main) ────────────────────────────────────
+    # Inverted: low income = high priority. Capped at p2–p98.
+    norm_income_weighted = 1 - normalize_minmax(
+      income_weighted,
+      lower = quantile(income_weighted, 0.02, na.rm = TRUE),
+      upper = quantile(income_weighted, 0.98, na.rm = TRUE)
+    ),
+
+    # ── SES: Income raw (sensitivity) ─────────────────────────
+    norm_income = 1 - normalize_minmax(
+      income,
+      lower = quantile(income, 0.02, na.rm = TRUE),
+      upper = quantile(income, 0.98, na.rm = TRUE)
+    )
+  )
+
+# Main analysis variable set
+norm_vars <- c("norm_lst", "norm_dist_bs", "norm_no2", "norm_pm25",
+               "norm_green_time", "norm_traffic_cat", "norm_income_weighted")
+
+# Sensitivity: swap norm_traffic_cat → norm_traffic_log
+# norm_vars_sens <- c("norm_lst", "norm_dist_bs", "norm_no2", "norm_pm25",
+#                     "norm_green_time", "norm_traffic_log", "norm_income")
+```
+
+
+## 5.1 Normalization Summary
+
+```{r normalization-summary}
+norm_all <- c(norm_vars, "norm_traffic_log", "norm_income")
+
+klagenfurt %>%
+  st_drop_geometry() %>%
+  select(all_of(norm_all)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  group_by(variable) %>%
+  summarise(
+    n_valid   = sum(!is.na(value)),
+    n_missing = sum(is.na(value)),
+    min       = min(value, na.rm = TRUE),
+    p2        = quantile(value, 0.02, na.rm = TRUE),
+    q1        = quantile(value, 0.25, na.rm = TRUE),
+    median    = median(value, na.rm = TRUE),
+    mean      = mean(value, na.rm = TRUE),
+    q3        = quantile(value, 0.75, na.rm = TRUE),
+    p98       = quantile(value, 0.98, na.rm = TRUE),
+    max       = max(value, na.rm = TRUE),
+    sd        = sd(value, na.rm = TRUE)
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(., 3))) %>%
+  arrange(variable) %>%
+  kable(caption = "Summary of normalized variables") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+```
+
+
+## 5.2 Normalized Distributions
+
+```{r normalized-histograms, fig.height=12}
+norm_labels <- c(
+  norm_lst          = "LST (min-max, p98)",
+  norm_dist_bs      = "Dist. Blue Space (min-max, p98)",
+  norm_no2          = "NO2 (log, p98)",
+  norm_pm25         = "PM2.5 (min-max, p98)",
+  norm_green_time   = "Time to Green (categorical)",
+  norm_traffic_cat  = "Traffic (categorical)",
+  norm_traffic_log  = "Traffic (log capped p98)",
+  norm_income_weighted = "Income (spatially weighted, min-max, p2–p98)",
+  norm_income       = "Income (raw, min-max, p2–p98)"
+)
+
+klagenfurt %>%
+  st_drop_geometry() %>%
+  select(all_of(names(norm_labels))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  mutate(variable = factor(norm_labels[variable], levels = norm_labels)) %>%
+  drop_na() %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill = "#5DCAA5", color = "white", linewidth = 0.2) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 2) +
+  labs(title = "Distribution of normalized MCDA variables – Klagenfurt",
+       x = "Normalized value (0–1)", y = "Frequency") +
+  theme_minimal(base_size = 11)
+```
+
+
+# 6. Citizen Survey Analysis
+
+## 6.1 Sample Description
+
+The survey used a budget allocation method: each respondent distributed a hypothetical
+€1,000,000 across 6 criteria for prioritizing green space interventions in Klagenfurt.
+The criteria were derived from stakeholder interviews and thematic analysis.
+
+```{r load-survey}
+survey <- read.csv(file.path(data_dir, "klagenfurtsurvey_responses260907.csv"))
+
+budget_cols <- c("alloc_1_TooHotStreets",
+                 "alloc_2_GreenOutOfReach",
+                 "alloc_3_LowIncomeNeighborhoods",
+                 "alloc_4_HighTrafficAreas",
+                 "alloc_5_PoorAirQuality",
+                 "alloc_6_DisconnectedNatureWater")
+```
+
+### Residency status cleanup
+
+The xlsx export auto-converted two of the `resident` text categories into spreadsheet
+date serials ("1-5" -> day 1, month 5 -> 46143; "5-10" -> day 5, month 10 -> 46300),
+so they're mapped back here. `"left-2-plus"` (respondents who used to live in
+Klagenfurt but left) isn't a residency-duration category and is excluded from the
+survey entirely.
+
+```{r resident-cleanup}
+resident_levels <- c("born", "0-1", "1-5", "5-10", "10+")
+
+n_before <- nrow(survey)
+
+survey <- survey %>%
+  mutate(resident = case_when(
+    resident %in% c("46143", "46143.0") ~ "1-5",
+    resident %in% c("46300", "46300.0") ~ "5-10",
+    TRUE                                ~ resident
+  )) %>%
+  filter(resident != "left-2-plus") %>%
+  mutate(resident = factor(resident, levels = resident_levels))
+
+cat("Excluded 'left-2-plus':", n_before - nrow(survey), "respondents\n")
+cat("Resident categories after cleanup:\n")
+print(table(survey$resident, useNA = "ifany"))
+```
+
+### Neighbourhood name cleanup
+
+`neighborhood` mixes proper German umlauts and ASCII transliterations for the same
+place (`wölfnitz` vs. `woelfnitz`), and one entry has a typo (`waidmannsdort` for
+`waidmannsdorf`). Canonicalized here to one display label per neighbourhood; `st_ruprecht_viktringer_vorstadt`/`welzenegg_voelkermarkter_vorstadt` are combined
+statistical districts and are kept separate from the standalone
+`viktringer_vorstadt`/`völkermarkter_vorstadt` answers since those are distinct
+official Klagenfurt Stadtteile.
+
+```{r neighborhood-cleanup}
+neighborhood_labels <- c(
+  "hallegg"                           = "Hallegg",
+  "st_martin"                         = "St. Martin",
+  "viktringer_vorstadt"               = "Viktringer Vorstadt",
+  "völkermarkter_vorstadt"            = "Völkermarkter Vorstadt",
+  "wölfnitz"                          = "Wölfnitz",
+  "woelfnitz"                         = "Wölfnitz",
+  "villacher_vorstadt"                = "Villacher Vorstadt",
+  "hoertendorf"                       = "Hörtendorf",
+  "st_peter_fischl"                   = "St. Peter-Fischl",
+  "st_ruprecht_viktringer_vorstadt"   = "St. Ruprecht-Viktringer Vorstadt",
+  "feschnig_st_veiter_vorstadt"       = "Feschnig-St. Veiter Vorstadt",
+  "innere_stadt_ring"                 = "Innere Stadt-Ring",
+  "kreuzbergl_villacher_vorstadt"     = "Kreuzbergl-Villacher Vorstadt",
+  "annabichl"                         = "Annabichl",
+  "viktring"                          = "Viktring",
+  "welzenegg_voelkermarkter_vorstadt" = "Welzenegg-Völkermarkter Vorstadt",
+  "st_martin_waidmannsdort"           = "St. Martin-Waidmannsdorf"
+)
+
+survey <- survey %>%
+  mutate(neighborhood = recode(neighborhood, !!!neighborhood_labels))
+
+cat("Neighbourhood categories after cleanup:\n")
+print(sort(table(survey$neighborhood, useNA = "ifany")))
+```
+
+```{r sample-description}
+cat("Total responses:", nrow(survey), "\n\n")
+
+# Flag rows with NAs in budget columns before imputing
+n_incomplete <- sum(!complete.cases(survey[budget_cols]))
+cat("Rows with NA in budget cols:", n_incomplete, "\n")
+
+# Replace NA budget values with 0: respondents who left a criterion blank
+# allocated their full budget to the remaining criteria (row sums to €1,000,000
+# with na.rm = TRUE), so NA is treated as €0 for that criterion.
+survey <- survey %>%
+  mutate(across(all_of(budget_cols), ~replace_na(., 0)))
+
+survey_sums <- survey %>%
+  rowwise() %>%
+  mutate(total = sum(c_across(all_of(budget_cols)))) %>%
+  ungroup()
+
+cat("All budgets sum to €1,000,000:", all(survey_sums$total == 1000000), "\n")
+cat("Budget totals:\n")
+print(table(survey_sums$total))
+
+survey_clean <- survey
+cat("\nUsing", nrow(survey_clean), "responses for analysis\n")
+```
+
+
+## 6.2 Demographics
+
+```{r demographics, fig.height=8}
+p_age <- ggplot(survey, aes(x = ageGroup)) +
+  geom_bar(fill = "#5DCAA5") +
+  labs(title = "Age group", x = NULL, y = "Count") +
+  theme_minimal()
+
+p_gender <- ggplot(survey, aes(x = gender)) +
+  geom_bar(fill = "#85B7EB") +
+  labs(title = "Gender", x = NULL, y = "Count") +
+  theme_minimal()
+
+p_resident <- ggplot(survey, aes(x = resident)) +
+  geom_bar(fill = "#F0997B") +
+  labs(title = "Residency status", x = NULL, y = "Count") +
+  theme_minimal()
+
+p_language <- ggplot(survey, aes(x = language)) +
+  geom_bar(fill = "#AFA9EC") +
+  labs(title = "Survey language", x = NULL, y = "Count") +
+  theme_minimal()
+
+(p_age + p_gender) / (p_resident + p_language) +
+  plot_annotation(title = paste0("Survey sample demographics (n = ", nrow(survey), ")"))
+```
+
+## 6.3 Green space behaviour
+
+```{r green-space-behaviour, fig.height=14}
+freq_labels <- c("0" = "Never", "1" = "Once/week", "2-4" = "2–4×/week", "5-7" = "Daily")
+
+p_freq <- survey %>%
+  filter(!is.na(visitFrequency)) %>%
+  mutate(freq = factor(visitFrequency, levels = names(freq_labels), labels = freq_labels)) %>%
+  count(freq) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  ggplot(aes(x = freq, y = n)) +
+  geom_col(fill = "#5DCAA5") +
+  geom_text(aes(label = paste0(n, "\n(", pct, "%)")), vjust = -0.3, size = 3.2) +
+  labs(title = "How often do you visit green spaces?", x = NULL, y = "Respondents") +
+  ylim(0, max(table(survey$visitFrequency)) * 1.25) +
+  theme_minimal()
+
+p_nearby <- survey %>%
+  count(greenNearby) %>%
+  filter(!is.na(greenNearby)) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  ggplot(aes(x = greenNearby, y = n, fill = greenNearby)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = paste0(n, "\n(", pct, "%)")), vjust = -0.3, size = 3.2) +
+  scale_fill_manual(values = c("yes" = "#5DCAA5", "no" = "#D85A30")) +
+  labs(title = "Green space within walking distance?", x = NULL, y = "Respondents") +
+  theme_minimal()
+
+reasons_df <- survey %>%
+  filter(!is.na(visitReasons)) %>%
+  mutate(
+    Relaxation = str_detect(visitReasons, "relax"),
+    Social     = str_detect(visitReasons, "friends"),
+    Sport      = str_detect(visitReasons, "sport")
+  )
+
+p_reasons <- reasons_df %>%
+  summarise(Relaxation = sum(Relaxation),
+            Social     = sum(Social),
+            Sport      = sum(Sport)) %>%
+  pivot_longer(everything(), names_to = "reason", values_to = "n") %>%
+  mutate(pct = round(100 * n / nrow(reasons_df), 1)) %>%
+  ggplot(aes(x = reorder(reason, n), y = n, fill = reason)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = paste0(n, " (", pct, "%)")), hjust = -0.1, size = 3.2) +
+  scale_fill_manual(values = c(Relaxation = "#5DCAA5", Social = "#85B7EB", Sport = "#F0997B")) +
+  coord_flip() +
+  ylim(0, nrow(reasons_df) * 1.15) +
+  labs(title = "Why do you visit green spaces?",
+       subtitle = paste0("Multiple answers allowed; n = ", nrow(reasons_df), " with response"),
+       x = NULL, y = "Respondents") +
+  theme_minimal()
+
+p_combos <- survey %>%
+  filter(!is.na(visitReasons)) %>%
+  count(visitReasons, sort = TRUE) %>%
+  mutate(pct = round(100 * n / sum(n), 1),
+         lab = str_replace_all(visitReasons, ", ", " + ")) %>%
+  ggplot(aes(x = reorder(lab, n), y = n)) +
+  geom_col(fill = "#AFA9EC") +
+  geom_text(aes(label = paste0(n, " (", pct, "%)")), hjust = -0.1, size = 3.2) +
+  coord_flip() +
+  ylim(0, max(table(survey$visitReasons)) * 1.25) +
+  labs(title = "Reason combinations", x = NULL, y = "Respondents") +
+  theme_minimal()
+
+p_neigh <- survey %>%
+  count(neighborhood, sort = TRUE) %>%
+  filter(!is.na(neighborhood)) %>%
+  ggplot(aes(x = reorder(neighborhood, n), y = n)) +
+  geom_col(fill = "#AFA9EC") +
+  geom_text(aes(label = n), hjust = -0.2, size = 3) +
+  coord_flip() +
+  labs(title = "Neighbourhood of residence", x = NULL, y = "Respondents") +
+  theme_minimal()
+
+(p_freq + p_nearby) / (p_reasons + p_combos) / p_neigh +
+  plot_annotation(title = paste0("Green space behaviour and context — Klagenfurt (n = ", nrow(survey), ")"))
+```
+
+```{r green-space-behaviour-summary}
+cat("=== Visit frequency ===\n")
+survey %>%
+  filter(!is.na(visitFrequency)) %>%
+  count(visitFrequency) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  kable(col.names = c("Times/week", "n", "%"),
+        caption = "Green space visit frequency") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE) %>%
+  print()
+
+cat("\n=== Green space nearby ===\n")
+survey %>%
+  count(greenNearby) %>%
+  filter(!is.na(greenNearby)) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  kable(col.names = c("Nearby", "n", "%"),
+        caption = "Green space within walking distance") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE) %>%
+  print()
+
+cat("\n=== Visit frequency × nearby (cross-tab) ===\n")
+survey %>%
+  filter(!is.na(greenNearby), !is.na(visitFrequency)) %>%
+  count(greenNearby, visitFrequency) %>%
+  group_by(greenNearby) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  ungroup() %>%
+  kable(col.names = c("Nearby", "Frequency", "n", "%"),
+        caption = "Visit frequency by green space proximity") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE) %>%
+  print()
+```
+
+## 6.4 Budget Allocations
+
+```{r budget-summary}
+budget_summary <- survey %>%
+  select(all_of(budget_cols)) %>%
+  pivot_longer(everything(), names_to = "criterion", values_to = "allocation") %>%
+  group_by(criterion) %>%
+  summarise(
+    mean_alloc   = mean(allocation, na.rm = TRUE),
+    median_alloc = median(allocation, na.rm = TRUE),
+    sd_alloc     = sd(allocation, na.rm = TRUE),
+    min_alloc    = min(allocation, na.rm = TRUE),
+    max_alloc    = max(allocation, na.rm = TRUE),
+    .groups      = "drop"
+  ) %>%
+  arrange(desc(mean_alloc)) %>%
+  mutate(weight_pct = round(100 * mean_alloc / sum(mean_alloc), 1))
+
+budget_summary %>%
+  mutate(across(where(is.numeric), ~round(., 1))) %>%
+  kable(caption = "Citizen budget allocations (€1,000,000 distributed across 6 criteria)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+```
+
+```{r budget-plot, fig.height=6}
+survey %>%
+  select(all_of(budget_cols)) %>%
+  pivot_longer(everything(), names_to = "criterion", values_to = "allocation") %>%
+  mutate(criterion = gsub("alloc_[0-9]_", "", criterion) %>%
+           str_replace_all("([a-z])([A-Z])", "\\1 \\2")) %>%
+  ggplot(aes(x = reorder(criterion, allocation, FUN = median), y = allocation)) +
+  geom_boxplot(fill = "#5DCAA5", alpha = 0.7, outlier.size = 1) +
+  coord_flip() +
+  labs(title = "Distribution of citizen budget allocations per criterion",
+       subtitle = paste0("n = ", nrow(survey_clean), " respondents, €1,000,000 each"),
+       x = NULL, y = "Budget allocated (€)") +
+  theme_minimal()
+```
+
+
+## 6.4 Are Citizen Weights Significantly Different from Equal?
+
+I test whether the mean allocation for each criterion is significantly different from
+€166,667 (equal distribution = 1,000,000 / 6 criteria). This tells me whether citizens
+actually differentiated between criteria or just spread the budget evenly.
+
+```{r weight-significance}
+equal_alloc <- 1000000 / length(budget_cols)
+
+sig_results <- map_dfr(budget_cols, function(col) {
+  vals <- survey_clean[[col]]
+  test <- t.test(vals, mu = equal_alloc)
+  tibble(
+    criterion = col,
+    mean      = mean(vals, na.rm = TRUE),
+    ci_lower  = test$conf.int[1],
+    ci_upper  = test$conf.int[2],
+    p_value   = test$p.value,
+    sig       = ifelse(test$p.value < 0.05, "*", "")
+  )
+}) %>%
+  arrange(desc(mean))
+
+sig_results %>%
+  mutate(across(where(is.numeric), ~round(., 2))) %>%
+  kable(caption = paste0("One-sample t-test: mean allocation vs €",
+                         format(round(equal_alloc), big.mark = ","),
+                         " (equal weights)")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+```
+
+```{r weight-significance-plot, fig.height=6}
+sig_results %>%
+  mutate(criterion = gsub("alloc_[0-9]_", "", criterion) %>%
+           str_replace_all("([a-z])([A-Z])", "\\1 \\2")) %>%
+  ggplot(aes(x = reorder(criterion, mean), y = mean)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2) +
+  geom_hline(yintercept = equal_alloc, linetype = "dashed", color = "#D85A30") +
+  coord_flip() +
+  labs(title = "Mean budget allocation with 95% confidence intervals",
+       subtitle = paste0("Dashed line = equal weight (€",
+                         format(round(equal_alloc), big.mark = ","), ")"),
+       x = NULL, y = "Mean allocation (€)") +
+  theme_minimal()
+```
+
+
+# 7. Weighted Linear Combination
+
+## 7.1 Weights
+
+I use the citizen-derived weights from the survey. The mapping from survey criteria
+to spatial variables is:
+
+| Survey criterion | Spatial variable(s) |
+|------------------|---------------------|
+| 1. Too Hot Streets | norm_lst |
+| 2. Green Out of Reach | norm_green_time |
+| 3. Low Income Neighborhoods | **excluded** (no spatial data yet) |
+| 4. High Traffic Areas | norm_traffic_cat |
+| 5. Poor Air Quality | norm_no2 + norm_pm25 (weight split equally) |
+| 6. Disconnected from Nature/Water | norm_dist_bs |
+
+Air pollution (criterion 5) is represented by two sub-indicators: NO2 and PM2.5. Since their Spearman correlation is r = 0.77, I considered either a composite index
+or splitting the weight. Mathematically, splitting the weight equally (w_no2 = w_pm25 = w_airpol / 2) is identical to computing a composite and applying
+the full weight. I split to keep the variables explicit.
+
+Criterion 3 (vulnerable population / low income neighborhoods) is excluded from the priority map because the spatial indicator is still in development. The remaining
+weights are rescaled to sum to 1.
+
+```{r define-weights}
+raw_survey <- budget_summary %>%
+  select(criterion, mean_alloc) %>%
+  deframe()
+
+raw_weights <- c(
+  norm_lst          = raw_survey["alloc_1_TooHotStreets"],
+  norm_green_time   = raw_survey["alloc_2_GreenOutOfReach"],
+  norm_traffic_cat  = raw_survey["alloc_4_HighTrafficAreas"],
+  norm_income_weighted = raw_survey["alloc_3_LowIncomeNeighborhoods"], 
+  norm_no2          = raw_survey["alloc_5_PoorAirQuality"] / 2, #divided to two sub-indicators
+  norm_pm25         = raw_survey["alloc_5_PoorAirQuality"] / 2, #same
+  norm_dist_bs      = raw_survey["alloc_6_DisconnectedNatureWater"]
+)
+names(raw_weights) <- c("norm_lst", "norm_green_time", "norm_traffic_cat", "norm_income_weighted",
+                         "norm_no2", "norm_pm25", "norm_dist_bs")
+
+# Rescale to sum to 1 (criterion 3 excluded)
+weights <- raw_weights / sum(raw_weights)
+
+tibble(
+  criterion    = names(weights),
+  survey_avg   = round(raw_weights, 0),
+  weight       = round(weights, 3),
+  equal_weight = round(1 / length(norm_vars), 3)
+) %>%
+  kable(caption = paste0("Citizen-derived weights vs equal weights (",
+                         length(norm_vars),
+                         " variables, vulnerable population excluded)")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+```
+
+
+## 7.2 Priority Scores
+
+```{r compute-wlc}
+klagenfurt <- klagenfurt %>%
+  mutate(
+    # Equal weights: simple arithmetic mean of all normalized variables
+    priority_equal = rowMeans(across(all_of(norm_vars)), na.rm = TRUE),
+
+    # Citizen-derived weights: weighted linear combination
+    priority_citizen = weights["norm_lst"]          * norm_lst +
+                       weights["norm_green_time"]   * norm_green_time +
+                       weights["norm_income_weighted"]   * norm_income_weighted +
+                       weights["norm_traffic_cat"]  * norm_traffic_cat +
+                       weights["norm_no2"]          * norm_no2 +
+                       weights["norm_pm25"]         * norm_pm25 +
+                       weights["norm_dist_bs"]      * norm_dist_bs
+  )
+```
+
+
+## 7.3 Priority Maps
+
+```{r priority-maps}
+p1 <- ggplot(klagenfurt) +
+  geom_sf(aes(fill = priority_equal), color = NA) +
+  scale_fill_viridis_c(option = "magma", na.value = "grey90") +
+  labs(title = "Equal weights") +
+  theme_void() +
+  theme(legend.position = "bottom",
+        legend.key.width = unit(1, "cm"),
+        legend.key.height = unit(0.25, "cm"))
+
+p2 <- ggplot(klagenfurt) +
+  geom_sf(aes(fill = priority_citizen), color = NA) +
+  scale_fill_viridis_c(option = "magma", na.value = "grey90") +
+  labs(title = "Citizen weights") +
+  theme_void() +
+  theme(legend.position = "bottom",
+        legend.key.width = unit(1, "cm"),
+        legend.key.height = unit(0.25, "cm"))
+
+p1 + p2
+```
+
+
+## 7.4 Difference Analysis
+
+Red = citizen weights assign higher priority than equal weights.
+Blue = citizen weights assign lower priority than equal weights.
+
+```{r difference-analysis}
+cat("Correlation between equal and citizen scores:",
+    round(cor(klagenfurt$priority_equal, klagenfurt$priority_citizen,
+              use = "complete.obs"), 3), "\n")
+
+klagenfurt <- klagenfurt %>%
+  mutate(weight_diff = priority_citizen - priority_equal)
+
+ggplot(klagenfurt) +
+  geom_sf(aes(fill = weight_diff), color = NA) +
+  scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#b2182b",
+                       midpoint = 0, name = "Citizen\nminus\nEqual") +
+  labs(title = "Difference: citizen weights minus equal weights") +
+  theme_void()
+```
+
+```{r}
+tibble(
+  criterion = names(weights),
+  citizen_weight = round(weights, 3),
+  equal_weight = round(1/length(norm_vars), 3),
+  diff = round(weights - 1/length(norm_vars), 3)
+) %>%
+  arrange(diff)
+```
+
+## 7.5 Top Drivers
+
+Which normalized variables contribute most to the top 20% priority cells?
+
+```{r top-drivers}
+klagenfurt %>%
+  st_drop_geometry() %>%
+  filter(priority_citizen >= quantile(priority_citizen, 0.80, na.rm = TRUE)) %>%
+  summarise(across(all_of(norm_vars), ~mean(., na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "mean_score") %>%
+  mutate(contribution = mean_score * weights[variable]) %>%
+  arrange(desc(contribution)) %>%
+  mutate(across(where(is.numeric), ~round(., 3))) %>%
+  kable(caption = "Average contribution of each variable to the top 20% priority cells") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+```
+
+### Individual variable maps
+
+To understand what drives the spatial pattern of the priority map, I plot each normalized variable individually 
+```{r individual-maps, fig.height=10}
+plots <- map(norm_vars, function(v) {
+  ggplot(klagenfurt) +
+    geom_sf(aes(fill = .data[[v]]), color = NA) +
+    scale_fill_viridis_c(option = "magma", na.value = "grey90", name = NULL) +
+    labs(title = gsub("norm_", "", v)) +
+    theme_void() +
+    theme(plot.title = element_text(size = 9, hjust = 0.5))
+})
+
+wrap_plots(plots, ncol = 3)
+```
+
+
+## 7.6 Priority Classification
+
+Quintile classification of the citizen-weighted priority scores.
+
+Note: the city center concentrates the highest priorities because heat, traffic, NO2,
+and PM2.5 all overlap there. Adding the vulnerable population criterion (when data
+becomes available) is expected to shift some priority towards peripheral neighborhoods
+with socioeconomic disadvantage.
+
+```{r classification, fig.width=7, fig.height=6, fig.align='center', out.width='80%'}
+klagenfurt <- klagenfurt %>%
+  mutate(
+    class_citizen = cut(priority_citizen,
+                        breaks = quantile(priority_citizen,
+                                          probs = seq(0, 1, 0.2), na.rm = TRUE),
+                        labels = c("Very low", "Low", "Medium", "High", "Very high"),
+                        include.lowest = TRUE)
+  )
+
+pal <- c(
+  "Very low"  = "#6a9e7f",
+  "Low"       = "#a8c4a2",
+  "Medium"    = "#e8d5a3",
+  "High"      = "#d4957a",
+  "Very high" = "#b5564e"
+)
+
+ggplot() +
+  geom_sf(data = klagenfurt, aes(fill = class_citizen), color = NA) +
+  scale_fill_manual(
+    values   = pal,
+    name     = NULL,
+    na.value = "#d4d0c8",
+    guide    = guide_legend(
+      keywidth    = unit(0.8, "lines"),
+      keyheight   = unit(0.8, "lines"),
+      label.theme = element_text(size = 8, color = "#3d3d3a", family = "sans")
+    )
+  ) +
+  labs(
+    title    = "Priority for greening interventions",
+    subtitle = paste0("Klagenfurt · Citizen weights · ", length(norm_vars),
+                      " criteria · Quintile classification",
+                      "\n(vulnerable population excluded — data pending)")
+  ) +
+  theme_void(base_family = "sans") +
+  theme(
+    plot.title       = element_text(size = 13, face = "bold", color = "#2c2c2a",
+                                    hjust = 0.5, margin = margin(b = 4)),
+    plot.subtitle    = element_text(size = 8.5, color = "#73726c",
+                                    hjust = 0.5, margin = margin(b = 10)),
+    legend.position  = "bottom",
+    legend.direction = "horizontal",
+    legend.margin    = margin(t = 6),
+    legend.text      = element_text(size = 8),
+    plot.margin      = margin(20, 30, 20, 30),
+    plot.background  = element_rect(fill = "#fafaf8", color = NA)
+  )
+```
+
+Sad, it looks like the city center is the highest priority area, which makes sense given the overlap of heat, traffic, and air pollution, just the city center... no need for a study to get to that conclusion. Hopefully, the vulnerable population criterion (when added) will shft the priority areas or at least make some distinctions1
+into the central areas. Prob there is a lot of LST driving this pattern (the one with the heaviest weight by citizens).
+
+# 8. Sensitivity Analysis
+
+## 8.1 Robustness to weight perturbations
+
+Each citizen weight is perturbed by ±20% in turn (remaining weights rescaled to sum to 1). Spearman r and top-quintile class agreement vs the baseline citizen-weighted priority surface.
+
+```{r sensitivity-analysis}
+perturbation <- 0.20
+
+sensitivity_results <- map_dfr(names(weights), function(var) {
+  map_dfr(c(-perturbation, perturbation), function(delta) {
+
+    w_perturbed        <- weights
+    w_perturbed[var]   <- weights[var] * (1 + delta)
+    others             <- setdiff(names(weights), var)
+    remaining          <- 1 - w_perturbed[var]
+    w_perturbed[others] <- weights[others] / sum(weights[others]) * remaining
+
+    perturbed_score <-
+      w_perturbed["norm_lst"]             * klagenfurt$norm_lst             +
+      w_perturbed["norm_green_time"]      * klagenfurt$norm_green_time      +
+      w_perturbed["norm_income_weighted"] * klagenfurt$norm_income_weighted +
+      w_perturbed["norm_traffic_cat"]     * klagenfurt$norm_traffic_cat     +
+      w_perturbed["norm_no2"]             * klagenfurt$norm_no2             +
+      w_perturbed["norm_pm25"]            * klagenfurt$norm_pm25            +
+      w_perturbed["norm_dist_bs"]         * klagenfurt$norm_dist_bs
+
+    r <- cor(klagenfurt$priority_citizen, perturbed_score,
+             use = "complete.obs", method = "spearman")
+
+    q80_base <- quantile(klagenfurt$priority_citizen, 0.8, na.rm = TRUE)
+    q80_pert <- quantile(perturbed_score,             0.8, na.rm = TRUE)
+    top_base <- !is.na(klagenfurt$priority_citizen) & klagenfurt$priority_citizen >= q80_base
+    top_pert <- !is.na(perturbed_score)             & perturbed_score             >= q80_pert
+    overlap  <- sum(top_base & top_pert) / sum(top_base)
+
+    tibble(
+      variable      = var,
+      direction     = ifelse(delta > 0, "+20%", "-20%"),
+      spearman_r    = round(r, 4),
+      top_q_overlap = round(overlap * 100, 1)
+    )
+  })
+})
+
+sensitivity_results %>%
+  kable(
+    caption   = "Sensitivity: effect of ±20% weight perturbation (Klagenfurt)",
+    col.names = c("Variable", "Direction", "Spearman r", "Top-quintile overlap (%)")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+## 8.2 WLC without traffic
+
+```{r wlc-no-traffic}
+norm_no_traffic_k    <- setdiff(norm_vars, "norm_traffic_cat")
+weights_no_traffic_k <- raw_weights[names(raw_weights) != "norm_traffic_cat"]
+weights_no_traffic_k <- weights_no_traffic_k / sum(weights_no_traffic_k)
+
+klagenfurt <- klagenfurt %>%
+  mutate(
+    priority_no_traffic =
+      weights_no_traffic_k["norm_lst"]             * norm_lst             +
+      weights_no_traffic_k["norm_green_time"]      * norm_green_time      +
+      weights_no_traffic_k["norm_income_weighted"] * norm_income_weighted +
+      weights_no_traffic_k["norm_no2"]             * norm_no2             +
+      weights_no_traffic_k["norm_pm25"]            * norm_pm25            +
+      weights_no_traffic_k["norm_dist_bs"]         * norm_dist_bs
+  )
+
+r_no_traffic_k <- cor(klagenfurt$priority_citizen, klagenfurt$priority_no_traffic,
+                      use = "complete.obs", method = "spearman")
+q80_base_k <- quantile(klagenfurt$priority_citizen,    0.8, na.rm = TRUE)
+q80_nt_k   <- quantile(klagenfurt$priority_no_traffic, 0.8, na.rm = TRUE)
+top_base_k <- !is.na(klagenfurt$priority_citizen)    & klagenfurt$priority_citizen    >= q80_base_k
+top_nt_k   <- !is.na(klagenfurt$priority_no_traffic) & klagenfurt$priority_no_traffic >= q80_nt_k
+agree_no_traffic_k <- round(100 * sum(top_base_k & top_nt_k) / sum(top_base_k), 1)
+
+cat("Correlation with vs without traffic:", round(r_no_traffic_k, 3), "\n")
+cat("Top-quintile class agreement:", agree_no_traffic_k, "%\n")
+
+p1 <- ggplot(klagenfurt) +
+  geom_sf(aes(fill = priority_citizen), color = NA) +
+  scale_fill_viridis_c(option = "magma", na.value = "grey90") +
+  labs(title = "With traffic (7 criteria)") + theme_void()
+
+p2 <- ggplot(klagenfurt) +
+  geom_sf(aes(fill = priority_no_traffic), color = NA) +
+  scale_fill_viridis_c(option = "magma", na.value = "grey90") +
+  labs(title = "Without traffic (6 criteria)") + theme_void()
+
+p1 + p2
+```
+
+## 8.3 Traffic: categorical vs log normalization
+
+```{r traffic-log-sens}
+p98_traffic_k <- quantile(klagenfurt$new_trafficvol, 0.98, na.rm = TRUE)
+
+klagenfurt_b <- klagenfurt %>%
+  mutate(
+    priority_traffic_log =
+      weights["norm_lst"]             * norm_lst             +
+      weights["norm_green_time"]      * norm_green_time      +
+      weights["norm_income_weighted"] * norm_income_weighted +
+      weights["norm_traffic_cat"]     * norm_traffic_log     +
+      weights["norm_no2"]             * norm_no2             +
+      weights["norm_pm25"]            * norm_pm25            +
+      weights["norm_dist_bs"]         * norm_dist_bs
+  )
+
+r_traffic_k <- cor(klagenfurt$priority_citizen, klagenfurt_b$priority_traffic_log,
+                   use = "complete.obs", method = "spearman")
+q80_tlog_k  <- quantile(klagenfurt_b$priority_traffic_log, 0.8, na.rm = TRUE)
+top_tcat_k  <- !is.na(klagenfurt$priority_citizen)         & klagenfurt$priority_citizen         >= q80_base_k
+top_tlog_k  <- !is.na(klagenfurt_b$priority_traffic_log)   & klagenfurt_b$priority_traffic_log   >= q80_tlog_k
+agree_traffic_k <- round(100 * sum(top_tcat_k & top_tlog_k) / sum(top_tcat_k), 1)
+
+cat("Correlation categorical vs log:", round(r_traffic_k, 3), "\n")
+cat("Top-quintile class agreement:", agree_traffic_k, "%\n")
+
+p1 <- ggplot(klagenfurt) +
+  geom_sf(aes(fill = priority_citizen), color = NA) +
+  scale_fill_viridis_c(option = "magma", na.value = "grey90") +
+  labs(title = "Categorical traffic (default)") + theme_void()
+
+p2 <- ggplot(klagenfurt_b) +
+  geom_sf(aes(fill = priority_traffic_log), color = NA) +
+  scale_fill_viridis_c(option = "magma", na.value = "grey90") +
+  labs(title = "Log traffic (sensitivity)") + theme_void()
+
+p1 + p2
+```
+
+## 8.4 Citizen vs equal weights
+
+```{r citizen-vs-equal-k}
+r_equal_k <- cor(klagenfurt$priority_citizen, klagenfurt$priority_equal,
+                 use = "complete.obs", method = "spearman")
+q80_eq_k  <- quantile(klagenfurt$priority_equal, 0.8, na.rm = TRUE)
+top_eq_k  <- !is.na(klagenfurt$priority_equal) & klagenfurt$priority_equal >= q80_eq_k
+agree_equal_k <- round(100 * sum(top_base_k & top_eq_k) / sum(top_base_k), 1)
+
+cat("Correlation citizen vs equal weights:", round(r_equal_k, 3), "\n")
+cat("Top-quintile class agreement:", agree_equal_k, "%\n")
+```
+
+## 8.5 Income: raw vs spatially-weighted
+
+The main analysis uses spatially-weighted median household income (`norm_income_weighted`). Here I substitute the raw (unweighted) income indicator (`norm_income`) to test sensitivity to the weighting choice.
+
+```{r income-sens}
+klagenfurt_inc <- klagenfurt %>%
+  mutate(
+    priority_income_raw =
+      weights["norm_lst"]             * norm_lst             +
+      weights["norm_green_time"]      * norm_green_time      +
+      weights["norm_income_weighted"] * norm_income          +
+      weights["norm_traffic_cat"]     * norm_traffic_cat     +
+      weights["norm_no2"]             * norm_no2             +
+      weights["norm_pm25"]            * norm_pm25            +
+      weights["norm_dist_bs"]         * norm_dist_bs
+  )
+
+r_income_k <- cor(klagenfurt$priority_citizen, klagenfurt_inc$priority_income_raw,
+                  use = "complete.obs", method = "spearman")
+q80_inc_k  <- quantile(klagenfurt_inc$priority_income_raw, 0.8, na.rm = TRUE)
+top_inc_k  <- !is.na(klagenfurt_inc$priority_income_raw) & klagenfurt_inc$priority_income_raw >= q80_inc_k
+agree_income_k <- round(100 * sum(top_base_k & top_inc_k) / sum(top_base_k), 1)
+
+cat("Correlation weighted vs raw income:", round(r_income_k, 3), "\n")
+cat("Top-quintile class agreement:", agree_income_k, "%\n")
+```
+
+## Sensitivity summary
+
+```{r sensitivity-summary-k}
+tibble(
+  `Sensitivity test` = c(
+    "§8.1 Weight perturbation — worst case",
+    "§8.1 Weight perturbation — best case",
+    "§8.2 WLC without traffic (6 criteria)",
+    "§8.3 Traffic: categorical vs log normalization",
+    "§8.4 Citizen vs equal weights",
+    "§8.5 Income: spatially-weighted vs raw"
+  ),
+  `Spearman r` = c(
+    round(min(sensitivity_results$spearman_r), 3),
+    round(max(sensitivity_results$spearman_r), 3),
+    round(r_no_traffic_k, 3),
+    round(r_traffic_k, 3),
+    round(r_equal_k, 3),
+    round(r_income_k, 3)
+  ),
+  `Top-quintile overlap (%)` = c(
+    round(min(sensitivity_results$top_q_overlap), 1),
+    round(max(sensitivity_results$top_q_overlap), 1),
+    agree_no_traffic_k,
+    agree_traffic_k,
+    agree_equal_k,
+    agree_income_k
+  )
+) %>%
+  kable(caption = paste0(
+    "Sensitivity analysis summary — Klagenfurt. ",
+    "Spearman r: rank correlation across all grid cells. ",
+    "Top-quintile overlap: % of baseline top-quintile cells retained in alternative top quintile."
+  )) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+# 9. Save Outputs
+
+```{r save}
+saveRDS(klagenfurt, file.path(data_dir, "klagenfurt_mcda_priority_may.rds"))
+cat("Saved to:", file.path(data_dir, "klagenfurt_mcda_priority_may.rds"), "\n")
+```

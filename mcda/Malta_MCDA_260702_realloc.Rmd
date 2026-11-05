@@ -33,7 +33,7 @@ knitr::opts_chunk$set(
 > because none of the ten WLC criteria are actually derived from `malta_master_full`'s
 > `Total_Population`/`Adult_Population` columns -- population only enters indirectly via the
 > `norm_green_exp` criterion, which is joined from an externally precomputed E2SFCA parquet
-> (`analysis/exposure/final_metrics.parquet`) with its own independent population pipeline, never
+> (`mcda/exposure/final_metrics.parquet`) with its own independent population pipeline, never
 > touching the column this notebook's `Total_Population` refers to. Given the change is a verified no-op
 > for MCDA/targeting, this file remains the canonical one; the `_nso` variant is kept for provenance only,
 > not adopted as main.
@@ -79,7 +79,7 @@ Walking time to the nearest UA2021-classified green space (excluding class 32000
 
 ```{r join-accessibility}
 access <- read_parquet(
-  here::here("analysis/accessibility/final_metrics.parquet")
+  here::here("mcda/accessibility/final_metrics.parquet")
 ) %>%
   st_drop_geometry() %>%
   mutate(
@@ -345,7 +345,7 @@ The E2SFCA Gaussian further improves on the simple confluent-population ratio by
 
 ```{r green-sufficiency-final}
 exposure_e2sfca <- read_parquet(
-  here::here("analysis/exposure/final_metrics.parquet")
+  here::here("mcda/exposure/final_metrics.parquet")
 ) %>%
   st_drop_geometry() %>%
   mutate(unit_id = as.character(unit_id)) %>%
@@ -782,14 +782,13 @@ malta <- malta %>%
                                      lower = 300,
                                      upper = quantile(walk_dist_m, 0.98, na.rm = TRUE)),
 
-    # Inverted: less green per person = higher priority. Capped at p98; NAs
-    # (unrouted cells, no population) replaced with 0 — neutral on this criterion.
-    norm_green_exp = replace_na(
-      1 - normalize_minmax(green_m2_e2sfca_per_person_gauss,
-                           lower = 0,
-                           upper = quantile(green_m2_e2sfca_per_person_gauss,
-                                            0.98, na.rm = TRUE)),
-      0)
+    # Inverted: less green per person = higher priority. Capped at p98.
+    # Since 2026-11-05 (UT2026 poster) NAs (unrouted cells) stay missing and are handled by the
+    # available weight rule (compute-wlc); before, they were set to 0 (lowest priority contribution).
+    norm_green_exp = 1 - normalize_minmax(green_m2_e2sfca_per_person_gauss,
+                                          lower = 0,
+                                          upper = quantile(green_m2_e2sfca_per_person_gauss,
+                                                           0.98, na.rm = TRUE))
   )
 
 norm_vars <- c("norm_lst", "norm_imd", "norm_dist_bs", "norm_Lden",
@@ -980,24 +979,72 @@ tibble(variable   = names(weights),
 
 # Weighted Linear Combination
 
+## Cells not eligible for greening (airport, port)
+
+Added 2026-11-05 (UT2026 poster). Under the available weight rule below, airport and port cells
+entered the top quintile, so cells whose majority Urban Atlas 2021 class is 12400 (airports) or
+12300 (port areas) get no score.
+
+```{r eligibility-mask}
+ua21 <- st_read(here::here("data/urban_atlas/Malta_UA21/CLMS_UA_LCU_S2021_V025ha_MT001L1_VALLETTA_03035_V01_R00_20241025.fgb"),
+                quiet = TRUE, wkt_filter = st_as_text(st_as_sfc(st_bbox(malta)))) %>%
+  select(code_2021) %>%
+  st_make_valid()
+ua_major <- st_intersection(malta %>% select(gid), ua21) %>%
+  mutate(a = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  group_by(gid) %>%
+  slice_max(a, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(gid, ua_code_2021 = code_2021)
+malta <- malta %>%
+  select(-any_of(c("ua_code_2021", "ua_not_eligible"))) %>%
+  left_join(ua_major, by = "gid") %>%
+  mutate(ua_not_eligible = ua_code_2021 %in% c("12400", "12300"))
+
+table(malta$ua_code_2021[malta$ua_not_eligible], useNA = "ifany")
+ggplot(malta) +
+  geom_sf(aes(fill = ua_not_eligible), colour = NA) +
+  scale_fill_manual(values = c(`FALSE` = "grey85", `TRUE` = "#c0392b"), name = "Airport or port") +
+  theme_void()
+```
+
 ## Computing priority scores
 
-```{r compute-wlc}
-malta <- malta %>%
-  mutate(
-    priority_equal = rowMeans(across(all_of(norm_vars)), na.rm = TRUE),
+Available weight rule (adopted 2026-11-05 for the UT2026 poster; the HIA still uses the score saved
+before this change, `malta_mcda_processed_realloc_pre_avail80.rds`). A cell is scored if its
+available criteria carry at least 80% of the total citizen weight and it is eligible for greening;
+the score is the weighted mean over the available criteria, sum(w_i s_i) / sum(w_i). The equal
+weights score uses the same cells.
 
-    priority_citizen = weights["norm_tree"]       * norm_tree +
-                       weights["norm_imd"]        * norm_imd +
-                       weights["norm_traffic"]    * norm_traffic +
-                       weights["norm_no2"]        * norm_no2 +
-                       weights["norm_lst"]        * norm_lst +
-                       weights["norm_dist_rec"]   * norm_dist_rec +
-                       weights["norm_Lden"]       * norm_Lden +
-                       weights["norm_green_time"] * norm_green_time +
-                       weights["norm_dist_bs"]    * norm_dist_bs +
-                       weights["norm_green_exp"]  * norm_green_exp
-  )
+```{r compute-wlc}
+MIN_WEIGHT_AVAILABLE <- 0.80
+crit_mat <- function(df, w) as.matrix(as.data.frame(df)[, names(w), drop = FALSE])
+malta <- malta %>%
+  mutate(weight_available = as.numeric((!is.na(crit_mat(malta, weights))) %*% weights) / sum(weights),
+         scored = weight_available >= MIN_WEIGHT_AVAILABLE - 1e-12 & !ua_not_eligible)
+
+# Weighted mean over available criteria, NA for cells outside the scored set
+wlc_avail <- function(df, w, keep = malta$scored) {
+  S <- crit_mat(df, w)
+  A <- !is.na(S)
+  S[!A] <- 0
+  den <- as.numeric(A %*% w)
+  out <- as.numeric(S %*% w) / den
+  out[!keep | den == 0] <- NA
+  out
+}
+weights_equal <- setNames(rep(1 / length(norm_vars), length(norm_vars)), norm_vars)
+
+malta <- malta %>%
+  mutate(priority_equal   = wlc_avail(malta, weights_equal),
+         priority_citizen = wlc_avail(malta, weights))
+
+# Sanity checks: available weight, scored cells, score distribution
+summary(malta$weight_available)
+table(n_missing = rowSums(is.na(crit_mat(malta, weights))), scored = malta$scored)
+summary(malta$priority_citizen)
+hist(malta$priority_citizen, breaks = 60, main = "priority_citizen (available weight rule)", xlab = "")
 ```
 
 ## Equal vs citizen weights
@@ -1162,16 +1209,7 @@ sensitivity_results <- map_dfr(names(weights), function(var) {
     remaining <- 1 - w_perturbed[var]
     w_perturbed[others] <- weights[others] / sum(weights[others]) * remaining
 
-    perturbed_score <- w_perturbed["norm_tree"]       * malta$norm_tree +
-                       w_perturbed["norm_imd"]        * malta$norm_imd +
-                       w_perturbed["norm_traffic"]    * malta$norm_traffic +
-                       w_perturbed["norm_no2"]        * malta$norm_no2 +
-                       w_perturbed["norm_lst"]        * malta$norm_lst +
-                       w_perturbed["norm_dist_rec"]   * malta$norm_dist_rec +
-                       w_perturbed["norm_Lden"]       * malta$norm_Lden +
-                       w_perturbed["norm_green_time"] * malta$norm_green_time +
-                       w_perturbed["norm_dist_bs"]    * malta$norm_dist_bs +
-                       w_perturbed["norm_green_exp"]  * malta$norm_green_exp
+    perturbed_score <- wlc_avail(malta, w_perturbed)
 
     r <- cor(malta$priority_citizen, perturbed_score, use = "complete.obs")
 
@@ -1207,15 +1245,7 @@ weights_no_traffic <- weights_no_traffic / sum(weights_no_traffic)
 
 malta <- malta %>%
   mutate(
-    priority_no_traffic = weights_no_traffic["norm_tree"]       * norm_tree +
-                          weights_no_traffic["norm_imd"]        * norm_imd +
-                          weights_no_traffic["norm_no2"]        * norm_no2 +
-                          weights_no_traffic["norm_lst"]        * norm_lst +
-                          weights_no_traffic["norm_dist_rec"]   * norm_dist_rec +
-                          weights_no_traffic["norm_Lden"]       * norm_Lden +
-                          weights_no_traffic["norm_green_time"] * norm_green_time +
-                          weights_no_traffic["norm_dist_bs"]    * norm_dist_bs +
-                          weights_no_traffic["norm_green_exp"]  * norm_green_exp
+    priority_no_traffic = wlc_avail(malta, weights_no_traffic)
   )
 
 p1 <- ggplot(malta) +
@@ -1251,16 +1281,7 @@ malta_b <- malta %>%
 
 malta_b <- malta_b %>%
   mutate(
-    priority_citizen_b = weights["norm_tree"]       * norm_tree +
-                         weights["norm_imd"]        * norm_imd +
-                         weights["norm_traffic"]    * norm_traffic_log +
-                         weights["norm_no2"]        * norm_no2 +
-                         weights["norm_lst"]        * norm_lst +
-                         weights["norm_dist_rec"]   * norm_dist_rec +
-                         weights["norm_Lden"]       * norm_Lden +
-                         weights["norm_green_time"] * norm_green_time +
-                         weights["norm_dist_bs"]    * norm_dist_bs +
-                         weights["norm_green_exp"]  * norm_green_exp
+    priority_citizen_b = wlc_avail(malta_b %>% mutate(norm_traffic = norm_traffic_log), weights)
   )
 ```
 
@@ -1339,26 +1360,16 @@ Replacing the Gaussian decay with the Luo & Qi (2009) step-weights E2SFCA for th
 ```{r green-exp-step-sensitivity}
 malta <- malta %>%
   mutate(
-    norm_green_exp_step = replace_na(
-      1 - normalize_minmax(green_m2_e2sfca_per_person,
-                           lower = 0,
-                           upper = quantile(green_m2_e2sfca_per_person,
-                                            0.98, na.rm = TRUE)),
-      0)
+    # NAs stay missing (available weight rule), as for norm_green_exp
+    norm_green_exp_step = 1 - normalize_minmax(green_m2_e2sfca_per_person,
+                                               lower = 0,
+                                               upper = quantile(green_m2_e2sfca_per_person,
+                                                                0.98, na.rm = TRUE))
   )
 
 malta <- malta %>%
   mutate(
-    priority_step_exp = weights["norm_tree"]       * norm_tree +
-                        weights["norm_imd"]        * norm_imd +
-                        weights["norm_traffic"]    * norm_traffic +
-                        weights["norm_no2"]        * norm_no2 +
-                        weights["norm_lst"]        * norm_lst +
-                        weights["norm_dist_rec"]   * norm_dist_rec +
-                        weights["norm_Lden"]       * norm_Lden +
-                        weights["norm_green_time"] * norm_green_time +
-                        weights["norm_dist_bs"]    * norm_dist_bs +
-                        weights["norm_green_exp"]  * norm_green_exp_step
+    priority_step_exp = wlc_avail(malta %>% mutate(norm_green_exp = norm_green_exp_step), weights)
   )
 
 cat("Correlation (Gaussian vs step WLC):",

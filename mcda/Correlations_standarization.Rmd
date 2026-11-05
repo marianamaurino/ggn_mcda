@@ -301,7 +301,7 @@ p3
 library(arrow)
 
 exposure_e2sfca <- read_parquet(
-  here::here("analysis/exposure/final_metrics.parquet")
+  here::here("mcda/exposure/final_metrics.parquet")
 ) %>%
   st_drop_geometry() %>%
   mutate(unit_id = as.character(unit_id)) %>%

@@ -587,7 +587,10 @@ klagenfurt <- klagenfurt %>%
                                  upper = quantile(pm25_final, 0.98, na.rm = TRUE)),
 
     # ── Accessibility: time to green space ────────────────────
+    # Missing walking time stays missing (available weight rule, 2026-11-05); before, it fell
+    # through to the last branch and scored 1.00
     norm_green_time = case_when(
+      is.na(nearest_green_min) ~ NA_real_,
       nearest_green_min <= 5  ~ 0.00,
       nearest_green_min <= 10 ~ 0.33,
       nearest_green_min <= 15 ~ 0.67,
@@ -702,6 +705,10 @@ The criteria were derived from stakeholder interviews and thematic analysis.
 
 ```{r load-survey}
 survey <- read.csv(file.path(data_dir, "klagenfurtsurvey_responses260907.csv"))
+# 2 neighbourhood answers in the export are Latin-1, the rest UTF-8; re-encode the invalid ones
+# (2026-11-05; without this, plotting fails with "invalid string in PangoCairo_Text")
+survey <- survey %>%
+  mutate(across(where(is.character), ~ ifelse(validUTF8(.), ., iconv(., "latin1", "UTF-8"))))
 
 budget_cols <- c("alloc_1_TooHotStreets",
                  "alloc_2_GreenOutOfReach",
@@ -721,6 +728,7 @@ survey entirely.
 
 ```{r resident-cleanup}
 resident_levels <- c("born", "0-1", "1-5", "5-10", "10+")
+KEEP_FORMER_RESIDENTS <- TRUE
 
 n_before <- nrow(survey)
 
@@ -730,10 +738,13 @@ survey <- survey %>%
     resident %in% c("46300", "46300.0") ~ "5-10",
     TRUE                                ~ resident
   )) %>%
-  filter(resident != "left-2-plus") %>%
-  mutate(resident = factor(resident, levels = resident_levels))
+  # UT2026 poster (2026-11-05): keep the 2 former residents so the weights stay those of the saved
+  # map and Figure 4 (n = 184). Set to FALSE to exclude them (n = 182).
+  { if (KEEP_FORMER_RESIDENTS) . else filter(., resident != "left-2-plus") } %>%
+  mutate(resident = factor(resident, levels = c(resident_levels, if (KEEP_FORMER_RESIDENTS) "left-2-plus")))
 
-cat("Excluded 'left-2-plus':", n_before - nrow(survey), "respondents\n")
+cat("Excluded 'left-2-plus':", n_before - nrow(survey), "respondents (KEEP_FORMER_RESIDENTS =",
+    KEEP_FORMER_RESIDENTS, ")\n")
 cat("Resident categories after cleanup:\n")
 print(table(survey$resident, useNA = "ifany"))
 ```
@@ -1089,21 +1100,40 @@ tibble(
 
 ## 7.2 Priority Scores
 
-```{r compute-wlc}
-klagenfurt <- klagenfurt %>%
-  mutate(
-    # Equal weights: simple arithmetic mean of all normalized variables
-    priority_equal = rowMeans(across(all_of(norm_vars)), na.rm = TRUE),
+Available weight rule (adopted 2026-11-05 for the UT2026 poster; the HIA still uses the score saved
+before this change, `klagenfurt_mcda_priority_may_pre_avail80.rds`). A cell is scored if its
+available criteria carry at least 80% of the total citizen weight; the score is the weighted mean
+over the available criteria, sum(w_i s_i) / sum(w_i). The equal weights score uses the same cells.
 
-    # Citizen-derived weights: weighted linear combination
-    priority_citizen = weights["norm_lst"]          * norm_lst +
-                       weights["norm_green_time"]   * norm_green_time +
-                       weights["norm_income_weighted"]   * norm_income_weighted +
-                       weights["norm_traffic_cat"]  * norm_traffic_cat +
-                       weights["norm_no2"]          * norm_no2 +
-                       weights["norm_pm25"]         * norm_pm25 +
-                       weights["norm_dist_bs"]      * norm_dist_bs
-  )
+```{r compute-wlc}
+MIN_WEIGHT_AVAILABLE <- 0.80
+crit_mat <- function(df, w) as.matrix(as.data.frame(df)[, names(w), drop = FALSE])
+klagenfurt <- klagenfurt %>%
+  mutate(weight_available = as.numeric((!is.na(crit_mat(klagenfurt, weights))) %*% weights) / sum(weights),
+         scored = weight_available >= MIN_WEIGHT_AVAILABLE - 1e-12)
+
+# Weighted mean over available criteria, NA for cells outside the scored set
+wlc_avail <- function(df, w, keep = klagenfurt$scored) {
+  S <- crit_mat(df, w)
+  A <- !is.na(S)
+  S[!A] <- 0
+  den <- as.numeric(A %*% w)
+  out <- as.numeric(S %*% w) / den
+  out[!keep | den == 0] <- NA
+  out
+}
+weights_equal <- setNames(rep(1 / length(norm_vars), length(norm_vars)), norm_vars)
+
+klagenfurt <- klagenfurt %>%
+  mutate(priority_equal   = wlc_avail(klagenfurt, weights_equal),
+         priority_citizen = wlc_avail(klagenfurt, weights))
+
+# Sanity checks: missing values, available weight, scored cells, score distribution
+colSums(is.na(crit_mat(klagenfurt, weights)))
+summary(klagenfurt$weight_available)
+table(n_missing = rowSums(is.na(crit_mat(klagenfurt, weights))), scored = klagenfurt$scored)
+summary(klagenfurt$priority_citizen)
+hist(klagenfurt$priority_citizen, breaks = 60, main = "priority_citizen (available weight rule)", xlab = "")
 ```
 
 
@@ -1278,14 +1308,7 @@ sensitivity_results <- map_dfr(names(weights), function(var) {
     remaining          <- 1 - w_perturbed[var]
     w_perturbed[others] <- weights[others] / sum(weights[others]) * remaining
 
-    perturbed_score <-
-      w_perturbed["norm_lst"]             * klagenfurt$norm_lst             +
-      w_perturbed["norm_green_time"]      * klagenfurt$norm_green_time      +
-      w_perturbed["norm_income_weighted"] * klagenfurt$norm_income_weighted +
-      w_perturbed["norm_traffic_cat"]     * klagenfurt$norm_traffic_cat     +
-      w_perturbed["norm_no2"]             * klagenfurt$norm_no2             +
-      w_perturbed["norm_pm25"]            * klagenfurt$norm_pm25            +
-      w_perturbed["norm_dist_bs"]         * klagenfurt$norm_dist_bs
+    perturbed_score <- wlc_avail(klagenfurt, w_perturbed)
 
     r <- cor(klagenfurt$priority_citizen, perturbed_score,
              use = "complete.obs", method = "spearman")
@@ -1323,13 +1346,7 @@ weights_no_traffic_k <- weights_no_traffic_k / sum(weights_no_traffic_k)
 
 klagenfurt <- klagenfurt %>%
   mutate(
-    priority_no_traffic =
-      weights_no_traffic_k["norm_lst"]             * norm_lst             +
-      weights_no_traffic_k["norm_green_time"]      * norm_green_time      +
-      weights_no_traffic_k["norm_income_weighted"] * norm_income_weighted +
-      weights_no_traffic_k["norm_no2"]             * norm_no2             +
-      weights_no_traffic_k["norm_pm25"]            * norm_pm25            +
-      weights_no_traffic_k["norm_dist_bs"]         * norm_dist_bs
+    priority_no_traffic = wlc_avail(klagenfurt, weights_no_traffic_k)
   )
 
 r_no_traffic_k <- cor(klagenfurt$priority_citizen, klagenfurt$priority_no_traffic,
@@ -1363,14 +1380,7 @@ p98_traffic_k <- quantile(klagenfurt$new_trafficvol, 0.98, na.rm = TRUE)
 
 klagenfurt_b <- klagenfurt %>%
   mutate(
-    priority_traffic_log =
-      weights["norm_lst"]             * norm_lst             +
-      weights["norm_green_time"]      * norm_green_time      +
-      weights["norm_income_weighted"] * norm_income_weighted +
-      weights["norm_traffic_cat"]     * norm_traffic_log     +
-      weights["norm_no2"]             * norm_no2             +
-      weights["norm_pm25"]            * norm_pm25            +
-      weights["norm_dist_bs"]         * norm_dist_bs
+    priority_traffic_log = wlc_avail(klagenfurt %>% mutate(norm_traffic_cat = norm_traffic_log), weights)
   )
 
 r_traffic_k <- cor(klagenfurt$priority_citizen, klagenfurt_b$priority_traffic_log,
@@ -1416,14 +1426,7 @@ The main analysis uses spatially-weighted median household income (`norm_income_
 ```{r income-sens}
 klagenfurt_inc <- klagenfurt %>%
   mutate(
-    priority_income_raw =
-      weights["norm_lst"]             * norm_lst             +
-      weights["norm_green_time"]      * norm_green_time      +
-      weights["norm_income_weighted"] * norm_income          +
-      weights["norm_traffic_cat"]     * norm_traffic_cat     +
-      weights["norm_no2"]             * norm_no2             +
-      weights["norm_pm25"]            * norm_pm25            +
-      weights["norm_dist_bs"]         * norm_dist_bs
+    priority_income_raw = wlc_avail(klagenfurt %>% mutate(norm_income_weighted = norm_income), weights)
   )
 
 r_income_k <- cor(klagenfurt$priority_citizen, klagenfurt_inc$priority_income_raw,

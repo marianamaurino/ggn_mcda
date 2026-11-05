@@ -34,6 +34,14 @@ library(ggplot2)
 library(sf)
 library(patchwork)
 
+# Poster font, all figures: Hanken Grotesk via showtext (text drawn as outlines in every format)
+library(sysfonts); library(showtext)
+font_add_google("Hanken Grotesk", "hanken")
+showtext_auto(); showtext_opts(dpi = 300)
+theme_set(theme_void(base_family = "hanken"))
+update_geom_defaults("text", list(family = "hanken"))
+update_geom_defaults("label", list(family = "hanken"))
+
 BASE      <- here::here()
 DATA      <- file.path(BASE, "data/malta")
 DATA_KLAG <- file.path(BASE, "data/klagenfurt")
@@ -42,7 +50,7 @@ dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
 
 # ── shared theme ─────────────────────────────────────────────────────────────
 map_theme_fig <- function() {
-  theme_void() +
+  theme_void(base_family = "hanken") +
     theme(
       legend.position   = "right",
       legend.title      = element_text(size = 7, face = "bold", colour = "#2B2D2B"),
@@ -56,7 +64,7 @@ map_theme_fig <- function() {
 }
 
 bar_theme_fig <- function() {
-  theme_minimal(base_size = 8) +
+  theme_minimal(base_size = 8, base_family = "hanken") +
     theme(
       axis.title.x      = element_text(size = 7.5, colour = "#4B4B4B"),
       axis.title.y      = element_blank(),
@@ -372,6 +380,288 @@ cat("Saved Figure4_Klagenfurt.png and Figure4_Klagenfurt.pdf\n")
 **Figure 4.** Citizen priorities and spatial priority distribution for Klagenfurt (*n* = `r klag_n`).
 *(a)* Mean budget allocation (%) per criterion (dots with 95% confidence intervals). The dashed reference line marks the equal-weight allocation (16.7% per criterion). Significance symbols as in Figure 3.
 *(b)* Spatial distribution of the citizen-weighted composite priority score in quintiles across the 100 × 100 m grid.
+
+---
+
+## Lancet style versions (Figures 3 and 4, priority maps)
+
+Same data, quintiles and colours as Figures 3 and 4 above; typography, axes and export from
+`R/theme_lancet.R` (as the HIA paper figures). Drawing only: grid cells are clipped to the city
+boundary and dissolved by quintile, so neighbouring cells of the same class show no seam. Quintiles
+are computed on all cells, unclipped. Cells without a priority score are drawn light grey ("No score").
+Written to `output/figures_mcda/` (PDF, SVG, PNG and editable PPTX).
+
+```{r lancet-setup}
+source(here::here("R", "theme_lancet.R"))
+lancet_font <- "hanken"  # poster font (setup chunk) instead of Source Sans 3
+LANCET_MCDA_DIR <- here::here("output/figures_mcda")
+dir.create(LANCET_MCDA_DIR, showWarnings = FALSE, recursive = TRUE)
+NA_GREY <- "grey88"
+
+save_mcda_lancet <- function(p, name, height_mm, width_mm = LANCET_W2) {
+  f <- c(save_figure_lancet(p, name, LANCET_MCDA_DIR, height_mm = height_mm, width_mm = width_mm),
+         save_figure_pptx(p, name, LANCET_MCDA_DIR, height_mm = height_mm, width_mm = width_mm))
+  cat("Saved:", paste(basename(f), collapse = ", "), "\n")
+  invisible(f)
+}
+
+# Dissolved quintile polygons clipped to the boundary (drawing only)
+quint_map_layer <- function(map_df, border) {
+  border_u <- sf::st_union(sf::st_geometry(border))
+  # 0.5 m buffer before the union closes sub metre gaps between cells (Klagenfurt grid), which
+  # would otherwise show as thin white lines; drawing only
+  clipped  <- map_df %>%
+    dplyr::select(quint_label) %>%
+    sf::st_buffer(0.5) %>%
+    sf::st_set_agr("constant") %>%
+    sf::st_intersection(border_u) %>%
+    sf::st_collection_extract("POLYGON")
+  out <- clipped %>%
+    dplyr::group_by(quint_label) %>%
+    dplyr::summarise(.groups = "drop")
+  stopifnot(nrow(out) == dplyr::n_distinct(map_df$quint_label))
+  out
+}
+
+# Dot and CI panel of the survey allocations, Lancet type
+survey_panel <- function(plot_df, equal_pct, n, tag, x_pad) {
+  ggplot(plot_df, aes(x = mean_pct, y = label, colour = direction)) +
+    geom_vline(xintercept = equal_pct, linetype = "dashed", colour = "grey45", linewidth = 0.3) +
+    geom_segment(aes(x = ci_lower, xend = ci_upper, yend = label), linewidth = 0.5) +
+    geom_point(size = 1.6) +
+    geom_text(aes(x = ci_upper + x_pad, label = sig), size = pt_size(7), hjust = 0,
+              colour = "black", family = lancet_font) +
+    scale_colour_manual(values = c("above" = "#1a7a2e", "below" = "#b84c4c"), guide = "none") +
+    scale_x_continuous(name = "Mean budget allocation (%)",
+                       limits = c(NA, max(plot_df$ci_upper) + 3 * x_pad),
+                       expand = expansion(mult = c(0.02, 0.01))) +
+    labs(tag = tag, y = NULL,
+         subtitle = sprintf("n = %d; dashed line = equal weight (%s%%)", n,
+                            format(round(equal_pct, 1), nsmall = 0))) +
+    theme_lancet()
+}
+
+quint_fill_scale <- function(pal = quint_colours, na_col = NA_GREY) {
+  scale_fill_manual(values = c(setNames(unname(pal), names(quint_colours)), "No score" = na_col),
+                    name = "Priority quintile", drop = FALSE)
+}
+quint_fill <- quint_fill_scale()
+
+priority_map_panel <- function(map_df, border, tag, legend = TRUE, bar = "bl",
+                               fill_scale = quint_fill) {
+  bb <- sf::st_bbox(border)
+  # cells without a priority score as their own legend class (drawing only)
+  map_df <- map_df %>%
+    dplyr::mutate(quint_label = factor(dplyr::if_else(is.na(quint_label), "No score",
+                                                      as.character(quint_label)),
+                                       levels = c(levels(quint_label), "No score")))
+  ggplot() +
+    geom_sf(data = quint_map_layer(map_df, border), aes(fill = quint_label), colour = NA) +
+    geom_sf(data = border, fill = NA, colour = "grey25", linewidth = 0.2) +
+    fill_scale +
+    lancet_scale_bar(bar) + lancet_north_arrow("tr") +
+    coord_sf(xlim = bb[c("xmin", "xmax")], ylim = bb[c("ymin", "ymax")], datum = NA) +
+    labs(tag = tag) +
+    theme_lancet_map() +
+    theme(legend.position = if (legend) "right" else "none",
+          legend.key.size = unit(3, "mm"))
+}
+
+# Sanity checks: quintile counts and unscored cells, per city
+for (nm in c("Malta", "Klagenfurt")) {
+  d <- if (nm == "Malta") malta_map_df else klag_map_df
+  cat(nm, ": cells", nrow(d), "| no priority score", sum(is.na(d$priority_citizen)), "\n")
+  print(table(d$quint_label, useNA = "ifany"))
+}
+```
+
+```{r fig3-malta-lancet, fig.width=170/25.4, fig.height=95/25.4}
+fig3_lancet <- survey_panel(malta_plot_df, malta_equal_pct, malta_n, "A  Citizen priorities", 0.35) +
+  priority_map_panel(malta_map_df, malta_border_sf, "B  Priority map") +
+  plot_layout(widths = c(1.1, 0.9))
+fig3_lancet
+save_mcda_lancet(fig3_lancet, "Figure3_Malta_lancet", height_mm = 95)
+```
+
+```{r fig4-klagenfurt-lancet, fig.width=170/25.4, fig.height=80/25.4}
+fig4_lancet <- survey_panel(klag_plot_df, klag_equal_pct, klag_n, "A  Citizen priorities", 0.3) +
+  priority_map_panel(klag_map_df, klag_border, "B  Priority map", bar = "br") +
+  plot_layout(widths = c(1, 1))
+fig4_lancet
+save_mcda_lancet(fig4_lancet, "Figure4_Klagenfurt_lancet", height_mm = 80)
+```
+
+```{r fig-priority-map-malta-lancet, fig.width=80/25.4, fig.height=95/25.4}
+# One city per figure, one column wide (80 mm), legend below the map, no panel letter
+single_map_theme <- theme(legend.position = "bottom", legend.title.position = "top",
+                          plot.margin = margin(3, 3, 3, 3)) 
+fig_priority_malta <- priority_map_panel(malta_map_df, malta_border_sf, NULL) +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+  single_map_theme
+fig_priority_malta
+save_mcda_lancet(fig_priority_malta, "Figure_priority_map_Malta_lancet", height_mm = 95,
+                 width_mm = LANCET_W1)
+```
+
+```{r fig-priority-map-klagenfurt-lancet, fig.width=80/25.4, fig.height=95/25.4}
+fig_priority_klag <- priority_map_panel(klag_map_df, klag_border, NULL, bar = "br") +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+  single_map_theme
+fig_priority_klag
+save_mcda_lancet(fig_priority_klag, "Figure_priority_map_Klagenfurt_lancet", height_mm = 95,
+                 width_mm = LANCET_W1)
+```
+
+### Priority map palette trials
+
+Alternative choropleth palettes (Q1 to Q5) for the single city priority maps; the maps above keep
+the current green to red palette. Written to `output/figures_mcda/palette_trials/`, one file per
+palette and city. `na` is the "No score" colour, chosen to stay distinct from each palette.
+
+```{r priority-palette-trials, fig.width=80/25.4, fig.height=95/25.4}
+palette_trials <- list(
+  warm_red = list(pal = c("#e8e6e1", "#d9c3b0", "#e8916a", "#cf4a35", "#8c1d24"), na = "#b8c2cc"),
+  teal_red = list(pal = c("#1d6470", "#7ab5b0", "#ece6d7", "#de8a62", "#962c22"), na = "#a6a6a6")
+)
+TRIAL_DIR <- file.path(LANCET_MCDA_DIR, "palette_trials")
+dir.create(TRIAL_DIR, showWarnings = FALSE)
+
+for (pn in names(palette_trials)) {
+  sc <- quint_fill_scale(palette_trials[[pn]]$pal, palette_trials[[pn]]$na)
+  for (city in c("Malta", "Klagenfurt")) {
+    p <- if (city == "Malta") {
+      priority_map_panel(malta_map_df, malta_border_sf, NULL, fill_scale = sc)
+    } else {
+      priority_map_panel(klag_map_df, klag_border, NULL, bar = "br", fill_scale = sc)
+    }
+    p <- p + guides(fill = guide_legend(nrow = 2, byrow = TRUE)) + single_map_theme
+    print(p)
+    f <- save_figure_lancet(p, sprintf("Figure_priority_map_%s_%s", city, pn), TRIAL_DIR,
+                            height_mm = 95, width_mm = LANCET_W1)
+    cat("Saved:", paste(basename(f), collapse = ", "), "\n")
+  }
+}
+```
+
+### Criterion maps (poster)
+
+One map per MCDA criterion, drawn like the single city priority maps (80 x 95 mm, cells clipped to
+the boundary and dissolved by class, scale bar, north arrow, legend below). Five classes per map:
+quintiles of the grid values, except when one value (zero, or the noise floor) covers 10% of cells
+or more; that value is then its own class and the other cells are split into quartiles. Raw values
+from the saved MCDA grids, before normalisation. Written to `output/figures_mcda/criterion_maps/`
+(PDF, SVG, PNG and editable PPTX).
+
+```{r criterion-maps, fig.width=80/25.4, fig.height=95/25.4}
+CRIT_DIR <- file.path(LANCET_MCDA_DIR, "criterion_maps")
+dir.create(CRIT_DIR, showWarnings = FALSE)
+
+# Five classes: quintiles, or tied minimum + quartiles of the rest
+class_values <- function(x, digits, tie_share = 0.10, tie_prefix = "") {
+  fmt <- function(v) formatC(v, format = "f", digits = digits, big.mark = ",")
+  ok <- x[!is.na(x)]
+  mn <- min(ok)
+  if (mean(ok == mn) >= tie_share) {
+    br  <- quantile(ok[ok > mn], seq(0, 1, 0.25), names = FALSE)
+    lab <- c(paste0(tie_prefix, fmt(mn)), sprintf("%s–%s", fmt(head(br, -1)), fmt(br[-1])))
+    lab[2] <- sprintf(">%s–%s", fmt(mn), fmt(br[2]))  # class 2 starts just above the tied value
+    cls <- ifelse(x == mn, 1L, 1L + as.integer(cut(x, br, include.lowest = TRUE)))
+  } else {
+    br  <- quantile(ok, seq(0, 1, 0.2), names = FALSE)
+    lab <- sprintf("%s–%s", fmt(head(br, -1)), fmt(br[-1]))
+    cls <- as.integer(cut(x, br, include.lowest = TRUE))
+  }
+  stopifnot(!anyDuplicated(br), length(lab) == 5)
+  factor(lab[cls], levels = lab)
+}
+
+# Hanken Grotesk has no subscript digits: NO2 and PM2.5 titles as plotmath subscripts
+legend_expr <- function(t) {
+  switch(t,
+         "NO2 (µg/m³)"   = expression(NO[2] ~ "(µg/m³)"),
+         "PM2.5 (µg/m³)" = expression(PM[2.5] ~ "(µg/m³)"),
+         t)
+}
+
+criterion_map_panel <- function(grid, border, var, legend_title, pal, digits = 0, bar = "bl",
+                                na_label = "No data", na_col = "#a6a6a6", tie_prefix = "") {
+  bb <- sf::st_bbox(border)
+  cl <- class_values(grid[[var]], digits, tie_prefix = tie_prefix)
+  # Cells without a value are kept only if their centre is inside the city (drawing only; NA cells
+  # cut by the boundary would otherwise add a "No data" legend key for invisible slivers)
+  inside <- lengths(sf::st_intersects(sf::st_centroid(sf::st_geometry(grid)),
+                                      sf::st_union(sf::st_geometry(border)))) > 0
+  keep <- !is.na(cl) | inside
+  map_df <- grid[keep, ] %>%
+    dplyr::mutate(quint_label = factor(dplyr::if_else(is.na(cl[keep]), na_label, as.character(cl[keep])),
+                                       levels = c(levels(cl), na_label)))
+  lay <- quint_map_layer(map_df, border)
+  lay$quint_label <- droplevels(lay$quint_label)  # "No data" only if present inside the city
+  ggplot() +
+    geom_sf(data = lay, aes(fill = quint_label), colour = NA) +
+    geom_sf(data = border, fill = NA, colour = "grey25", linewidth = 0.2) +
+    scale_fill_manual(values = c(setNames(pal, levels(cl)), setNames(na_col, na_label)),
+                      name = legend_expr(legend_title), drop = TRUE) +
+    lancet_scale_bar(bar) + lancet_north_arrow("tr") +
+    coord_sf(xlim = bb[c("xmin", "xmax")], ylim = bb[c("ymin", "ymax")], datum = NA) +
+    guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+    theme_lancet_map() +
+    theme(legend.key.size = unit(3, "mm")) +
+    single_map_theme
+}
+
+# Palettes of the earlier exposure maps (sandbox Malta_exposures_master_plots.Rmd and
+# Plot_klagenfurt.Rmd, ../ggn_analysis_archive/), sampled at five steps for the five classes
+ramp5 <- function(cols) grDevices::colorRampPalette(cols)(5)
+PAL <- list(
+  pop       = ramp5(c("#EFF3FF", "#084594")),
+  lst       = viridisLite::magma(5),
+  imd_malta = ramp5(c("#eef2f3", "#64798f")),
+  imd_klag  = ramp5(c("#eef2f3", "#2c3e50")),
+  blue      = ramp5(c("dodgerblue3", "lightblue", "wheat", "sienna3")),
+  noise     = c("#FFEDA0", "#FEB24C", "#FD8D3C", "#E31A1C", "#800026"),
+  # NO2 ramp starts at white; drop the white step so the lowest class stays visible on the page
+  no2       = grDevices::colorRampPalette(c("white", "#FEB24C", "#F03B20", "#BD0026"))(6)[-1],
+  pm25      = viridisLite::viridis(5, begin = 0.4)
+)
+
+# Population: Malta = Total_Population per 1 ha cell (reallocated, MCDA grid);
+# Klagenfurt = popdense_2020 per 1 ha cell, NA where the census grid has no residents
+crit_specs <- tibble::tribble(
+  ~city,        ~var,               ~name,               ~title,                                   ~pal,    ~digits, ~na_label,                ~tie_prefix,
+  "Malta",      "Total_Population", "population",        "Population density (residents per ha)",  "pop",   0,       "No data",                "",
+  "Malta",      "lst",              "LST",               "Land surface temperature (°C)",          "lst",   1,       "No data",                "",
+  "Malta",      "imd",              "imperviousness",    "Imperviousness (%)",                     "imd_malta",   0,       "No data",                "",
+  "Malta",      "dist_bs",          "distance_bluespace","Distance to blue space (m)",             "blue",  0,       "No data",                "",
+  "Malta",      "Lden",             "noise",             "Noise, Lden (dB)",                  "noise", 0,       "No data",                "≤",
+  "Malta",      "no2_avg_21",       "NO2",               "NO2 (µg/m³)",                       "no2",   1,       "No data",                "",
+  "Klagenfurt", "popdense_2020",    "population",        "Population density (residents per ha)",  "pop",   0,       "No residents recorded",  "",
+  "Klagenfurt", "no2_final",        "NO2",               "NO2 (µg/m³)",                       "no2",   1,       "No data",                "",
+  "Klagenfurt", "pm25_final",       "PM25",              "PM2.5 (µg/m³)",                "pm25",  1,       "No data",                "",
+  "Klagenfurt", "lst",              "LST",               "Land surface temperature (°C)",          "lst",   1,       "No data",                "",
+  "Klagenfurt", "imd",              "imperviousness",    "Imperviousness (%)",                     "imd_klag",   0,       "No data",                "",
+  "Klagenfurt", "dist_bs",          "distance_bluespace","Distance to blue space (m)",             "blue",  0,       "No data",                ""
+)
+
+for (i in seq_len(nrow(crit_specs))) {
+  s <- crit_specs[i, ]
+  grid   <- if (s$city == "Malta") malta_grid else klag_grid
+  border <- if (s$city == "Malta") malta_border_sf else klag_border
+  # Sanity check: summary and class counts of each variable
+  cat("\n##", s$city, s$var, "\n")
+  print(summary(grid[[s$var]]))
+  print(table(class_values(grid[[s$var]], s$digits, tie_prefix = s$tie_prefix), useNA = "ifany"))
+  p <- criterion_map_panel(grid, border, s$var, s$title, PAL[[s$pal]], digits = s$digits,
+                           bar = if (s$city == "Malta") "bl" else "br",
+                           na_label = s$na_label, tie_prefix = s$tie_prefix,
+                           na_col = if (s$var == "popdense_2020") "#ebebeb" else "#a6a6a6")
+  print(p)
+  nm <- sprintf("criterion_map_%s_%s", s$city, s$name)
+  f <- c(save_figure_lancet(p, nm, CRIT_DIR, height_mm = 95, width_mm = LANCET_W1),
+         save_figure_pptx(p, nm, CRIT_DIR, height_mm = 95, width_mm = LANCET_W1))
+  cat("Saved:", paste(basename(f), collapse = ", "), "\n")
+}
+```
 
 ---
 

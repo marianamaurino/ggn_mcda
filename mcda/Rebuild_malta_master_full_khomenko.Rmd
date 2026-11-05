@@ -1,0 +1,138 @@
+---
+title: "Malta: Rebuild malta_master_full with Khomenko Reallocated Population"
+author: "Mariana Mauriño"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 12, fig.height = 6)
+```
+
+> **Purpose.** `malta_master_full_realloc.rds` (built by `Population_reallocation_malta.Rmd`) reallocated
+> `Total_Population`/`Adult_Population` using a **different** method than Khomenko et al. (2021): broad
+> residential definition (includes class `11300`), area-based zero-residential-land threshold, grouped by
+> locality (`NAME`), with a nearest-neighbour fallback for orphan localities.
+>
+> This notebook builds a replacement, `malta_master_full_reallocated_khomenko`, using the Khomenko
+> reallocation instead (`Population_Malta_reallocated_khomenko.Rmd`: narrow residential definition,
+> topological intersection test, grouped by `district`, skip/uniform fallbacks) -- for **both**
+> `Total_Population` and `Adult_Population` (the latter extended in that notebook to also reallocate total
+> population using the same method). `malta_master_full.rds` itself is untouched; every other column is
+> carried over unchanged.
+
+```{r libraries}
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(knitr)
+library(kableExtra)
+
+data_dir <- here::here("data/malta")
+```
+
+# Load inputs
+
+```{r load}
+malta_master_full <- readRDS(file.path(data_dir, "malta_master_full.rds")) %>%
+  mutate(gid = as.character(gid))
+
+khomenko <- st_read(file.path(data_dir, "Population_Malta_reallocated_khomenko.gpkg"), quiet = TRUE) %>%
+  st_drop_geometry() %>%
+  mutate(gid = as.character(gid)) %>%
+  select(gid, adult_khomenko = pop_reallocated, total_khomenko = total_reallocated)
+
+cat("malta_master_full:", nrow(malta_master_full), "rows\n")
+cat("khomenko:", nrow(khomenko), "rows\n")
+cat("Total_Population (original):", sum(malta_master_full$Total_Population, na.rm = TRUE), "\n")
+cat("Adult_Population (original):", sum(malta_master_full$Adult_Population, na.rm = TRUE), "\n")
+```
+
+# Build `malta_master_full_reallocated_khomenko`
+
+```{r build}
+d <- malta_master_full %>%
+  st_drop_geometry() %>%
+  select(gid) %>%
+  left_join(khomenko, by = "gid")
+
+cat("NAs after join (adult):", sum(is.na(d$adult_khomenko)), "\n")
+cat("NAs after join (total):", sum(is.na(d$total_khomenko)), "\n")
+
+malta_master_full_reallocated_khomenko <- malta_master_full
+malta_master_full_reallocated_khomenko$Total_Population <- d$total_khomenko
+malta_master_full_reallocated_khomenko$Adult_Population <- d$adult_khomenko
+
+cat("\nColumns identical to original (besides the two population columns):",
+    identical(setdiff(names(malta_master_full), c("Total_Population","Adult_Population")),
+              setdiff(names(malta_master_full_reallocated_khomenko), c("Total_Population","Adult_Population"))),
+    "\n")
+```
+
+# Verification
+
+## Global totals
+
+```{r verify-global}
+tibble(
+  metric   = c("Total_Population", "Adult_Population"),
+  original = c(sum(malta_master_full$Total_Population, na.rm = TRUE),
+               sum(malta_master_full$Adult_Population, na.rm = TRUE)),
+  khomenko = c(sum(malta_master_full_reallocated_khomenko$Total_Population, na.rm = TRUE),
+               sum(malta_master_full_reallocated_khomenko$Adult_Population, na.rm = TRUE))
+) %>%
+  mutate(diff = khomenko - original) %>%
+  kable(caption = "National totals: original vs Khomenko-reallocated", digits = 4) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+```
+
+## Sanity check: histograms of the change
+
+```{r sanity-hist, fig.height=4}
+diff_df <- tibble(
+  diff_total = malta_master_full_reallocated_khomenko$Total_Population - malta_master_full$Total_Population,
+  diff_adult = malta_master_full_reallocated_khomenko$Adult_Population - malta_master_full$Adult_Population
+)
+
+ggplot(diff_df, aes(x = diff_total)) +
+  geom_histogram(bins = 60, fill = "#3B1F5E") +
+  labs(title = "Total_Population: Khomenko - original", x = "Difference", y = "Cells") +
+  theme_minimal()
+```
+
+```{r sanity-hist-adult, fig.height=4}
+ggplot(diff_df, aes(x = diff_adult)) +
+  geom_histogram(bins = 60, fill = "#3B1F5E") +
+  labs(title = "Adult_Population: Khomenko - original", x = "Difference", y = "Cells") +
+  theme_minimal()
+```
+
+## Sanity check: map of the change (Total_Population)
+
+```{r sanity-map, fig.height=6}
+map_data <- malta_master_full_reallocated_khomenko %>%
+  select(gid) %>%
+  mutate(diff_total = diff_df$diff_total)
+
+cap <- max(abs(quantile(map_data$diff_total, c(0.02, 0.98), na.rm = TRUE)))
+ggplot(map_data) +
+  geom_sf(aes(fill = pmax(pmin(diff_total, cap), -cap)), color = NA) +
+  scale_fill_gradient2(low = "#4575b4", mid = "white", high = "#d73027", midpoint = 0,
+                       na.value = "grey90", name = "Δ Total_Population\n(Khomenko - original)") +
+  labs(title = "Change in Total_Population per cell (Khomenko reallocation)") +
+  theme_void()
+```
+
+# Save
+
+```{r save}
+saveRDS(malta_master_full_reallocated_khomenko,
+        file.path(data_dir, "malta_master_full_reallocated_khomenko.rds"))
+cat("Saved malta_master_full_reallocated_khomenko.rds — malta_master_full.rds untouched.\n")
+```

@@ -3,7 +3,7 @@
 # Reads only saved outputs and the survey files; does not re-run the MCDA scoring notebooks.
 #   data/malta/malta_mcda_processed_realloc.rds      (mcda/Malta_MCDA_260702_realloc.Rmd)
 #   data/klagenfurt/klagenfurt_mcda_priority_may.rds  (mcda/Klagenfurt_MCDA_260520.Rmd)
-#   data/malta/maltasurvey_jun26.csv, data/klagenfurt/klagenfurtsurvey_responses260907.csv
+#   data/malta/maltasurvey_jun26.xlsx, data/klagenfurt/klagenfurtsurvey_nov26.xlsx (via R/read_survey.R)
 # Writes tables, figures and a GeoPackage to output/figures_mcda/poster/.
 #
 # Run from the project root:
@@ -57,8 +57,9 @@ k_cols <- c("alloc_1_TooHotStreets", "alloc_2_GreenOutOfReach", "alloc_3_LowInco
 k_lab <- c("Too-hot streets", "Green out of reach", "Low-income neighbourhoods", "High-traffic areas",
            "Poor air quality", "Disconnected nature/water")
 
-ms <- read.csv(here::here("data/malta/maltasurvey_jun26.csv"))
-ks_raw <- read.csv(here::here("data/klagenfurt/klagenfurtsurvey_responses260907.csv"))
+source(here::here("R/read_survey.R"))  # 2026-11-06: surveys are .xlsx now
+ms <- read_survey(here::here("data/malta/maltasurvey_jun26.xlsx"), dot_names = TRUE)
+ks_raw <- read_survey(here::here("data/klagenfurt/klagenfurtsurvey_nov26.xlsx"), dot_names = TRUE)
 # Klagenfurt exclusion, as in mcda/Klagenfurt_MCDA_260520.Rmd (resident-cleanup): former residents
 ks <- ks_raw %>% filter(resident != "left-2-plus") %>%
   mutate(across(all_of(k_cols), ~ tidyr::replace_na(., 0)))

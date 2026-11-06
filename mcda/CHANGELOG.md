@@ -1,5 +1,41 @@
 # MCDA changelog
 
+## 2026-11-06: green per person with the new population; new survey exports
+
+**Malta green per person (`norm_green_exp`).** The main input is now our E2SFCA rebuild with the new
+population (`mcda/malta_e2sfca_newpop.R`, output `data/malta/accessibility_malta/own_routing/norm_green_exp_newpop.csv`):
+NSO-rescaled GHSL population, OSM walking network, igraph routing at 5 km/h, ATGreen's 106 UA2021 patches and
+origin points, Gaussian kernel exp(-t²/2σ²) with σ = 5 min, cut at 15 min; the step 1/0.7/0.4 sensitivity uses the same rebuild.
+ATGreen's own values (GHSL population, Valhalla) are kept as a sensitivity (`*_atg` columns, `priority_atg_exp`);
+that sensitivity reproduces the previous score exactly. Column names of the main inputs are unchanged.
+
+**Malta `Total_Population`** on the MCDA grid is now the NSO grid (`pop_reallocated_nso`, 346,005); the old
+DHIR/Khomenko values are kept as `Total_Population_dhir_khomenko`. It enters no criterion.
+
+**Surveys.** Exports are now .xlsx and the .csv files were removed: `data/malta/maltasurvey_jun26.xlsx`
+(123 responses, same answers as before) and `data/klagenfurt/klagenfurtsurvey_nov26.xlsx` (186, +2, last
+2026-10-17). All readers use `R/read_survey.R` (first sheet; maps Excel date serials back to "1-5", "5-10",
+"2-4", "5-7"). Klagenfurt keeps the 2 former residents (`KEEP_FORMER_RESIDENTS <- TRUE`, n = 186).
+
+**Effect**
+
+| | Malta | Klagenfurt |
+|---|---|---|
+| Spearman r vs 2026-11-05 score | 0.995 | 1.000 |
+| Cells changing quintile | 4.9% | 0.5% |
+| Old top quintile retained | 97.6% | 99.9% |
+| Cells scored | 10,194 (unchanged) | 12,329 (unchanged) |
+
+Re-knitted: both scoring notebooks, both survey notebooks and reports, `Figures_MCDA.Rmd`, `Tables_MCDA.Rmd`,
+`poster_UT2026_numbers.R`. The HIA was not re-run (still on `*_pre_avail80`).
+
+**Backups of the 2026-11-05 state (tag `ut2026-poster`):** `data/malta/malta_mcda_processed_realloc_ut2026_poster.rds`,
+`data/klagenfurt/klagenfurt_mcda_priority_may_ut2026_poster.rds`, `output/figures_mcda/_ut2026_poster/`,
+`data/malta/outputs/_ut2026_poster/`.
+
+**Prose not updated (TODO markers):** status note at the top of the Malta MCDA notebook; Klagenfurt survey
+report "until September 2026"; `output/figures_mcda/poster/poster_numbers_report.md` (handwritten, says n = 184).
+
 ## 2026-11-05: available weight rule (≥ 80% of weight), Malta and Klagenfurt, for the UT2026 poster
 
 Git tag: `ut2026-poster`.

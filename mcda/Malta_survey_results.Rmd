@@ -48,9 +48,8 @@ library(kableExtra)
 The survey used a **budget-allocation method**: each respondent distributed a hypothetical €1,000 across 10 criteria for prioritizing green-space interventions.
 
 ```{r load-survey}
-survey <- read_csv(
-  here::here("data/malta/maltasurvey_jun26.csv")
-)
+source(here::here("R/read_survey.R"))  # 2026-11-06: surveys are .xlsx now
+survey <- read_survey(here::here("data/malta/maltasurvey_jun26.xlsx"))
 
 budget_cols <- c("Lack-recreational-facilities", "overcrowding", "poor-accessibility",
                  "lack-blue-spaces", "poor-airquality", "noise-pollution",

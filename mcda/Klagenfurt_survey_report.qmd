@@ -43,9 +43,8 @@ library(patchwork)
 
 knitr::opts_chunk$set(dev = "cairo_pdf", fig.width = 6.5)
 
-survey <- read.csv(
-  here::here("data/klagenfurt/klagenfurtsurvey_responses260907.csv")
-)
+source(here::here("R/read_survey.R"))  # 2026-11-06: surveys are .xlsx now
+survey <- read_survey(here::here("data/klagenfurt/klagenfurtsurvey_nov26.xlsx"), dot_names = TRUE)
 
 # Two `neighborhood` values ("völkermarkter_vorstadt", "wölfnitz") are stored
 # as Latin-1 bytes rather than UTF-8 in the source CSV, which crashes text
@@ -196,6 +195,7 @@ sentence_below <- paste0(
 
 # Introduction
 
+<!-- TODO: update text (2026-11-06): survey now runs to 17 October 2026 (klagenfurtsurvey_nov26.xlsx) -->
 Between the launch of the Klagenfurt pilot and September 2026, `r n_total` residents completed a citizen-priority survey for greening interventions investment. Each respondent distributed a hypothetical €1,000,000 budget across six criteria describing problems that green-space interventions could address (e.g. too-hot streets, poor air quality, disconnection from nature and water), and answered a short set of questions, including a general demographic profile and their usage of green space habits. This report summarises the results: who responded, how they currently use green space, and which problems they prioritised for investment.
 
 # Sample and demographics

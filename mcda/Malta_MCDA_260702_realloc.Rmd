@@ -22,6 +22,8 @@ knitr::opts_chunk$set(
 )
 ```
 
+<!-- TODO: update text (2026-11-06): green per person now uses our E2SFCA rebuild with the NSO population, and Total_Population is the NSO grid; the status note below describes the earlier setup. -->
+
 > **Status: main / canonical MCDA (2026-08-13).** This is the MCDA that feeds the main HIA pipeline
 > (`MCDA_RDS` in `HIA_malta_consolidated_popkho_ratefix.Rmd`). A GHSL+NSO-reallocated-population variant
 > was built and run for comparison (`Rebuild_malta_master_full_khomenko_nso.Rmd` →
@@ -69,6 +71,26 @@ malta       <- readRDS(file.path(data_dir, "malta_master_full_reallocated_khomen
 malta_union <- readRDS(file.path(out_dir,  "malta_union_shape.rds"))
 
 malta$gid <- as.character(malta$gid)
+
+# 2026-11-06: Total_Population replaced by the final study population (GHSL reallocated to
+# residential cells, Khomenko et al. 2021 method, rescaled to NSO Census 2021 district totals).
+# Before, it was the Khomenko reallocation of DHIR population. It enters no criterion directly;
+# it is used for the confluent-population comparison and the residents-within-walk numbers.
+pop_nso <- st_read(file.path(data_dir, "Population_Malta_reallocated_nso.gpkg"), quiet = TRUE) %>%
+  st_drop_geometry() %>%
+  transmute(gid = as.character(gid), pop_nso = pop_reallocated_nso)
+
+malta <- malta %>%
+  rename(Total_Population_dhir_khomenko = Total_Population) %>%
+  left_join(pop_nso, by = "gid") %>%
+  rename(Total_Population = pop_nso)
+
+stopifnot(!anyNA(malta$Total_Population))
+cat("Total population, NSO grid:", round(sum(malta$Total_Population)),
+    "| old DHIR/Khomenko:", round(sum(malta$Total_Population_dhir_khomenko, na.rm = TRUE)), "\n")
+summary(malta$Total_Population)
+hist(malta$Total_Population[malta$Total_Population > 0], breaks = 60,
+     main = "Population per cell, NSO grid (populated cells)", xlab = "Residents")
 ```
 
 # Data Preparation
@@ -344,15 +366,35 @@ The E2SFCA Gaussian further improves on the simple confluent-population ratio by
 ### E2SFCA Gaussian — final criterion column
 
 ```{r green-sufficiency-final}
+# TODO: update text (2026-11-06). The main E2SFCA is now our rebuild with the NSO population
+# (mcda/malta_e2sfca_newpop.R: OSM walking network, igraph routing at 5 km/h, ATGreen's 106 UA2021
+# patches and origin points, Gaussian sigma = 5 min cut at 15 min; step 1/0.7/0.4 for 5/10/15 min).
+# ATGreen's own values (GHSL population, Valhalla) are kept as a sensitivity analysis
+# (green_m2_e2sfca_*_atg). Column names of the main inputs are unchanged so downstream code works.
+e2sfca_own <- read_csv(
+  here::here("data/malta/accessibility_malta/own_routing/norm_green_exp_newpop.csv"),
+  show_col_types = FALSE
+) %>%
+  transmute(gid = as.character(gid),
+            green_m2_e2sfca_per_person_gauss = green_m2_e2sfca_gauss_newpop,
+            green_m2_e2sfca_per_person       = green_m2_e2sfca_step_newpop)
+
 exposure_e2sfca <- read_parquet(
   here::here("mcda/exposure/final_metrics.parquet")
 ) %>%
   st_drop_geometry() %>%
   mutate(unit_id = as.character(unit_id)) %>%
-  select(unit_id, green_m2_e2sfca_per_person_gauss, green_m2_e2sfca_per_person)
+  transmute(gid = unit_id,
+            green_m2_e2sfca_per_person_gauss_atg = green_m2_e2sfca_per_person_gauss,
+            green_m2_e2sfca_per_person_atg       = green_m2_e2sfca_per_person)
 
 malta <- malta %>%
-  left_join(exposure_e2sfca, by = c("gid" = "unit_id"))
+  left_join(e2sfca_own, by = "gid") %>%
+  left_join(exposure_e2sfca, by = "gid")
+
+cat("Spearman, own (NSO pop) vs ATGreen, Gaussian:",
+    round(cor(malta$green_m2_e2sfca_per_person_gauss, malta$green_m2_e2sfca_per_person_gauss_atg,
+              method = "spearman", use = "complete.obs"), 3), "\n")
 
 cat("Cells with Gaussian E2SFCA:", sum(!is.na(malta$green_m2_e2sfca_per_person_gauss)), "\n")
 cat("Cells with step-weights E2SFCA:", sum(!is.na(malta$green_m2_e2sfca_per_person)), "\n")
@@ -820,9 +862,8 @@ malta %>%
 The survey used a **budget-allocation method**: each respondent distributed a hypothetical €1,000 across 10 criteria for prioritizing green-space interventions.
 
 ```{r load-survey}
-survey <- read_csv(
-  here::here("data/malta/maltasurvey_jun26.csv")
-)
+source(here::here("R/read_survey.R"))  # 2026-11-06: surveys are .xlsx now
+survey <- read_survey(here::here("data/malta/maltasurvey_jun26.xlsx"))
 
 budget_cols <- c("Lack-recreational-facilities", "overcrowding", "poor-accessibility",
                  "lack-blue-spaces", "poor-airquality", "noise-pollution",
@@ -1399,6 +1440,49 @@ p_step_wlc <- ggplot(malta) +
   theme_void()
 
 p_gauss_wlc + p_step_wlc
+```
+
+## Green sufficiency: ATGreen E2SFCA (sensitivity, added 2026-11-06)
+
+ATGreen's own Gaussian E2SFCA (R. Schifanella, run 2026-06-01: GHSL 2020 population, Valhalla routing) replaces our rebuild (NSO population, OSM routing) for `norm_green_exp`. All other variables and weights are unchanged.
+
+```{r green-exp-atgreen-sensitivity}
+malta <- malta %>%
+  mutate(
+    norm_green_exp_atg = 1 - normalize_minmax(green_m2_e2sfca_per_person_gauss_atg,
+                                              lower = 0,
+                                              upper = quantile(green_m2_e2sfca_per_person_gauss_atg,
+                                                               0.98, na.rm = TRUE)),
+    priority_atg_exp = wlc_avail(malta %>% mutate(norm_green_exp = norm_green_exp_atg), weights)
+  )
+
+summary(malta$norm_green_exp_atg)
+hist(malta$priority_atg_exp, breaks = 50, main = "Priority score, ATGreen E2SFCA", xlab = "Priority")
+
+class_atg <- cut(malta$priority_atg_exp, breaks = q_breaks, labels = 1:5, include.lowest = TRUE)
+top_main  <- class_gauss == "5"
+top_atg   <- class_atg == "5"
+
+tibble(
+  check = c("Spearman r, priority (main vs ATGreen)",
+            "Quintile class agreement (%)",
+            "Main top quintile also top with ATGreen (%)",
+            "Cells scored, main / ATGreen"),
+  value = c(round(cor(malta$priority_citizen, malta$priority_atg_exp,
+                      method = "spearman", use = "complete.obs"), 3),
+            round(100 * mean(class_gauss == class_atg, na.rm = TRUE), 1),
+            round(100 * mean(top_atg[top_main], na.rm = TRUE), 1),
+            paste(sum(!is.na(malta$priority_citizen)), "/", sum(!is.na(malta$priority_atg_exp))))
+) %>%
+  kable(caption = "Main (own E2SFCA, NSO population) vs ATGreen E2SFCA") %>%
+  kable_styling(full_width = FALSE)
+
+ggplot(malta) +
+  geom_sf(aes(fill = priority_citizen - priority_atg_exp), color = NA) +
+  scale_fill_gradient2(low = "#4575b4", mid = "#f7f7f7", high = "#d73027", midpoint = 0,
+                       na.value = "grey90", name = "Δ priority\n(main − ATGreen)") +
+  labs(title = "Priority difference: own E2SFCA (NSO population) vs ATGreen E2SFCA") +
+  theme_void()
 ```
 
 The two priority surfaces are nearly indistinguishable, confirming that the choice of distance-decay function for the green sufficiency criterion does not materially affect the MCDA outcome.

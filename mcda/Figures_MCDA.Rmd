@@ -15,8 +15,8 @@ Required files (all paths relative to `BASE = /PROJECTES/HIA/GreenSpace/GoGreenN
 
 | File | Status |
 |------|--------|
-| `Data/citydata/maltasurvey_jun26.csv` | `r if(file.exists(here::here("data/malta/maltasurvey_jun26.csv"))) "✓" else "**MISSING**"` |
-| `Data/citydata/klagenfurtsurvey_responses260907.csv` | `r if(file.exists(here::here("data/klagenfurt/klagenfurtsurvey_responses260907.csv"))) "✓" else "**MISSING**"` |
+| `data/malta/maltasurvey_jun26.xlsx` | `r if(file.exists(here::here("data/malta/maltasurvey_jun26.xlsx"))) "✓" else "**MISSING**"` |
+| `data/klagenfurt/klagenfurtsurvey_nov26.xlsx` | `r if(file.exists(here::here("data/klagenfurt/klagenfurtsurvey_nov26.xlsx"))) "✓" else "**MISSING**"` |
 | `Data/citydata/malta_mcda_processed_realloc.rds` | `r if(file.exists(here::here("data/malta/malta_mcda_processed_realloc.rds"))) "✓" else "**MISSING**"` |
 | `Data/citydata/klagenfurt_mcda_priority_may.rds` | `r if(file.exists(here::here("data/klagenfurt/klagenfurt_mcda_priority_may.rds"))) "✓" else "**MISSING**"` |
 | `Data/citydata/malta_union_boundary.rds` | `r if(file.exists(here::here("data/malta/malta_union_boundary.rds"))) "✓" else "**MISSING**"` |
@@ -102,8 +102,8 @@ sig_label <- function(p) {
 
 ```{r survey-summaries}
 # ── Malta survey ─────────────────────────────────────────────────────────────
-malta_survey_raw <- read.csv(file.path(DATA, "maltasurvey_jun26.csv"),
-                             stringsAsFactors = FALSE)
+source(here::here("R/read_survey.R"))  # 2026-11-06: surveys are .xlsx now
+malta_survey_raw <- read_survey(here::here("data/malta/maltasurvey_jun26.xlsx"), dot_names = TRUE)
 
 malta_budget_cols <- c(
   "Lack.recreational.facilities", "overcrowding", "poor.accessibility",
@@ -152,8 +152,7 @@ malta_summary <- purrr::map_dfr(malta_budget_cols, function(col) {
 saveRDS(malta_summary, file.path(OUT, "malta_survey_summary.rds"))
 
 # ── Klagenfurt survey ─────────────────────────────────────────────────────────
-klag_survey_raw <- read.csv(file.path(DATA_KLAG, "klagenfurtsurvey_responses260907.csv"),
-                            stringsAsFactors = FALSE)
+klag_survey_raw <- read_survey(here::here("data/klagenfurt/klagenfurtsurvey_nov26.xlsx"), dot_names = TRUE)
 
 klag_budget_cols <- c(
   "alloc_1_TooHotStreets", "alloc_2_GreenOutOfReach",

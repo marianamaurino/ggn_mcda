@@ -49,7 +49,8 @@ The survey used a budget allocation method: each respondent distributed a hypoth
 The criteria were derived from stakeholder interviews and thematic analysis.
 
 ```{r load-survey}
-survey <- read.csv(file.path(data_dir, "klagenfurtsurvey_responses260907.csv"))
+source(here::here("R/read_survey.R"))  # 2026-11-06: surveys are .xlsx now
+survey <- read_survey(here::here("data/klagenfurt/klagenfurtsurvey_nov26.xlsx"), dot_names = TRUE)
 
 # Two `neighborhood` values ("völkermarkter_vorstadt", "wölfnitz") are stored
 # as Latin-1 bytes rather than UTF-8 in the source CSV, which the

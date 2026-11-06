@@ -43,10 +43,8 @@ library(patchwork)
 
 knitr::opts_chunk$set(dev = "cairo_pdf", fig.width = 6.5)
 
-survey <- read_csv(
-  here::here("data/malta/maltasurvey_jun26.csv"),
-  show_col_types = FALSE
-)
+source(here::here("R/read_survey.R"))  # 2026-11-06: surveys are .xlsx now
+survey <- read_survey(here::here("data/malta/maltasurvey_jun26.xlsx"))
 
 budget_cols <- c("Lack-recreational-facilities", "overcrowding", "poor-accessibility",
                  "lack-blue-spaces", "poor-airquality", "noise-pollution",

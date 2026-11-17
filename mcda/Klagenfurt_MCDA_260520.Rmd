@@ -729,7 +729,7 @@ survey entirely.
 
 ```{r resident-cleanup}
 resident_levels <- c("born", "0-1", "1-5", "5-10", "10+")
-KEEP_FORMER_RESIDENTS <- TRUE
+KEEP_FORMER_RESIDENTS <- FALSE  # 2026-11-17: back to excluding former residents (n = 184); TRUE was for the UT2026 poster only
 
 n_before <- nrow(survey)
 

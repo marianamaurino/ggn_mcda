@@ -86,3 +86,13 @@ On cells complete in both versions the scores are identical (max difference < 1e
 - `mcda/malta_atgreen_checks.R` → `output/figures_mcda/atgreen_checks/`: ATGreen vs the study grid.
 - `mcda/malta_e2sfca_newpop.R`: E2SFCA rebuilt with the new population, kept as a sensitivity analysis; the MCDA was not switched to it.
 - `mcda/poster_UT2026_numbers.R`: the poster numbers. Malta residents now come from the new population grid; the ±20% perturbation uses the available weight rule.
+
+## 2026-11-17: Klagenfurt survey re-export, former residents excluded again
+
+- New export `data/klagenfurt/klagenfurtsurvey_nov26.xlsx` (saved 2026-11-17): 186 rows, budget answers identical to the 2026-11-06 export.
+- `Klagenfurt_MCDA_260520.Rmd`: `KEEP_FORMER_RESIDENTS <- FALSE`, the 2 "left-2-plus" respondents are excluded again (n = 184). Keeping them was for the UT2026 poster only.
+- `Figures_MCDA.Rmd`: the Klagenfurt survey now excludes "left-2-plus" too, so Figure 4 and `klag_survey_summary.rds` match the MCDA weights (n = 184).
+- Weights (n = 184): too-hot streets 25.5%, green out of reach 11.3%, low income 14.3%, traffic 18.0%, air quality 16.1%, nature/water 14.7%.
+- Score vs previous (`data/klagenfurt/klagenfurt_mcda_priority_may_pre_nov17.rds`, md5 `af2c76489e9ec716d4c5d72c6b239eee`): same 12,329 cells scored, Spearman 1.000, max abs difference 0.0012, 36 cells (0.3%) change quartile, 99.8% of Q4 stays in Q4.
+- New `data/klagenfurt/klagenfurt_mcda_priority_may.rds`, md5 `181cce3a1831e81ec7e9e25d1d9b1c00`.
+- Re-knitted: `Klagenfurt_MCDA_260520.Rmd`, `Klagenfurt_survey_results.Rmd`, `Figures_MCDA.Rmd`, `Tables_MCDA.Rmd`. HIA not re-run.

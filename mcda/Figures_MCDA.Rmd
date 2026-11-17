@@ -152,7 +152,8 @@ malta_summary <- purrr::map_dfr(malta_budget_cols, function(col) {
 saveRDS(malta_summary, file.path(OUT, "malta_survey_summary.rds"))
 
 # ── Klagenfurt survey ─────────────────────────────────────────────────────────
-klag_survey_raw <- read_survey(here::here("data/klagenfurt/klagenfurtsurvey_nov26.xlsx"), dot_names = TRUE)
+klag_survey_raw <- read_survey(here::here("data/klagenfurt/klagenfurtsurvey_nov26.xlsx"), dot_names = TRUE) %>%
+  dplyr::filter(resident != "left-2-plus")  # former residents excluded, as in Klagenfurt_MCDA_260520.Rmd (2026-11-17)
 
 klag_budget_cols <- c(
   "alloc_1_TooHotStreets", "alloc_2_GreenOutOfReach",

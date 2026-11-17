@@ -448,8 +448,9 @@ quint_fill_scale <- function(pal = quint_colours, na_col = NA_GREY) {
 quint_fill <- quint_fill_scale()
 
 priority_map_panel <- function(map_df, border, tag, legend = TRUE, bar = "bl",
-                               fill_scale = quint_fill) {
+                               fill_scale = quint_fill, north = TRUE, frame = NULL) {
   bb <- sf::st_bbox(border)
+  lims <- if (is.null(frame)) list(x = bb[c("xmin", "xmax")], y = bb[c("ymin", "ymax")]) else frame
   # cells without a priority score as their own legend class (drawing only)
   map_df <- map_df %>%
     dplyr::mutate(quint_label = factor(dplyr::if_else(is.na(quint_label), "No score",
@@ -459,8 +460,9 @@ priority_map_panel <- function(map_df, border, tag, legend = TRUE, bar = "bl",
     geom_sf(data = quint_map_layer(map_df, border), aes(fill = quint_label), colour = NA) +
     geom_sf(data = border, fill = NA, colour = "grey25", linewidth = 0.2) +
     fill_scale +
-    lancet_scale_bar(bar) + lancet_north_arrow("tr") +
-    coord_sf(xlim = bb[c("xmin", "xmax")], ylim = bb[c("ymin", "ymax")], datum = NA) +
+    lancet_scale_bar(bar) +
+    (if (north) lancet_north_arrow("tr") else NULL) +
+    coord_sf(xlim = lims$x, ylim = lims$y, expand = FALSE, datum = NA) +
     labs(tag = tag) +
     theme_lancet_map() +
     theme(legend.position = if (legend) "right" else "none",
@@ -524,15 +526,33 @@ palette_trials <- list(
   teal_red = list(pal = c("#1d6470", "#7ab5b0", "#ece6d7", "#de8a62", "#962c22"), na = "#a6a6a6")
 )
 TRIAL_DIR <- file.path(LANCET_MCDA_DIR, "palette_trials")
+
+# teal_red: no north arrow; both cities in frames of the same aspect ratio with a strip below the
+# city for the scale bar (bottom left), so the panels and scale bars line up across the two figures
+common_frames <- function(borders, strip = 0.12, margin = 0.03) {
+  bbs <- lapply(borders, sf::st_bbox)
+  asp <- max(sapply(bbs, function(b) (b[["ymax"]] - b[["ymin"]]) * (1 + strip + margin) /
+                      ((b[["xmax"]] - b[["xmin"]]) * (1 + 2 * margin))))
+  lapply(bbs, function(b) {
+    w <- (b[["xmax"]] - b[["xmin"]]) * (1 + 2 * margin); h <- b[["ymax"]] - b[["ymin"]]
+    extra <- w * asp - h * (1 + strip + margin)
+    list(x = c(b[["xmin"]], b[["xmax"]]) + c(-1, 1) * (b[["xmax"]] - b[["xmin"]]) * margin,
+         y = c(b[["ymin"]] - h * strip - extra / 2, b[["ymax"]] + h * margin + extra / 2))
+  })
+}
+teal_frames <- common_frames(list(Malta = malta_border_sf, Klagenfurt = klag_border))
 dir.create(TRIAL_DIR, showWarnings = FALSE)
 
 for (pn in names(palette_trials)) {
   sc <- quint_fill_scale(palette_trials[[pn]]$pal, palette_trials[[pn]]$na)
   for (city in c("Malta", "Klagenfurt")) {
+    teal <- pn == "teal_red"
     p <- if (city == "Malta") {
-      priority_map_panel(malta_map_df, malta_border_sf, NULL, fill_scale = sc)
+      priority_map_panel(malta_map_df, malta_border_sf, NULL, fill_scale = sc, north = !teal,
+                         frame = if (teal) teal_frames$Malta)
     } else {
-      priority_map_panel(klag_map_df, klag_border, NULL, bar = "br", fill_scale = sc)
+      priority_map_panel(klag_map_df, klag_border, NULL, bar = if (teal) "bl" else "br", fill_scale = sc,
+                         north = !teal, frame = if (teal) teal_frames$Klagenfurt)
     }
     p <- p + guides(fill = guide_legend(nrow = 2, byrow = TRUE)) + single_map_theme
     print(p)
@@ -541,125 +561,160 @@ for (pn in names(palette_trials)) {
     cat("Saved:", paste(basename(f), collapse = ", "), "\n")
   }
 }
+
+# Klagenfurt teal_red for the poster: city drawn ~15% smaller. Same canvas (80 x 95 mm, 300 dpi), same
+# frame aspect, so the panel and the bottom left scale bar keep their pixel position; the frame covers
+# 1/0.85 more ground around its centre, and the scale bar length follows the new map scale. Legend
+# kept but invisible so the layout does not move. PNG only.
+zoom_frame <- function(fr, f = 0.85) {
+  lapply(fr, function(r) mean(r) + c(-1, 1) * diff(r) / 2 / f)
+}
+sc_teal <- quint_fill_scale(palette_trials$teal_red$pal, palette_trials$teal_red$na)
+p_klag_small <- priority_map_panel(klag_map_df, klag_border, NULL, bar = "bl", fill_scale = sc_teal,
+                                   north = FALSE, frame = zoom_frame(teal_frames$Klagenfurt)) +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE, override.aes = list(alpha = 0))) +
+  single_map_theme +
+  theme(legend.text = element_text(colour = NA), legend.title = element_text(colour = NA))
+ggsave(file.path(TRIAL_DIR, "Figure_priority_map_Klagenfurt_teal_red_map85.png"), p_klag_small,
+       width = LANCET_W1, height = 95, units = "mm", device = ragg::agg_png, res = 300, bg = "white")
 ```
 
 ### Criterion maps (poster)
 
-One map per MCDA criterion, drawn like the single city priority maps (80 x 95 mm, cells clipped to
-the boundary and dissolved by class, scale bar, north arrow, legend below). Five classes per map:
-quintiles of the grid values, except when one value (zero, or the noise floor) covers 10% of cells
-or more; that value is then its own class and the other cells are split into quartiles. Raw values
-from the saved MCDA grids, before normalisation. Written to `output/figures_mcda/criterion_maps/`
-(PDF, SVG, PNG and editable PPTX).
+One map per MCDA criterion, 80 x 95 mm like the single city priority maps: cells clipped to the
+boundary, continuous colour gradient (palettes, stops and limits of the earlier exposure maps,
+sandbox `Malta_exposures_master_plots.Rmd` and `Plot_klagenfurt.Rmd` in ../ggn_analysis_archive/),
+scale bar, no north arrow, colour bar below. Raw values from the saved MCDA grids, before
+normalisation; Malta population from the new population grid (`pop_reallocated_nso`, as the poster
+numbers). Written to `output/figures_mcda/criterion_maps/` (PDF, SVG, PNG, editable PPTX). A tilted
+"layer" version of each map, without legend or cartographic elements, is written as transparent PNG
+to `criterion_maps/tilted/`.
 
 ```{r criterion-maps, fig.width=80/25.4, fig.height=95/25.4}
 CRIT_DIR <- file.path(LANCET_MCDA_DIR, "criterion_maps")
-dir.create(CRIT_DIR, showWarnings = FALSE)
-
-# Five classes: quintiles, or tied minimum + quartiles of the rest
-class_values <- function(x, digits, tie_share = 0.10, tie_prefix = "") {
-  fmt <- function(v) formatC(v, format = "f", digits = digits, big.mark = ",")
-  ok <- x[!is.na(x)]
-  mn <- min(ok)
-  if (mean(ok == mn) >= tie_share) {
-    br  <- quantile(ok[ok > mn], seq(0, 1, 0.25), names = FALSE)
-    lab <- c(paste0(tie_prefix, fmt(mn)), sprintf("%s–%s", fmt(head(br, -1)), fmt(br[-1])))
-    lab[2] <- sprintf(">%s–%s", fmt(mn), fmt(br[2]))  # class 2 starts just above the tied value
-    cls <- ifelse(x == mn, 1L, 1L + as.integer(cut(x, br, include.lowest = TRUE)))
-  } else {
-    br  <- quantile(ok, seq(0, 1, 0.2), names = FALSE)
-    lab <- sprintf("%s–%s", fmt(head(br, -1)), fmt(br[-1]))
-    cls <- as.integer(cut(x, br, include.lowest = TRUE))
-  }
-  stopifnot(!anyDuplicated(br), length(lab) == 5)
-  factor(lab[cls], levels = lab)
-}
+TILT_DIR <- file.path(CRIT_DIR, "tilted")
+dir.create(TILT_DIR, showWarnings = FALSE, recursive = TRUE)
 
 # Hanken Grotesk has no subscript digits: NO2 and PM2.5 titles as plotmath subscripts
 legend_expr <- function(t) {
   switch(t,
          "NO2 (µg/m³)"   = expression(NO[2] ~ "(µg/m³)"),
          "PM2.5 (µg/m³)" = expression(PM[2.5] ~ "(µg/m³)"),
+         "Noise, Lden (dB)" = expression("Noise," ~ L[den] ~ "(dB)"),
          t)
 }
 
-criterion_map_panel <- function(grid, border, var, legend_title, pal, digits = 0, bar = "bl",
-                                na_label = "No data", na_col = "#a6a6a6", tie_prefix = "") {
+# Cells clipped to the boundary; 0.5 m square buffer closes sub metre gaps between cells (drawing only)
+clip_cells <- function(grid, border, var) {
+  grid %>%
+    dplyr::select(value = dplyr::all_of(var)) %>%
+    sf::st_buffer(0.5, joinStyle = "MITRE", mitreLimit = 2) %>%
+    sf::st_set_agr("constant") %>%
+    sf::st_intersection(sf::st_union(sf::st_geometry(border))) %>%
+    sf::st_collection_extract("POLYGON")
+}
+
+fill_gradient <- function(sp, title, na_col) {
+  scale_fill_gradientn(colours = sp$colours, values = sp$values, limits = sp$limits,
+                       oob = scales::squish, na.value = na_col, name = legend_expr(title),
+                       labels = scales::label_comma(accuracy = sp$accuracy))
+}
+
+criterion_map_panel <- function(cells, border, sp, title, bar = "bl", na_col = "#a6a6a6") {
   bb <- sf::st_bbox(border)
-  cl <- class_values(grid[[var]], digits, tie_prefix = tie_prefix)
-  # Cells without a value are kept only if their centre is inside the city (drawing only; NA cells
-  # cut by the boundary would otherwise add a "No data" legend key for invisible slivers)
-  inside <- lengths(sf::st_intersects(sf::st_centroid(sf::st_geometry(grid)),
-                                      sf::st_union(sf::st_geometry(border)))) > 0
-  keep <- !is.na(cl) | inside
-  map_df <- grid[keep, ] %>%
-    dplyr::mutate(quint_label = factor(dplyr::if_else(is.na(cl[keep]), na_label, as.character(cl[keep])),
-                                       levels = c(levels(cl), na_label)))
-  lay <- quint_map_layer(map_df, border)
-  lay$quint_label <- droplevels(lay$quint_label)  # "No data" only if present inside the city
   ggplot() +
-    geom_sf(data = lay, aes(fill = quint_label), colour = NA) +
+    geom_sf(data = cells, aes(fill = value), colour = NA) +
     geom_sf(data = border, fill = NA, colour = "grey25", linewidth = 0.2) +
-    scale_fill_manual(values = c(setNames(pal, levels(cl)), setNames(na_col, na_label)),
-                      name = legend_expr(legend_title), drop = TRUE) +
-    lancet_scale_bar(bar) + lancet_north_arrow("tr") +
+    fill_gradient(sp, title, na_col) +
+    lancet_scale_bar(bar) +
     coord_sf(xlim = bb[c("xmin", "xmax")], ylim = bb[c("ymin", "ymax")], datum = NA) +
-    guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+    guides(fill = guide_colourbar(title.position = "top", barwidth = unit(45, "mm"),
+                                  barheight = unit(2.5, "mm"))) +
     theme_lancet_map() +
-    theme(legend.key.size = unit(3, "mm")) +
     single_map_theme
 }
 
-# Palettes of the earlier exposure maps (sandbox Malta_exposures_master_plots.Rmd and
-# Plot_klagenfurt.Rmd, ../ggn_analysis_archive/), sampled at five steps for the five classes
-ramp5 <- function(cols) grDevices::colorRampPalette(cols)(5)
-PAL <- list(
-  pop       = ramp5(c("#EFF3FF", "#084594")),
-  lst       = viridisLite::magma(5),
-  imd_malta = ramp5(c("#eef2f3", "#64798f")),
-  imd_klag  = ramp5(c("#eef2f3", "#2c3e50")),
-  blue      = ramp5(c("dodgerblue3", "lightblue", "wheat", "sienna3")),
-  noise     = c("#FFEDA0", "#FEB24C", "#FD8D3C", "#E31A1C", "#800026"),
-  # NO2 ramp starts at white; drop the white step so the lowest class stays visible on the page
-  no2       = grDevices::colorRampPalette(c("white", "#FEB24C", "#F03B20", "#BD0026"))(6)[-1],
-  pm25      = viridisLite::viridis(5, begin = 0.4)
+# Tilted layer: shear and rotate around the city centre; no legend, border or cartographic elements
+tilt <- function(x, centre) {
+  shear  <- matrix(c(2, 1.2, 0, 1), 2, 2)
+  rot    <- function(a) matrix(c(cos(a), sin(a), -sin(a), cos(a)), 2, 2)
+  g <- (sf::st_geometry(x) - centre) * shear * rot(pi / 20)
+  sf::st_set_geometry(x, sf::st_set_crs(g, NA))
+}
+tilted_panel <- function(cells, border, sp, na_col) {
+  centre <- sf::st_coordinates(sf::st_centroid(sf::st_union(sf::st_geometry(border))))[1, ]
+  ggplot() +
+    geom_sf(data = tilt(cells, centre), aes(fill = value), colour = NA) +
+    fill_gradient(sp, "", na_col) +
+    coord_sf(datum = NA) +
+    theme_void() +
+    theme(legend.position = "none",
+          plot.background = element_rect(fill = "transparent", colour = NA),
+          panel.background = element_rect(fill = "transparent", colour = NA))
+}
+
+# Gradients of the earlier exposure maps
+GR <- list(
+  pop        = list(colours = c("#EFF3FF", "#084594"), values = NULL, limits = c(0, NA), accuracy = 1),
+  lst        = list(colours = viridisLite::magma(256), values = NULL, limits = NULL, accuracy = 1),
+  imd_malta  = list(colours = c("#eef2f3", "#64798f"), values = NULL, limits = c(0, 100), accuracy = 1),
+  imd_klag   = list(colours = c("#eef2f3", "#2c3e50"), values = NULL, limits = c(0, 100), accuracy = 1),
+  blue_malta = list(colours = c("dodgerblue3", "lightblue", "wheat", "sienna3"), values = NULL,
+                    limits = c(0, NA), accuracy = 1),
+  blue_klag  = list(colours = c("dodgerblue3", "lightblue", "wheat", "sienna3"),
+                    values = scales::rescale(c(0, 500, 1500, 3000)), limits = NULL, accuracy = 1),
+  noise      = list(colours = c("#FFEDA0", "#FEB24C", "#FD8D3C", "#E31A1C", "#800026"), values = NULL,
+                    limits = c(40, 75), accuracy = 1),
+  no2        = list(colours = c("white", "#FEB24C", "#F03B20", "#BD0026"), values = NULL, limits = NULL,
+                    accuracy = 1),
+  pm25       = list(colours = viridisLite::viridis(256, begin = 0.4), values = NULL, limits = NULL,
+                    accuracy = 0.1)
 )
 
-# Population: Malta = Total_Population per 1 ha cell (reallocated, MCDA grid);
-# Klagenfurt = popdense_2020 per 1 ha cell, NA where the census grid has no residents
+malta_grid_crit <- malta_grid %>%
+  dplyr::left_join(sf::st_read(here::here("data/malta/Population_Malta_reallocated_nso.gpkg"), quiet = TRUE) %>%
+                     sf::st_drop_geometry() %>%
+                     dplyr::transmute(gid = as.character(gid), pop_nso = pop_reallocated_nso),
+                   by = "gid")
+stopifnot(!anyNA(malta_grid_crit$pop_nso))
+
+# Klagenfurt popdense_2020 is NA where the census grid has no residents (pale grey)
 crit_specs <- tibble::tribble(
-  ~city,        ~var,               ~name,               ~title,                                   ~pal,    ~digits, ~na_label,                ~tie_prefix,
-  "Malta",      "Total_Population", "population",        "Population density (residents per ha)",  "pop",   0,       "No data",                "",
-  "Malta",      "lst",              "LST",               "Land surface temperature (°C)",          "lst",   1,       "No data",                "",
-  "Malta",      "imd",              "imperviousness",    "Imperviousness (%)",                     "imd_malta",   0,       "No data",                "",
-  "Malta",      "dist_bs",          "distance_bluespace","Distance to blue space (m)",             "blue",  0,       "No data",                "",
-  "Malta",      "Lden",             "noise",             "Noise, Lden (dB)",                  "noise", 0,       "No data",                "≤",
-  "Malta",      "no2_avg_21",       "NO2",               "NO2 (µg/m³)",                       "no2",   1,       "No data",                "",
-  "Klagenfurt", "popdense_2020",    "population",        "Population density (residents per ha)",  "pop",   0,       "No residents recorded",  "",
-  "Klagenfurt", "no2_final",        "NO2",               "NO2 (µg/m³)",                       "no2",   1,       "No data",                "",
-  "Klagenfurt", "pm25_final",       "PM25",              "PM2.5 (µg/m³)",                "pm25",  1,       "No data",                "",
-  "Klagenfurt", "lst",              "LST",               "Land surface temperature (°C)",          "lst",   1,       "No data",                "",
-  "Klagenfurt", "imd",              "imperviousness",    "Imperviousness (%)",                     "imd_klag",   0,       "No data",                "",
-  "Klagenfurt", "dist_bs",          "distance_bluespace","Distance to blue space (m)",             "blue",  0,       "No data",                ""
+  ~city,        ~var,            ~name,                ~title,                                  ~gr,
+  "Malta",      "pop_nso",       "population",         "Population density (residents per ha)", "pop",
+  "Malta",      "lst",           "LST",                "Land surface temperature (°C)",         "lst",
+  "Malta",      "imd",           "imperviousness",     "Imperviousness (%)",                    "imd_malta",
+  "Malta",      "dist_bs",       "distance_bluespace", "Distance to blue space (m)",            "blue_malta",
+  "Malta",      "Lden",          "noise",              "Noise, Lden (dB)",                      "noise",
+  "Malta",      "no2_avg_21",    "NO2",                "NO2 (µg/m³)",                           "no2",
+  "Klagenfurt", "popdense_2020", "population",         "Population density (residents per ha)", "pop",
+  "Klagenfurt", "no2_final",     "NO2",                "NO2 (µg/m³)",                           "no2",
+  "Klagenfurt", "pm25_final",    "PM25",               "PM2.5 (µg/m³)",                         "pm25",
+  "Klagenfurt", "lst",           "LST",                "Land surface temperature (°C)",         "lst",
+  "Klagenfurt", "imd",           "imperviousness",     "Imperviousness (%)",                    "imd_klag",
+  "Klagenfurt", "dist_bs",       "distance_bluespace", "Distance to blue space (m)",            "blue_klag"
 )
 
 for (i in seq_len(nrow(crit_specs))) {
   s <- crit_specs[i, ]
-  grid   <- if (s$city == "Malta") malta_grid else klag_grid
+  grid   <- if (s$city == "Malta") malta_grid_crit else klag_grid
   border <- if (s$city == "Malta") malta_border_sf else klag_border
-  # Sanity check: summary and class counts of each variable
+  na_col <- if (s$var == "popdense_2020") "#ebebeb" else "#a6a6a6"
+  # Sanity check: summary of each variable
   cat("\n##", s$city, s$var, "\n")
   print(summary(grid[[s$var]]))
-  print(table(class_values(grid[[s$var]], s$digits, tie_prefix = s$tie_prefix), useNA = "ifany"))
-  p <- criterion_map_panel(grid, border, s$var, s$title, PAL[[s$pal]], digits = s$digits,
-                           bar = if (s$city == "Malta") "bl" else "br",
-                           na_label = s$na_label, tie_prefix = s$tie_prefix,
-                           na_col = if (s$var == "popdense_2020") "#ebebeb" else "#a6a6a6")
+  cells <- clip_cells(grid, border, s$var)
+  p <- criterion_map_panel(cells, border, GR[[s$gr]], s$title,
+                           bar = if (s$city == "Malta") "bl" else "br", na_col = na_col)
   print(p)
   nm <- sprintf("criterion_map_%s_%s", s$city, s$name)
   f <- c(save_figure_lancet(p, nm, CRIT_DIR, height_mm = 95, width_mm = LANCET_W1),
          save_figure_pptx(p, nm, CRIT_DIR, height_mm = 95, width_mm = LANCET_W1))
-  cat("Saved:", paste(basename(f), collapse = ", "), "\n")
+  # Tilted layer, PNG only, transparent background
+  ft <- file.path(TILT_DIR, paste0(nm, "_tilted.png"))
+  ggsave(ft, tilted_panel(cells, border, GR[[s$gr]], na_col), width = 160, height = 90, units = "mm",
+         device = ragg::agg_png, res = 300, bg = "transparent")
+  cat("Saved:", paste(basename(c(f, ft)), collapse = ", "), "\n")
 }
 ```
 

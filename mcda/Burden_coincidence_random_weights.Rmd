@@ -50,9 +50,17 @@ SEED    <- 20261120
 N_DRAWS <- 1000
 N_PERM  <- 200
 city_cols <- c(Malta = "#2166ac", Klagenfurt = "#b2182b")
+# Tables: formatted HTML when knitting; a plain printed table when a chunk is run interactively
+# (kableExtra HTML shows as raw code in the editor)
+knitting <- function() isTRUE(getOption("knitr.in.progress"))
 ktab <- function(x, caption, digits = 3) {
-  x %>% mutate(across(where(is.double), ~ round(., digits))) %>%
-    kable(caption = caption) %>% kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+  x <- x %>% mutate(across(where(is.double), ~ round(., digits)))
+  if (!knitting()) {
+    cat("\n", caption, "\n", sep = "")
+    print(as.data.frame(x), row.names = FALSE)
+    return(invisible(x))
+  }
+  x %>% kable(caption = caption) %>% kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
 }
 ```
 
@@ -93,7 +101,7 @@ k_w <- c(k_w7[c("norm_lst", "norm_dist_bs")], norm_air = unname(k_w7["norm_no2"]
 shared <- list(Malta      = c("norm_lst", "norm_no2", "norm_traffic", "norm_green_time", "norm_dist_bs"),
                Klagenfurt = c("norm_lst", "norm_air", "norm_traffic_cat", "norm_green_time", "norm_dist_bs"))
 
-city <- list(
+cities <- list(
   Malta = list(df = malta, id = "gid", vars = m_vars, lab = setNames(m_lab, m_vars), w = m_w,
                pop = "Total_Population", border = readRDS(here::here("data/malta/malta_union_boundary.rds"))),
   Klagenfurt = list(df = klag, id = "ID", vars = k_vars, lab = setNames(k_lab, k_vars), w = k_w,
@@ -121,142 +129,61 @@ cmp <- function(x, ref) {
 rdirichlet1 <- function(n, k) { g <- matrix(rexp(n * k), nrow = k); sweep(g, 2, colSums(g), "/") }
 ```
 
-```{r compute}
-res_A <- list(); res_C2 <- list(); res_D <- list(); cor_mats <- list(); draws_all <- list()
-cells_D <- list(); check <- list()
+## Preparation
 
-for (cn in names(city)) {
-  ci <- city[[cn]]
-  d <- ci$df %>% filter(scored)
-  S <- as.matrix(st_drop_geometry(d)[, ci$vars])
-  k <- length(ci$vars)
+For each city: the scored cells, the criteria matrix, the citizen and equal weights scores, and the
+`r N_DRAWS` random weight sets (all criteria and five shared criteria). Everything below reuses these.
 
-  # check: the criterion level citizen score reproduces the saved score
-  s_cit <- as.numeric(score_mat(S, matrix(ci$w, ncol = 1)))
-  check[[cn]] <- tibble(city = cn, scored_cells = nrow(d), criteria = k,
-                        max_abs_diff_vs_saved = max(abs(s_cit - d$priority_citizen)),
-                        spearman_vs_saved = cor(s_cit, d$priority_citizen, method = "spearman"))
-  stopifnot(check[[cn]]$spearman_vs_saved > 0.9999)
-
-  # A. Burden coincidence
-  cm <- cor(S, method = "spearman", use = "pairwise.complete.obs")
-  dimnames(cm) <- list(ci$lab[ci$vars], ci$lab[ci$vars]); cor_mats[[cn]] <- cm
-  off <- cm[upper.tri(cm)]
-  ev_s <- eigen(cm, symmetric = TRUE, only.values = TRUE)$values
-  cc <- complete.cases(S)
-  ev_c <- prcomp(S[cc, ], scale. = TRUE)$sdev^2
-  # top quintile of a criterion: at or above p80 among scored cells with a value; where ties make that
-  # class larger than 25% of cells (categorical traffic, street greenery), strictly above p80
-  topc <- apply(S, 2, function(x) {
-    q <- quantile(x, 0.8, na.rm = TRUE); t <- !is.na(x) & x >= q
-    if (mean(t[!is.na(x)]) > 0.25) t <- !is.na(x) & x > q
-    t
-  })
-  n_top <- rowSums(topc)
-  set.seed(SEED)
-  perm <- replicate(N_PERM, mean(rowSums(apply(topc, 2, sample)) >= 3))
-  res_A[[cn]] <- tibble(city = cn, criteria = k, scored_cells = nrow(d),
-                        mean_abs_spearman = mean(abs(off)), mean_spearman = mean(off),
-                        min_spearman = min(off), max_spearman = max(off),
-                        pc1_variance_pct = 100 * ev_s[1] / sum(ev_s), pc1_eigenvalue = ev_s[1],
-                        pc1_pct_if_independent = 100 / k,
-                        pca_complete_cases = sum(cc), pc1_variance_pct_complete_cases = 100 * ev_c[1] / sum(ev_c),
-                        top_quintile_3plus_pct = 100 * mean(n_top >= 3),
-                        top_quintile_3plus_pct_permuted = 100 * mean(perm),
-                        ratio_to_permuted = mean(n_top >= 3) / mean(perm))
-  res_A[[paste(cn, "shares")]] <- tibble(city = cn, criterion = ci$lab[ci$vars], top_class_pct = 100 * colMeans(topc))
-
-  # B. Random weights vs equal weights
+```{r prep}
+P <- list()
+for (cn in names(cities)) {
+  ci <- cities[[cn]]
+  d  <- ci$df %>% filter(scored)
+  S  <- as.matrix(st_drop_geometry(d)[, ci$vars])
+  k  <- length(ci$vars)
   w_eq <- rep(1 / k, k)
-  s_eq <- as.numeric(score_mat(S, matrix(w_eq, ncol = 1)))
-  set.seed(SEED)
-  W <- rdirichlet1(N_DRAWS, k)
-  SC <- score_mat(S, W)
-  st <- t(apply(SC, 2, cmp, ref = s_eq))
-  draws_all[[cn]] <- tibble(city = cn, set = "All criteria", draw = seq_len(N_DRAWS),
-                            dist_from_equal = sqrt(colSums((W - w_eq)^2)),
-                            spearman = st[, "spearman"], top_quintile_overlap_pct = st[, "top_quintile_overlap_pct"])
-
-  # C1. Five shared criteria
   sv <- shared[[cn]]; S5 <- S[, sv]
-  s_eq5 <- as.numeric(score_mat(S5, matrix(rep(1 / 5, 5), ncol = 1)))
-  set.seed(SEED)
-  W5 <- rdirichlet1(N_DRAWS, 5)
-  st5 <- t(apply(score_mat(S5, W5), 2, cmp, ref = s_eq5))
-  draws_all[[paste(cn, "5")]] <- tibble(city = cn, set = "Five shared criteria", draw = seq_len(N_DRAWS),
-                                        dist_from_equal = sqrt(colSums((W5 - 1 / 5)^2)),
-                                        spearman = st5[, "spearman"], top_quintile_overlap_pct = st5[, "top_quintile_overlap_pct"])
-
-  # C2. Citizen vs equal: map change per unit of weight change
-  slope <- function(dd) unname(coef(lm(I(1 - spearman) ~ 0 + dist_from_equal, data = dd))[1])
-  ce <- cmp(s_cit, s_eq); dce <- sqrt(sum((ci$w - w_eq)^2))
   w5c <- ci$w[sv] / sum(ci$w[sv])
-  ce5 <- cmp(as.numeric(score_mat(S5, matrix(w5c, ncol = 1))), s_eq5); dce5 <- sqrt(sum((w5c - 1 / 5)^2))
-  res_C2[[cn]] <- bind_rows(
-    tibble(city = cn, set = "All criteria", dist_citizen_equal = dce, one_minus_spearman = 1 - ce[["spearman"]],
-           top_quintile_overlap_pct = ce[["top_quintile_overlap_pct"]],
-           change_per_unit_weight = (1 - ce[["spearman"]]) / dce, random_draws_slope = slope(draws_all[[cn]])),
-    tibble(city = cn, set = "Five shared criteria", dist_citizen_equal = dce5, one_minus_spearman = 1 - ce5[["spearman"]],
-           top_quintile_overlap_pct = ce5[["top_quintile_overlap_pct"]],
-           change_per_unit_weight = (1 - ce5[["spearman"]]) / dce5, random_draws_slope = slope(draws_all[[paste(cn, "5")]])))
-
-  # D. Robust and contested cells: under 10% rare; 10% to 90% contested; over 90% robust core
-  ptop <- rowMeans(apply(SC, 2, top5))
-  cls <- factor(case_when(ptop > 0.90 ~ "Robust core (> 90%)",
-                          ptop >= 0.10 ~ "Contested (10% to 90%)",
-                          TRUE ~ "Rarely prioritised (< 10%)"),
-                levels = c("Rarely prioritised (< 10%)", "Contested (10% to 90%)", "Robust core (> 90%)"))
-  pop <- st_drop_geometry(d)[[ci$pop]]; pop[is.na(pop)] <- 0
-  res_D[[cn]] <- tibble(city = cn, class = cls, pop = pop, cit_top = top5(s_cit)) %>%
-    group_by(city, class, .drop = FALSE) %>%
-    summarise(cells = n(), residents = sum(pop), citizen_top_quintile_cells = sum(cit_top), .groups = "drop") %>%
-    mutate(cells_pct = 100 * cells / sum(cells), residents_pct = 100 * residents / sum(residents))
-  d$p_top <- ptop; d$robust_class <- cls
-  cells_D[[cn]] <- d %>% select(all_of(ci$id), p_top, robust_class)
-  out_ids <- st_drop_geometry(cells_D[[cn]]) %>% mutate(robust_class = as.character(robust_class))
-  saveRDS(out_ids, file.path(OUT, paste0("robust_class_", tolower(cn), ".rds")))
+  set.seed(SEED); W  <- rdirichlet1(N_DRAWS, k)
+  set.seed(SEED); W5 <- rdirichlet1(N_DRAWS, 5)
+  P[[cn]] <- list(d = d, S = S, k = k, w_eq = w_eq, S5 = S5, w5c = w5c, W = W, W5 = W5,
+                  s_cit  = as.numeric(score_mat(S, matrix(ci$w, ncol = 1))),
+                  s_eq   = as.numeric(score_mat(S, matrix(w_eq, ncol = 1))),
+                  s_cit5 = as.numeric(score_mat(S5, matrix(w5c, ncol = 1))),
+                  s_eq5  = as.numeric(score_mat(S5, matrix(rep(1 / 5, 5), ncol = 1))),
+                  SC  = score_mat(S, W), SC5 = score_mat(S5, W5))
 }
-
-A      <- bind_rows(res_A[names(city)])
-shares <- bind_rows(res_A[paste(names(city), "shares")])
-draws  <- bind_rows(draws_all)
-C2     <- bind_rows(res_C2)
-D      <- bind_rows(res_D)
-B <- draws %>% group_by(city, set) %>%
-  summarise(spearman_median = median(spearman), spearman_p05 = quantile(spearman, 0.05),
-            spearman_p95 = quantile(spearman, 0.95), overlap_median = median(top_quintile_overlap_pct),
-            overlap_p05 = quantile(top_quintile_overlap_pct, 0.05), overlap_p95 = quantile(top_quintile_overlap_pct, 0.95),
-            dist_from_equal_median = median(dist_from_equal), .groups = "drop") %>%
-  arrange(set, city)
-
-rnd <- function(x) x %>% mutate(across(where(is.double), ~ round(., 3)))
-readr::write_csv(rnd(A), file.path(OUT, "A_burden_coincidence.csv"))
-readr::write_csv(rnd(shares), file.path(OUT, "A_top_class_share_by_criterion.csv"))
-readr::write_csv(rnd(B), file.path(OUT, "B_C1_random_weights_summary.csv"))
-readr::write_csv(rnd(draws), file.path(OUT, "B_C1_random_weights_draws.csv"))
-readr::write_csv(rnd(C2), file.path(OUT, "C2_change_per_unit_weight.csv"))
-readr::write_csv(rnd(D), file.path(OUT, "D_robust_contested.csv"))
-readr::write_csv(rnd(weights_tab), file.path(OUT, "weights_criterion_level.csv"))
-for (cn in names(cor_mats))
-  readr::write_csv(as.data.frame(round(cor_mats[[cn]], 3)) %>% tibble::rownames_to_column("criterion"),
-                   file.path(OUT, paste0("A_spearman_matrix_", tolower(cn), ".csv")))
-
-ktab(bind_rows(check), "Check: the criterion level citizen score reproduces the saved priority_citizen", 6)
+check <- bind_rows(lapply(names(P), function(cn) tibble(
+  city = cn, scored_cells = nrow(P[[cn]]$d), criteria = P[[cn]]$k,
+  max_abs_diff_vs_saved = max(abs(P[[cn]]$s_cit - P[[cn]]$d$priority_citizen)),
+  spearman_vs_saved = cor(P[[cn]]$s_cit, P[[cn]]$d$priority_citizen, method = "spearman"))))
+stopifnot(all(check$spearman_vs_saved > 0.9999))
+ktab(check, "Check: the criterion level citizen score reproduces the saved priority_citizen", 6)
 ```
 
 # A. Burden coincidence
 
-All on the scored cells. PC1 comes from the eigenvalues of the pairwise Spearman matrix. A PCA on complete cases is shown alongside: in Malta it keeps fewer than half of the cells, because green per person is missing in unpopulated cells. "Top quintile of three or more criteria" is compared with the same share after shuffling each criterion independently across cells (`r N_PERM` permutations). That comparison is needed because the two cities have different numbers of criteria.
+All on the scored cells. If burdens coincide, the criteria are positively correlated, the first principal
+component carries a large share of the variance, and more cells than chance are in the top quintile of
+several criteria at once.
 
-```{r A-table}
-ktab(A %>% select(city, criteria, scored_cells, mean_abs_spearman, mean_spearman, min_spearman, max_spearman,
-                  pc1_variance_pct, pc1_pct_if_independent, pc1_variance_pct_complete_cases, pca_complete_cases),
-     "A. Correlation and PCA")
-ktab(A %>% select(city, top_quintile_3plus_pct, top_quintile_3plus_pct_permuted, ratio_to_permuted),
-     "A. Share of scored cells in the top quintile of three or more criteria (%)")
+## Step 1. Correlation between criteria
+
+```{r A1-correlation}
+cor_mats <- lapply(names(cities), function(cn) {
+  cm <- cor(P[[cn]]$S, method = "spearman", use = "pairwise.complete.obs")
+  dimnames(cm) <- list(cities[[cn]]$lab[cities[[cn]]$vars], cities[[cn]]$lab[cities[[cn]]$vars]); cm
+}) %>% setNames(names(cities))
+A1 <- bind_rows(lapply(names(cor_mats), function(cn) {
+  off <- cor_mats[[cn]][upper.tri(cor_mats[[cn]])]
+  tibble(city = cn, pairs = length(off), mean_abs_spearman = mean(abs(off)), mean_spearman = mean(off),
+         positive_pairs = sum(off > 0), pairs_above_0.3 = sum(off > 0.3), pairs_below_minus_0.3 = sum(off < -0.3),
+         min_spearman = min(off), max_spearman = max(off))
+}))
+ktab(A1, "A1. Spearman correlations between criteria (pairs of criteria)")
 ```
 
-```{r A-heatmaps, fig.width=12, fig.height=5.5}
+```{r A1-heatmaps, fig.width=12, fig.height=5.5}
 heat <- function(cn) {
   m <- cor_mats[[cn]]
   df <- as.data.frame(as.table(m)) %>%
@@ -270,76 +197,290 @@ heat <- function(cn) {
 heat("Malta") + heat("Klagenfurt") + plot_layout(guides = "collect")
 ```
 
-Top quintile class size by criterion. It is 20% unless ties change it. In Malta, street greenery cannot define a top quintile: about 90% of scored cells tie at maximum priority (no tree cover), so its strict class is empty. In Klagenfurt, traffic is categorical, and only the cells above p80 count.
+## Step 2. Principal components
 
-```{r A-shares}
+PC1 from the eigenvalues of the pairwise Spearman matrix (all scored cells). The PCA on complete cases is
+shown alongside: in Malta it keeps fewer than half of the cells, because green per person is missing in
+unpopulated cells. "If independent" is the share PC1 would have if the criteria were uncorrelated (1 / number
+of criteria).
+
+```{r A2-pca}
+A2 <- bind_rows(lapply(names(cities), function(cn) {
+  ev_s <- eigen(cor_mats[[cn]], symmetric = TRUE, only.values = TRUE)$values
+  cc <- complete.cases(P[[cn]]$S); ev_c <- prcomp(P[[cn]]$S[cc, ], scale. = TRUE)$sdev^2
+  tibble(city = cn, criteria = P[[cn]]$k, pc1_variance_pct = 100 * ev_s[1] / sum(ev_s), pc1_eigenvalue = ev_s[1],
+         pc1_pct_if_independent = 100 / P[[cn]]$k,
+         pca_complete_cases = sum(cc), pc1_variance_pct_complete_cases = 100 * ev_c[1] / sum(ev_c))
+}))
+ktab(A2, "A2. Variance explained by the first principal component")
+```
+
+```{r A2-scree, fig.width=8, fig.height=3.5}
+bind_rows(lapply(names(cities), function(cn) {
+  ev <- eigen(cor_mats[[cn]], symmetric = TRUE, only.values = TRUE)$values
+  tibble(city = cn, component = seq_along(ev), variance_pct = 100 * ev / sum(ev))
+})) %>%
+  ggplot(aes(component, variance_pct, colour = city)) + geom_line() + geom_point() +
+  scale_colour_manual(values = city_cols, name = NULL) + scale_x_continuous(breaks = 1:10) +
+  labs(x = "Principal component", y = "Variance explained (%)") + theme_minimal(base_size = 10)
+```
+
+PC1 loadings: the correlation of each criterion with the first component. The sign of an eigenvector is
+arbitrary, so it is set to make the sum of loadings positive.
+
+```{r A2-loadings}
+load_pc1 <- bind_rows(lapply(names(cities), function(cn) {
+  e <- eigen(cor_mats[[cn]], symmetric = TRUE)
+  v <- e$vectors[, 1] * sign(sum(e$vectors[, 1]))
+  tibble(city      = cn,
+         criterion = colnames(cor_mats[[cn]]),
+         loading   = v * sqrt(e$values[1]))   # correlación de cada criterio con la PC1
+})) %>% arrange(city, desc(abs(loading)))
+ktab(load_pc1, "PC1 loadings")
+```
+
+## Step 3. Cells in the top quintile of several criteria
+
+Top quintile of a criterion = at or above its p80 among scored cells with a value. Where ties make that class
+larger than 25% of cells, it is strictly above p80 (Malta street greenery: about 90% of cells tie at maximum
+priority, so its class is empty; Klagenfurt traffic is categorical). The observed share is compared with the
+share after shuffling each criterion independently across cells (`r N_PERM` permutations), because the two
+cities have different numbers of criteria.
+
+```{r A3-topclass}
+topc_l <- lapply(names(cities), function(cn) apply(P[[cn]]$S, 2, function(x) {
+  q <- quantile(x, 0.8, na.rm = TRUE); t <- !is.na(x) & x >= q
+  if (mean(t[!is.na(x)]) > 0.25) t <- !is.na(x) & x > q
+  t
+})) %>% setNames(names(cities))
+shares <- bind_rows(lapply(names(cities), function(cn)
+  tibble(city = cn, criterion = cities[[cn]]$lab[cities[[cn]]$vars], top_class_pct = 100 * colMeans(topc_l[[cn]]))))
 shares %>% pivot_wider(names_from = city, values_from = top_class_pct) %>%
-  ktab("Top quintile class size by criterion (% of scored cells with a value)", 1)
+  ktab("A3a. Top quintile class size by criterion (% of scored cells)", 1)
+
+perm_l <- lapply(names(cities), function(cn) {
+  set.seed(SEED)
+  replicate(N_PERM, tabulate(rowSums(apply(topc_l[[cn]], 2, sample)) + 1, nbins = P[[cn]]$k + 1))
+}) %>% setNames(names(cities))
+dist_top <- bind_rows(lapply(names(cities), function(cn) {
+  obs <- tabulate(rowSums(topc_l[[cn]]) + 1, nbins = P[[cn]]$k + 1)
+  tibble(city = cn, n_top_criteria = 0:P[[cn]]$k, observed_pct = 100 * obs / sum(obs),
+         permuted_pct = 100 * rowMeans(perm_l[[cn]]) / nrow(P[[cn]]$S))
+}))
+ktab(dist_top %>% filter(n_top_criteria <= 6),
+     "A3b. Cells by number of criteria in which they are in the top quintile (%; 7 or more not shown)", 1)
+
+A3 <- dist_top %>% group_by(city) %>%
+  summarise(top_quintile_3plus_pct = sum(observed_pct[n_top_criteria >= 3]),
+            top_quintile_3plus_pct_permuted = sum(permuted_pct[n_top_criteria >= 3]), .groups = "drop") %>%
+  mutate(ratio_to_permuted = top_quintile_3plus_pct / top_quintile_3plus_pct_permuted)
+ktab(A3, "A3c. Share of scored cells in the top quintile of three or more criteria (%)")
+```
+
+```{r A3-plot, fig.width=9, fig.height=3.5}
+dist_top %>% pivot_longer(c(observed_pct, permuted_pct), names_to = "what", values_to = "pct") %>%
+  mutate(what = recode(what, observed_pct = "Observed", permuted_pct = "Shuffled (chance)")) %>%
+  filter(n_top_criteria <= 6) %>%
+  ggplot(aes(n_top_criteria, pct, fill = what)) + geom_col(position = "dodge") + facet_wrap(~ city) +
+  scale_fill_manual(values = c(Observed = "grey30", `Shuffled (chance)` = "grey75"), name = NULL) +
+  labs(x = "Number of criteria with the cell in their top quintile", y = "Cells (%)") + theme_minimal(base_size = 10)
+```
+
+```{r A-summary}
+A <- A1 %>% left_join(A2, by = "city") %>% left_join(A3, by = "city")
+ktab(A %>% select(city, mean_abs_spearman, mean_spearman, pc1_variance_pct, pc1_pct_if_independent,
+                  top_quintile_3plus_pct, top_quintile_3plus_pct_permuted, ratio_to_permuted),
+     "A. Summary")
 ```
 
 # B. Sensitivity to weights in general
 
-`r N_DRAWS` weight sets per city, Dirichlet(1, ..., 1), seed `r SEED`. Each score is compared with the equal weights score.
+`r N_DRAWS` weight sets per city, Dirichlet(1, ..., 1), seed `r SEED`. Each random score is compared with
+the equal weights score on the same cells: Spearman and the share of the equal weights top quintile that
+stays in the top quintile.
 
-```{r B-table}
-ktab(B %>% filter(set == "All criteria") %>% select(-set),
-     "B. Random weights vs equal weights: median and 5th to 95th percentile")
+```{r B-draws}
+draws_B <- bind_rows(lapply(names(cities), function(cn) {
+  st <- t(apply(P[[cn]]$SC, 2, cmp, ref = P[[cn]]$s_eq))
+  tibble(city = cn, set = "All criteria", draw = seq_len(N_DRAWS),
+         dist_from_equal = sqrt(colSums((P[[cn]]$W - P[[cn]]$w_eq)^2)),
+         spearman = st[, "spearman"], top_quintile_overlap_pct = st[, "top_quintile_overlap_pct"])
+}))
+summ_draws <- function(dd) dd %>% group_by(city, set) %>%
+  summarise(spearman_median = median(spearman), spearman_p05 = quantile(spearman, 0.05),
+            spearman_p95 = quantile(spearman, 0.95), overlap_median = median(top_quintile_overlap_pct),
+            overlap_p05 = quantile(top_quintile_overlap_pct, 0.05), overlap_p95 = quantile(top_quintile_overlap_pct, 0.95),
+            dist_from_equal_median = median(dist_from_equal), .groups = "drop")
+B_all <- summ_draws(draws_B)
+ktab(B_all %>% select(-set), "B. Random weights vs equal weights: median and 5th to 95th percentile")
 ```
 
-```{r B-plot, fig.width=9, fig.height=7}
-pB <- ggplot(draws, aes(city, spearman, fill = city)) + geom_violin(colour = NA, alpha = 0.7) +
-  geom_boxplot(width = 0.12, outlier.size = 0.3, fill = "white") + facet_wrap(~ set) +
-  scale_fill_manual(values = city_cols, guide = "none") +
-  labs(x = NULL, y = "Spearman, random vs equal weights") + theme_minimal(base_size = 10)
-pB2 <- ggplot(draws, aes(city, top_quintile_overlap_pct, fill = city)) + geom_violin(colour = NA, alpha = 0.7) +
-  geom_boxplot(width = 0.12, outlier.size = 0.3, fill = "white") + facet_wrap(~ set) +
-  scale_fill_manual(values = city_cols, guide = "none") +
-  labs(x = NULL, y = "Top quintile overlap (%)") + theme_minimal(base_size = 10)
-pB / pB2
-ggsave(file.path(OUT, "B_C1_random_weights.png"), pB / pB2, width = 180, height = 150, units = "mm", dpi = 300, bg = "white")
+```{r B-plot, fig.width=9, fig.height=3.8}
+violin <- function(dd, y, ylab) ggplot(dd, aes(city, .data[[y]], fill = city)) +
+  geom_violin(colour = NA, alpha = 0.7) + geom_boxplot(width = 0.12, outlier.size = 0.3, fill = "white") +
+  facet_wrap(~ set) + scale_fill_manual(values = city_cols, guide = "none") +
+  labs(x = NULL, y = ylab) + theme_minimal(base_size = 10)
+violin(draws_B, "spearman", "Spearman, random vs equal weights") +
+  violin(draws_B, "top_quintile_overlap_pct", "Top quintile overlap (%)")
 ```
 
 # C. Controls
 
 ## C1. Five shared criteria
 
-The same draws using only urban heat, air quality, traffic, green proximity and blue space, with equal weight 1/5 in both cities. This removes the difference in the number and type of criteria. The right panels of the plot above show it.
+The same `r N_DRAWS` draws, using only urban heat, air quality, traffic, green proximity and blue space,
+with equal weight 1/5 in both cities. This removes the difference in the number and type of criteria. If
+Klagenfurt is still more stable, the difference comes from how the burdens are arranged in space, not from
+how many criteria each city has.
 
-```{r C1-table}
-ktab(B %>% filter(set == "Five shared criteria") %>% select(-set),
-     "C1. Five shared criteria: random vs equal weights, median and 5th to 95th percentile")
+### Step 1. Which criteria
+
+```{r C1-criteria}
+bind_rows(lapply(names(cities), function(cn) tibble(
+  city = cn, criterion = cities[[cn]]$lab[shared[[cn]]], variable = shared[[cn]],
+  citizen_weight_rescaled_pct = 100 * P[[cn]]$w5c))) %>%
+  ktab("C1a. The five shared criteria and their citizen weights, rescaled to sum to 100%", 1)
+```
+
+### Step 2. Correlation among the five shared criteria
+
+```{r C1-correlation}
+bind_rows(lapply(names(cities), function(cn) {
+  cm <- cor(P[[cn]]$S5, method = "spearman", use = "pairwise.complete.obs"); off <- cm[upper.tri(cm)]
+  tibble(city = cn, mean_abs_spearman = mean(abs(off)), mean_spearman = mean(off), positive_pairs = sum(off > 0))
+})) %>% ktab("C1b. Spearman correlations among the five shared criteria (10 pairs)")
+```
+
+### Step 3. Random weights on the five shared criteria
+
+```{r C1-draws}
+draws_C1 <- bind_rows(lapply(names(cities), function(cn) {
+  st <- t(apply(P[[cn]]$SC5, 2, cmp, ref = P[[cn]]$s_eq5))
+  tibble(city = cn, set = "Five shared criteria", draw = seq_len(N_DRAWS),
+         dist_from_equal = sqrt(colSums((P[[cn]]$W5 - 1 / 5)^2)),
+         spearman = st[, "spearman"], top_quintile_overlap_pct = st[, "top_quintile_overlap_pct"])
+}))
+B_C1 <- summ_draws(draws_C1)
+ktab(B_C1 %>% select(-set), "C1c. Five shared criteria: random vs equal weights, median and 5th to 95th percentile")
+```
+
+### Step 4. All criteria vs five shared criteria
+
+```{r C1-compare}
+bind_rows(B_all, B_C1) %>% select(city, set, spearman_median, spearman_p05, spearman_p95, overlap_median) %>%
+  arrange(city, set) %>% ktab("C1d. Random weights: all criteria (B) vs five shared criteria (C1)")
+draws <- bind_rows(draws_B, draws_C1)
+```
+
+```{r C1-plot, fig.width=9, fig.height=3.8}
+violin(draws, "spearman", "Spearman, random vs equal weights") +
+  violin(draws, "top_quintile_overlap_pct", "Top quintile overlap (%)")
 ```
 
 ## C2. Map change per unit of weight change
 
-Euclidean distance between the citizen and equal weight vectors, against the citizen vs equal map change. The table also gives the change per unit of distance, and the slope of 1 − Spearman on distance across the random draws (regression through the origin).
+Citizen weights move each city away from equal weights by some amount (the Euclidean distance between
+the two weight vectors). C2 asks how much the map changes for that amount of weight change.
 
-```{r C2-table}
-ktab(C2, "C2. Citizen vs equal weights: weight distance and map change")
+### Step 1. How far citizen weights are from equal weights
+
+```{r C2-weights}
+w_gap <- bind_rows(lapply(names(cities), function(cn) tibble(
+  city = cn, criterion = cities[[cn]]$lab[cities[[cn]]$vars], citizen_pct = 100 * cities[[cn]]$w,
+  equal_pct = 100 * P[[cn]]$w_eq, difference_pct_points = 100 * (cities[[cn]]$w - P[[cn]]$w_eq))))
+ktab(w_gap, "C2a. Citizen minus equal weight per criterion (percentage points)", 1)
+```
+
+### Step 2. Distance and map change, citizen vs equal
+
+```{r C2-change}
+c2_row <- function(cn, set, s_c, s_e, wc, we) {
+  ce <- cmp(s_c, s_e); dce <- sqrt(sum((wc - we)^2))
+  tibble(city = cn, set = set, dist_citizen_equal = dce, spearman = ce[["spearman"]],
+         one_minus_spearman = 1 - ce[["spearman"]], top_quintile_overlap_pct = ce[["top_quintile_overlap_pct"]],
+         change_per_unit_weight = (1 - ce[["spearman"]]) / dce)
+}
+C2 <- bind_rows(lapply(names(cities), function(cn) bind_rows(
+  c2_row(cn, "All criteria", P[[cn]]$s_cit, P[[cn]]$s_eq, cities[[cn]]$w, P[[cn]]$w_eq),
+  c2_row(cn, "Five shared criteria", P[[cn]]$s_cit5, P[[cn]]$s_eq5, P[[cn]]$w5c, rep(1 / 5, 5)))))
+ktab(C2, "C2b. Citizen vs equal weights: weight distance and map change")
+```
+
+### Step 3. The same relation across the random draws
+
+Slope of 1 − Spearman on the distance from equal weights across the `r N_DRAWS` draws (regression through
+the origin): the city's general map change per unit of weight change, against which the citizen weights
+(diamonds) can be read.
+
+```{r C2-slope}
+C2 <- C2 %>% left_join(draws %>% group_by(city, set) %>%
+  summarise(random_draws_slope = unname(coef(lm(I(1 - spearman) ~ 0 + dist_from_equal))[1]), .groups = "drop"),
+  by = c("city", "set"))
+ktab(C2 %>% select(city, set, change_per_unit_weight, random_draws_slope),
+     "C2c. Map change per unit of weight distance: citizen weights and random draws")
 ```
 
 ```{r C2-plot, fig.width=10, fig.height=5}
 pC <- ggplot(draws, aes(dist_from_equal, 1 - spearman, colour = city)) + geom_point(size = 0.4, alpha = 0.3) +
+  geom_abline(data = C2, aes(slope = random_draws_slope, intercept = 0, colour = city), linetype = 2) +
   geom_point(data = C2, aes(dist_citizen_equal, one_minus_spearman, fill = city), shape = 23, size = 3, colour = "black") +
   facet_wrap(~ set, scales = "free_x") +
   scale_colour_manual(values = city_cols, name = NULL) + scale_fill_manual(values = city_cols, guide = "none") +
   labs(x = "Euclidean distance of the weight vector from equal weights", y = "1 - Spearman vs equal weights",
-       caption = "Points: random weight sets. Diamonds: citizen weights.") + theme_minimal(base_size = 10)
+       caption = "Points: random weight sets. Dashed: slope through the origin. Diamonds: citizen weights.") +
+  theme_minimal(base_size = 10)
 pC
-ggsave(file.path(OUT, "C2_change_per_unit_weight.png"), pC, width = 180, height = 90, units = "mm", dpi = 300, bg = "white")
 ```
 
 # D. Robust and contested cells
 
-Share of the `r N_DRAWS` draws in which each scored cell is in the top quintile. Robust core: over 90%. Contested: 10% to 90%. Rarely prioritised: under 10%. Residents: Malta `pop_reallocated_nso` (`Total_Population`), Klagenfurt GHSL 2020 (`popdense_2020`).
+## Step 1. How often each cell is in the top quintile
 
-```{r D-table}
-ktab(D, "D. Robust and contested cells: cells and residents per class", 1)
+Share of the `r N_DRAWS` draws in which each scored cell is in the top quintile.
+
+```{r D1-ptop}
+for (cn in names(cities)) P[[cn]]$p_top <- rowMeans(apply(P[[cn]]$SC, 2, top5))
+bind_rows(lapply(names(cities), function(cn) tibble(city = cn, p = 100 * P[[cn]]$p_top))) %>%
+  group_by(city) %>%
+  summarise(never_pct = 100 * mean(p == 0), always_pct = 100 * mean(p == 100),
+            median = median(p), p25 = quantile(p, 0.25), p75 = quantile(p, 0.75), .groups = "drop") %>%
+  ktab("D1. Draws with the cell in the top quintile (%): share of cells never and always, and quartiles", 1)
 ```
 
-```{r D-maps, fig.width=12, fig.height=6.5}
+```{r D1-hist, fig.width=9, fig.height=3.5}
+bind_rows(lapply(names(cities), function(cn) tibble(city = cn, p_top = P[[cn]]$p_top))) %>%
+  ggplot(aes(100 * p_top, fill = city)) + geom_histogram(binwidth = 2.5, boundary = 0) +
+  geom_vline(xintercept = c(10, 90), linetype = 2) + facet_wrap(~ city, scales = "free_y") +
+  scale_fill_manual(values = city_cols, guide = "none") +
+  labs(x = "Draws with the cell in the top quintile (%)", y = "Cells") + theme_minimal(base_size = 10)
+```
+
+## Step 2. Classes: cells and residents
+
+Robust core: over 90% of draws. Contested: 10% to 90%. Rarely prioritised: under 10%. Residents: Malta
+`pop_reallocated_nso` (`Total_Population`), Klagenfurt GHSL 2020 (`popdense_2020`).
+
+```{r D2-classes}
+cls_levels <- c("Rarely prioritised (< 10%)", "Contested (10% to 90%)", "Robust core (> 90%)")
+cells_D <- list()
+for (cn in names(cities)) {
+  p <- P[[cn]]$p_top
+  cls <- factor(case_when(p > 0.90 ~ cls_levels[3], p >= 0.10 ~ cls_levels[2], TRUE ~ cls_levels[1]), levels = cls_levels)
+  cells_D[[cn]] <- P[[cn]]$d %>% mutate(p_top = p, robust_class = cls, citizen_top = top5(P[[cn]]$s_cit)) %>%
+    select(all_of(cities[[cn]]$id), all_of(cities[[cn]]$pop), p_top, robust_class, citizen_top)
+}
+D <- bind_rows(lapply(names(cities), function(cn) {
+  dd <- st_drop_geometry(cells_D[[cn]]); pop <- dd[[cities[[cn]]$pop]]; pop[is.na(pop)] <- 0
+  tibble(city = cn, class = dd$robust_class, pop = pop) %>% group_by(city, class, .drop = FALSE) %>%
+    summarise(cells = n(), residents = sum(pop), .groups = "drop") %>%
+    mutate(cells_pct = 100 * cells / sum(cells), residents_pct = 100 * residents / sum(residents))
+}))
+ktab(D, "D2. Robust and contested cells: cells and residents per class", 1)
+```
+
+```{r D2-maps, fig.width=12, fig.height=6.5}
 dmap <- function(cn) {
-  ci <- city[[cn]]; d <- cells_D[[cn]]
+  ci <- cities[[cn]]; d <- cells_D[[cn]]
   ggplot() +
     geom_sf(data = st_transform(ci$df, st_crs(d)), fill = "grey92", colour = NA) +
     geom_sf(data = d, aes(fill = robust_class), colour = NA) +
@@ -350,17 +491,46 @@ dmap <- function(cn) {
 }
 pD <- dmap("Malta") + dmap("Klagenfurt") + plot_layout(guides = "collect") & theme(legend.position = "bottom")
 pD
-ggsave(file.path(OUT, "D_robust_contested_maps.png"), pD, width = 180, height = 100, units = "mm", dpi = 300, bg = "white")
 ```
 
 Grey cells are not scored (in Malta, mainly the airport and port).
 
-```{r D-hist, fig.width=9, fig.height=3.5}
-bind_rows(lapply(names(cells_D), function(cn) tibble(city = cn, p_top = cells_D[[cn]]$p_top))) %>%
-  ggplot(aes(100 * p_top, fill = city)) + geom_histogram(binwidth = 2.5, boundary = 0) +
-  geom_vline(xintercept = c(10, 90), linetype = 2) + facet_wrap(~ city, scales = "free_y") +
-  scale_fill_manual(values = city_cols, guide = "none") +
-  labs(x = "Draws with the cell in the top quintile (%)", y = "Cells") + theme_minimal(base_size = 10)
+## Step 3. Classes and the citizen top quintile
+
+How the classes relate to the actual citizen weighted map: where do the citizen top quintile cells fall?
+
+```{r D3-citizen}
+bind_rows(lapply(names(cities), function(cn) st_drop_geometry(cells_D[[cn]]) %>%
+  filter(citizen_top) %>% count(robust_class, .drop = FALSE, name = "citizen_top_quintile_cells") %>%
+  mutate(pct_of_citizen_top_quintile = 100 * citizen_top_quintile_cells / sum(citizen_top_quintile_cells)) %>%
+  mutate(city = cn, .before = 1))) %>%
+  ktab("D3. Citizen top quintile cells by robustness class", 1)
+```
+
+```{r save-outputs}
+weights_tab_out <- weights_tab
+rnd <- function(x) x %>% mutate(across(where(is.double), ~ round(., 3)))
+readr::write_csv(rnd(A), file.path(OUT, "A_burden_coincidence.csv"))
+readr::write_csv(rnd(shares), file.path(OUT, "A_top_class_share_by_criterion.csv"))
+readr::write_csv(rnd(dist_top), file.path(OUT, "A_cells_by_number_of_top_criteria.csv"))
+readr::write_csv(rnd(bind_rows(B_all, B_C1)), file.path(OUT, "B_C1_random_weights_summary.csv"))
+readr::write_csv(rnd(draws), file.path(OUT, "B_C1_random_weights_draws.csv"))
+readr::write_csv(rnd(C2), file.path(OUT, "C2_change_per_unit_weight.csv"))
+readr::write_csv(rnd(D), file.path(OUT, "D_robust_contested.csv"))
+readr::write_csv(rnd(weights_tab_out), file.path(OUT, "weights_criterion_level.csv"))
+for (cn in names(cor_mats))
+  readr::write_csv(as.data.frame(round(cor_mats[[cn]], 3)) %>% tibble::rownames_to_column("criterion"),
+                   file.path(OUT, paste0("A_spearman_matrix_", tolower(cn), ".csv")))
+for (cn in names(cells_D))
+  saveRDS(st_drop_geometry(cells_D[[cn]]) %>% mutate(robust_class = as.character(robust_class)),
+          file.path(OUT, paste0("robust_class_", tolower(cn), ".rds")))
+ggsave(file.path(OUT, "B_C1_random_weights.png"),
+       violin(draws, "spearman", "Spearman, random vs equal weights") /
+         violin(draws, "top_quintile_overlap_pct", "Top quintile overlap (%)"),
+       width = 180, height = 150, units = "mm", dpi = 300, bg = "white")
+ggsave(file.path(OUT, "C2_change_per_unit_weight.png"), pC, width = 180, height = 90, units = "mm", dpi = 300, bg = "white")
+ggsave(file.path(OUT, "D_robust_contested_maps.png"), pD, width = 180, height = 100, units = "mm", dpi = 300, bg = "white")
+cat("Saved tables and figures to", OUT, "\n")
 ```
 
 # Leave one out and sensitivity summary (Table S6)
@@ -370,11 +540,14 @@ Computed in the scoring notebooks (`Malta_MCDA_260702_realloc.Rmd`, `Klagenfurt_
 ```{r s6}
 s6 <- bind_rows(readRDS(here::here("data/malta/malta_sensitivity.rds")) %>% mutate(city = "Malta", .before = 1),
                 readRDS(here::here("data/klagenfurt/klag_sensitivity.rds")) %>% mutate(city = "Klagenfurt", .before = 1))
-s6 %>% rename(`Sensitivity test` = test_name, Spearman = spearman_r, `Top quintile retained` = class_agreement,
-              `Cells changing quintile` = cells_changing_quintile) %>%
-  kable(caption = "Sensitivity summary, both cities (main score vs each variant, cells scored in both)") %>%
-  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE) %>%
-  collapse_rows(columns = 1, valign = "top")
+s6_tab <- s6 %>% rename(`Sensitivity test` = test_name, Spearman = spearman_r, `Top quintile retained` = class_agreement,
+                        `Cells changing quintile` = cells_changing_quintile)
+s6_cap <- "Sensitivity summary, both cities (main score vs each variant, cells scored in both)"
+if (knitting()) {
+  s6_tab %>% kable(caption = s6_cap) %>%
+    kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE) %>%
+    collapse_rows(columns = 1, valign = "top")
+} else ktab(s6_tab, s6_cap)
 ```
 
 ```{r loo-plot, fig.width=9, fig.height=4.5}

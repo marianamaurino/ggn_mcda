@@ -67,10 +67,11 @@ cat("connector cells: distance to nearest origin vs ATGreen connector_m: cor",
 # Pedestrian filter as OSMnx "walk": drop motorways, construction, proposed, raceways, cycleways,
 # areas, foot=no, access=private, service=private
 hw <- st_read(file.path(DOWN, "osm_highways_raw.gpkg"), quiet = TRUE)
-drop_hw <- "^(motorway|motorway_link|construction|proposed|raceway|cycleway|bus_guideway|busway|abandoned|planned|platform|razed|no)$"
-walk <- hw %>%
-  filter(!grepl(drop_hw, highway), is.na(foot) | foot != "no", is.na(access) | access != "private",
-         is.na(service) | service != "private", is.na(area) | area != "yes") %>%
+# Pedestrian filter: mcda/walk_filter.R (since 2026-11-20 keeps ways with explicit foot access,
+# e.g. shared foot and cycle paths; foot=no and access=private always dropped)
+source(here::here("mcda/walk_filter.R"))
+walk_filter_report(hw, file.path(DOWN, "malta"))
+walk <- hw[walk_keep(hw), ] %>%
   st_transform(3035) %>% st_cast("LINESTRING", warn = FALSE) %>%
   st_segmentize(dfMaxLength = 20)   # vertices every <= 20 m, so patches and origins find nearby nodes
 cat("walkable lines", nrow(walk), "of", nrow(hw), "\n")
@@ -119,32 +120,42 @@ cat("time matrix", dim(Tp)[1], "x", dim(Tp)[2], "| finite share", round(mean(is.
 
 # ---- 3. Cell to patch times (ATGreen aggregation: mean over points in the cell; connector cells
 #         use their assigned point + connector time; unroutable cells NA) --------------------------
-inside <- st_join(orig %>% select(network_point_id), cells %>% select(gid), join = st_within)
-pts_by_cell <- split(match(inside$network_point_id, orig$network_point_id), inside$gid)
-cell_T <- matrix(NA_real_, nrow(cells), ncol(Tp))
-for (i in seq_len(nrow(cells))) {
-  st <- cells$assignment_status[i]
-  if (st == "direct") {
-    p <- pts_by_cell[[cells$gid[i]]]
-    if (length(p) == 0) p <- cells$pt_idx[i]
-    cell_T[i, ] <- colMeans(Tp[p, , drop = FALSE])
-  } else if (st == "connector") {
-    cell_T[i, ] <- Tp[cells$pt_idx[i], ] + cells$connector_sec[i] / 60
-  }
+pt_cell <- st_join(orig %>% select(network_point_id), cells %>% select(gid), join = st_within)
+pts_by_cell <- split(match(pt_cell$network_point_id, orig$network_point_id), pt_cell$gid)
+cell_pts <- lapply(seq_len(nrow(cells)), function(i) {
+  if (cells$assignment_status[i] == "direct") {
+    p <- pts_by_cell[[cells$gid[i]]]; if (length(p) == 0) p <- cells$pt_idx[i]; p
+  } else if (cells$assignment_status[i] == "connector") cells$pt_idx[i] else integer(0)
+})
+conn_min <- ifelse(cells$assignment_status == "connector", cells$connector_sec / 60, 0)
+# Zero rule (since 2026-11-20, as ATGreen): origin inside a patch -> time 0 to it, and a connector
+# cell assigned to that point gets 0 for that patch (no connector walk)
+in_green <- matrix(FALSE, nrow(orig), nrow(green))
+ig <- st_intersects(orig, green)
+for (p in which(lengths(ig) > 0)) in_green[p, ig[[p]]] <- TRUE
+cat("origin points inside a green patch:", sum(rowSums(in_green) > 0), "of", nrow(orig), "\n")
+Tz <- apply_zero_rule(Tp, in_green)
+cell_times <- function(T, zero) t(vapply(seq_len(nrow(cells)), function(i) {
+  p <- cell_pts[[i]]
+  if (length(p) == 0) return(rep(NA_real_, ncol(T)))
+  add <- if (zero && length(p) == 1 && cells$assignment_status[i] == "connector") conn_min[i] * !in_green[p, ] else conn_min[i]
+  colMeans(T[p, , drop = FALSE]) + add
+}, numeric(ncol(T))))
+# Nearest green per point, then mean (and median) per cell
+nearest_cell <- function(T, zero, fun = mean) {
+  pt <- apply(T, 1, min); pin <- rowSums(in_green) > 0
+  vapply(seq_len(nrow(cells)), function(i) {
+    p <- cell_pts[[i]]
+    if (length(p) == 0) return(NA_real_)
+    if (cells$assignment_status[i] == "connector") return(if (zero && pin[p]) 0 else pt[p] + conn_min[i])
+    fun(pt[p])
+  }, numeric(1))
 }
-# Nearest green per point, then mean per cell (as ATGreen nearest_green_sec)
-pt_near <- apply(Tp, 1, min)
-cells$own_nearest_sec <- NA_real_
-for (i in seq_len(nrow(cells))) {
-  st <- cells$assignment_status[i]
-  if (st == "direct") {
-    p <- pts_by_cell[[cells$gid[i]]]
-    if (length(p) == 0) p <- cells$pt_idx[i]
-    cells$own_nearest_sec[i] <- 60 * mean(pt_near[p])
-  } else if (st == "connector") {
-    cells$own_nearest_sec[i] <- 60 * pt_near[cells$pt_idx[i]] + cells$connector_sec[i]
-  }
-}
+cell_T_nozero <- cell_times(Tp, FALSE)
+cell_T        <- cell_times(Tz, TRUE)
+cells$own_nearest_sec_nozero <- 60 * nearest_cell(Tp, FALSE)
+cells$own_nearest_sec        <- 60 * nearest_cell(Tz, TRUE)
+cells$own_nearest_sec_median <- 60 * nearest_cell(Tz, TRUE, median)
 
 # ---- 4. E2SFCA ------------------------------------------------------------------------------------
 w_step  <- function(t) ifelse(t <= 5, 1, ifelse(t <= 10, 0.7, ifelse(t <= 15, 0.4, 0)))
@@ -153,8 +164,8 @@ w_step  <- function(t) ifelse(t <= 5, 1, ifelse(t <= 10, 0.7, ifelse(t <= 15, 0.
 # e2sfca_kernel_choice.csv); ATGreen's exact kernel is not documented in its outputs
 w_gauss <- function(t, sigma = 5, cut = 15) ifelse(t <= cut, exp(-t^2 / (2 * sigma^2)), 0)
 S <- green$green_ha * 1e4   # supply: patch area, m2
-e2sfca <- function(P, W) {
-  Wm <- W(cell_T); Wm[is.na(Wm)] <- 0
+e2sfca <- function(P, W, CT = cell_T) {
+  Wm <- W(CT); Wm[is.na(Wm)] <- 0
   D <- colSums(Wm * P, na.rm = TRUE)        # step 1: weighted population reaching each patch
   R <- ifelse(D > 0, S / D, 0)
   out <- as.numeric(Wm %*% R)               # step 2: sum of patch ratios reachable from the cell
@@ -163,7 +174,11 @@ e2sfca <- function(P, W) {
 }
 cells <- cells %>%
   mutate(own_gauss_atgpop = e2sfca(pop_atg, w_gauss), own_step_atgpop = e2sfca(pop_atg, w_step),
-         own_gauss_nso    = e2sfca(pop_nso, w_gauss), own_step_nso    = e2sfca(pop_nso, w_step))
+         own_gauss_nso    = e2sfca(pop_nso, w_gauss), own_step_nso    = e2sfca(pop_nso, w_step),
+         own_gauss_nso_nozero = e2sfca(pop_nso, w_gauss, cell_T_nozero),
+         # Sensitivity, walking speed 4 km/h (spec 5.3): every time is distance / speed, so the
+         # 4 km/h times are exactly 5/4 of the 5 km/h times (kernel and cutoff unchanged)
+         own_gauss_nso_4kmh = e2sfca(pop_nso, w_gauss, cell_T * 5 / 4))
 
 # ---- 5. Validation --------------------------------------------------------------------------------
 vr <- function(x, y, what) {
@@ -172,7 +187,8 @@ vr <- function(x, y, what) {
          pearson = cor(x[ok], y[ok]), median_ours = median(x[ok]), median_atgreen = median(y[ok]))
 }
 val <- bind_rows(
-  vr(cells$own_nearest_sec, cells$nearest_green_sec, "Walking time to nearest green (s), own routing vs ATGreen"),
+  vr(cells$own_nearest_sec_nozero, cells$nearest_green_sec, "Walking time to nearest green (s), own routing vs ATGreen, no zero rule"),
+  vr(cells$own_nearest_sec, cells$nearest_green_sec, "Walking time to nearest green (s), own routing vs ATGreen, zero rule"),
   vr(cells$own_gauss_atgpop, cells$atg_gauss, "E2SFCA Gaussian, ATGreen population: own vs ATGreen"),
   vr(cells$own_step_atgpop, cells$atg_step, "E2SFCA step 1/0.7/0.4, ATGreen population: own vs ATGreen")) %>%
   mutate(across(where(is.double), ~ round(., 3)))
@@ -180,12 +196,27 @@ wcsv(val, "e2sfca_rebuild_validation.csv"); print(as.data.frame(val))
 
 # ---- 6. Save cell values --------------------------------------------------------------------------
 cell_out <- cells %>% st_drop_geometry() %>%
-  select(gid, assignment_status, pop_atg, pop_nso, nearest_green_sec, own_nearest_sec,
-         atg_gauss, own_gauss_atgpop, own_gauss_nso, atg_step, own_step_atgpop, own_step_nso)
+  select(gid, assignment_status, pop_atg, pop_nso, nearest_green_sec, own_nearest_sec_nozero, own_nearest_sec,
+         own_nearest_sec_median, atg_gauss, own_gauss_atgpop, own_gauss_nso_nozero, own_gauss_nso,
+         own_gauss_nso_4kmh, atg_step, own_step_atgpop, own_step_nso)
 readr::write_csv(cell_out, file.path(DOWN, "e2sfca_own_routing_cells.csv"))
-saveRDS(list(Tp = Tp, cell_T = cell_T, gid = cells$gid, green_id = green$green_id),
+saveRDS(list(Tp = Tp, cell_T = cell_T, in_green = in_green, gid = cells$gid, green_id = green$green_id),
         file.path(DOWN, "travel_times_min.rds"))
 cat("\nSaved", file.path(DOWN, "e2sfca_own_routing_cells.csv"), "\n")
+# MCDA input (read by Malta_MCDA_260702_realloc.Rmd: gauss and step columns; walking time from
+# e2sfca_own_routing_cells.csv). The norm column is the pre-2026-11-19 formula, not used by the score.
+readr::write_csv(cells %>% st_drop_geometry() %>%
+                   transmute(gid, green_m2_e2sfca_gauss_newpop = own_gauss_nso,
+                             green_m2_e2sfca_step_newpop = own_step_nso,
+                             green_m2_e2sfca_gauss_newpop_4kmh = own_gauss_nso_4kmh),
+                 file.path(DOWN, "norm_green_exp_newpop.csv"))
+cat("Saved", file.path(DOWN, "norm_green_exp_newpop.csv"), "\n")
+
+# Section 7 is the 2026-11-05 comparison (ATGreen vs own E2SFCA) with the min max normalisation used
+# until 2026-11-19; its check fails against the current log score, so it is not run any more.
+# Its outputs (output/figures_mcda/atgreen_checks/e2sfca_*.csv) are kept as a record.
+RUN_NOV05_COMPARISON <- FALSE
+if (!RUN_NOV05_COMPARISON) quit(save = "no")
 
 # ---- 7. Priority score with the rebuilt indicator -------------------------------------------------
 norm_vars <- c("norm_lst", "norm_imd", "norm_dist_bs", "norm_Lden", "norm_traffic", "norm_no2",

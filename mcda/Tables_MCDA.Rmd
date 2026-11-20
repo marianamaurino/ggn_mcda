@@ -43,7 +43,7 @@ klag_survey_summary  <- load_rds("klag_survey_summary",
 malta_sensitivity    <- load_rds("malta_sensitivity",
                                   file.path(data_dir, "malta_sensitivity.rds"))
 klag_sensitivity     <- load_rds("klag_sensitivity",
-                                  file.path(data_dir, "klag_sensitivity.rds"))
+                                  here::here("data/klagenfurt/klag_sensitivity.rds"))  # written by Klagenfurt_MCDA_260520.Rmd
 
 # ── track which objects are present ───────────────────────────────────────────
 obj_status <- list(

@@ -72,10 +72,11 @@ if (!file.exists(raw_path)) {
   cat("OSM highways downloaded", format(Sys.Date()), ":", nrow(hw_raw), "ways\n")
 }
 hw <- st_read(raw_path, quiet = TRUE)
-drop_hw <- "^(motorway|motorway_link|construction|proposed|raceway|cycleway|bus_guideway|busway|abandoned|planned|platform|razed|no)$"
-walk <- hw %>%
-  filter(!grepl(drop_hw, highway), is.na(foot) | foot != "no", is.na(access) | access != "private",
-         is.na(service) | service != "private", is.na(area) | area != "yes") %>%
+# Pedestrian filter: mcda/walk_filter.R (since 2026-11-20 keeps ways with explicit foot access,
+# e.g. shared foot and cycle paths; foot=no and access=private always dropped)
+source(here::here("mcda/walk_filter.R"))
+walk_filter_report(hw, file.path(DOWN, "klagenfurt"))
+walk <- hw[walk_keep(hw), ] %>%
   st_transform(3035) %>% st_cast("LINESTRING", warn = FALSE) %>%
   st_segmentize(dfMaxLength = 20)
 cat("walkable lines", nrow(walk), "of", nrow(hw), "\n")
@@ -128,22 +129,38 @@ cell_pts <- lapply(seq_len(nrow(cells)), function(i) {
   } else if (cells$assignment_status[i] == "connector") cells$pt_idx[i] else integer(0)
 })
 conn_min <- ifelse(cells$assignment_status == "connector", cells$connector_sec / 60, 0)
+# Zero rule (since 2026-11-20, as ATGreen): origin inside a patch -> time 0 to it, and a connector
+# cell assigned to that point gets 0 for that patch (no connector walk)
+in_green <- matrix(FALSE, nrow(orig), nrow(green))
+ig <- st_intersects(orig, green)
+for (p in which(lengths(ig) > 0)) in_green[p, ig[[p]]] <- TRUE
+cat("origin points inside a green patch:", sum(rowSums(in_green) > 0), "of", nrow(orig), "\n")
+Tz <- apply_zero_rule(Tp, in_green)
+is_m <- green$ua_code %in% MALTA_CLASSES
 cell_T <- t(vapply(seq_len(nrow(cells)), function(i) {
   p <- cell_pts[[i]]
-  if (length(p) == 0) return(rep(NA_real_, ncol(Tp)))
-  colMeans(Tp[p, , drop = FALSE]) + conn_min[i]
-}, numeric(ncol(Tp))))
-# Nearest green per origin point, then mean per cell; for a subset of patches
-nearest_min <- function(cols) {
-  pt <- apply(Tp[, cols, drop = FALSE], 1, min)
+  if (length(p) == 0) return(rep(NA_real_, ncol(Tz)))
+  add <- if (cells$assignment_status[i] == "connector") conn_min[i] * !in_green[p, ] else 0
+  colMeans(Tz[p, , drop = FALSE]) + add
+}, numeric(ncol(Tz))))
+# Nearest green per origin point, then mean (or median) per cell; for a subset of patches
+nearest_min <- function(cols, zero = TRUE, fun = mean) {
+  T <- if (zero) Tz else Tp
+  pt <- apply(T[, cols, drop = FALSE], 1, min)
+  pin <- rowSums(in_green[, cols, drop = FALSE]) > 0
   vapply(seq_len(nrow(cells)), function(i) {
-    p <- cell_pts[[i]]; if (length(p) == 0) NA_real_ else mean(pt[p]) + conn_min[i]
+    p <- cell_pts[[i]]
+    if (length(p) == 0) return(NA_real_)
+    if (cells$assignment_status[i] == "connector") return(if (zero && pin[p]) 0 else pt[p] + conn_min[i])
+    fun(pt[p])
   }, numeric(1))
 }
-is_m <- green$ua_code %in% MALTA_CLASSES
 cells <- cells %>% mutate(
-  own_nearest_min_atgclasses = nearest_min(rep(TRUE, nrow(green))),   # validation only
-  own_nearest_min_500m2      = nearest_min(is_m),
+  own_nearest_min_atgclasses = nearest_min(rep(TRUE, nrow(green)), zero = FALSE),   # validation only
+  own_nearest_min_atgclasses_zero = nearest_min(rep(TRUE, nrow(green))),            # validation only
+  own_nearest_min_nozero     = nearest_min(is_m, zero = FALSE),
+  own_nearest_min            = nearest_min(is_m),                  # MCDA input since 2026-11-20
+  own_nearest_min_median     = nearest_min(is_m, fun = median),
   own_nearest_min_05ha       = nearest_min(is_m & green$green_ha >= 0.5))
 
 # ---- 4. E2SFCA (Malta classes, census population) ------------------------------------------------
@@ -178,7 +195,7 @@ val <- tibble(check = "Walking time to nearest green (min), own routing vs ATGre
 print(as.data.frame(val))
 readr::write_csv(val, file.path(DOWN, "routing_validation.csv"))
 
-cat("\nown_nearest_min_500m2:\n"); print(summary(cells$own_nearest_min_500m2))
+cat("\nown_nearest_min:\n"); print(summary(cells$own_nearest_min))
 cat("own_nearest_min_05ha:\n");  print(summary(cells$own_nearest_min_05ha))
 cat("own_step_census (m2 green per person, step 1/0.7/0.4):\n"); print(summary(cells$own_step_census))
 p98 <- quantile(cells$own_step_census, 0.98, na.rm = TRUE)
@@ -186,7 +203,7 @@ ph <- ggplot(filter(cells, is.finite(own_step_census), pop_census > 0), aes(pmin
   geom_histogram(bins = 60) + theme_minimal(base_size = 9) +
   labs(x = "m2 green per person (E2SFCA step 1/0.7/0.4, census population; capped at p98)", y = "Populated cells")
 ggsave(file.path(DOWN, "e2sfca_step_census_histogram.png"), ph, width = 140, height = 90, units = "mm", dpi = 200)
-pm <- ggplot(cells %>% select(own_nearest_min_500m2, own_step_census) %>%
+pm <- ggplot(cells %>% select(own_nearest_min, own_step_census) %>%
                mutate(own_step_census = pmin(own_step_census, p98)) %>%
                pivot_longer(-geometry)) +
   geom_sf(aes(fill = value), colour = NA) + facet_wrap(~ name) +
@@ -196,10 +213,10 @@ ggsave(file.path(DOWN, "own_routing_maps.png"), pm, width = 200, height = 100, u
 # ---- 6. Save -----------------------------------------------------------------------------------
 readr::write_csv(cells %>% st_drop_geometry() %>%
                    select(gid, assignment_status, pop_census, nearest_green_sec, own_nearest_min_atgclasses,
-                          own_nearest_min_500m2, own_nearest_min_05ha, own_step_census, own_step10_census,
+                          own_nearest_min_atgclasses_zero, own_nearest_min_nozero, own_nearest_min, own_nearest_min_median, own_nearest_min_05ha, own_step_census, own_step10_census,
                           own_gauss_census),
                  file.path(DOWN, "e2sfca_own_routing_cells.csv"))
-saveRDS(list(Tp = Tp, cell_T = cell_T, gid = cells$gid, green_id = green$green_id,
+saveRDS(list(Tp = Tp, cell_T = cell_T, in_green = in_green, gid = cells$gid, green_id = green$green_id,
              ua_code = green$ua_code, green_ha = green$green_ha),
         file.path(DOWN, "travel_times_min.rds"))
 cat("\nSaved to", DOWN, "\n")

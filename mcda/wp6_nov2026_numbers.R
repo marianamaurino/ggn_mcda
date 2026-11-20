@@ -22,9 +22,9 @@ wkb_sf <- function(d, crs = 3035) st_sf(d %>% select(-geometry),
 # ---- Malta: nearest green >= 500 m2 and >= 0.5 ha, step E2SFCA (15 min and 10 min cut) ----------
 M_DIR <- here::here("data/malta/accessibility_malta/own_routing")
 ATG   <- here::here("accessibility_schifanella/exposure")
-mc <- readr::read_csv(file.path(M_DIR, "e2sfca_own_routing_cells.csv"), show_col_types = FALSE,
+mc <- readr::read_csv(file.path(M_DIR, "e2sfca_own_routing_cells_pre_nov20.csv"), show_col_types = FALSE,
                       col_types = readr::cols(gid = "c"))
-tt <- readRDS(file.path(M_DIR, "travel_times_min.rds"))
+tt <- readRDS(file.path(M_DIR, "travel_times_min_pre_nov20.rds"))
 mg <- as.data.frame(read_parquet(file.path(ATG, "intermediate/green/green_urban_atlas.parquet")))
 stopifnot(identical(tt$gid, mc$gid), identical(as.character(tt$green_id), as.character(mg$green_id)))
 
@@ -63,7 +63,7 @@ stopifnot(max(abs(e2sfca_malta(w_step) - malta$step15), na.rm = TRUE) < 1e-6)
 malta$step10 <- e2sfca_malta(w_step10)
 
 # ---- Klagenfurt ---------------------------------------------------------------------------------
-kc <- readr::read_csv(here::here("data/klagenfurt/accessibility_klagenfurt/own_routing/e2sfca_own_routing_cells.csv"),
+kc <- readr::read_csv(here::here("data/klagenfurt/accessibility_klagenfurt/own_routing/e2sfca_own_routing_cells_pre_nov20.csv"),
                       show_col_types = FALSE, col_types = readr::cols(gid = "c"))
 klag <- kc %>% transmute(gid, assignment_status, pop = pop_census, near_500m2 = own_nearest_min_500m2,
                          near_05ha = own_nearest_min_05ha, step15 = own_step_census, step10 = own_step10_census)

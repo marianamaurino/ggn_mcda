@@ -97,24 +97,28 @@ hist(malta$Total_Population[malta$Total_Population > 0], breaks = 60,
 
 ## Accessibility — walking time to nearest green space (UA2021)
 
-Walking time to the nearest UA2021-classified green space (excluding class 32000), routed at 5 km/h on the OSRM network. Each 100 m grid cell has ~2.4 sample points snapped to road edges; the file reports the **mean** travel time across samples (`nearest_green_sec`) and the median (`nearest_green_sec_median`). The mean is used as the MCDA input; the median feeds the WHO 300 m / 3.6 min threshold check below.
+Walking time to the nearest Urban Atlas 2021 green space (classes 14110, 14130, 31000 and 40000, at least 500 m²; class 32000, herbaceous vegetation, excluded; in Malta only green urban areas are present), computed for this study (`mcda/malta_e2sfca_newpop.R`, since 2026-11-20): OpenStreetMap walking network (pedestrian filter in `mcda/walk_filter.R`), shortest paths at 5 km/h, network origin points every 50 m. A cell takes the **mean** time over the origin points inside it; cells without a point take the nearest point within 200 m plus the straight line walk to it; an origin point inside a green patch has time 0, and a cell assigned to such a point gets 0. The mean is the MCDA input; the median over the cell's points feeds the WHO 300 m / 3.6 min threshold check below. ATGreen's walking time (Valhalla routing) is kept as a sensitivity analysis (`nearest_green_min_atg`, `priority_atg_walk`).
 
 ```{r join-accessibility}
-access <- read_parquet(
+access <- read_csv(
+  here::here("data/malta/accessibility_malta/own_routing/e2sfca_own_routing_cells.csv"),
+  show_col_types = FALSE
+) %>%
+  transmute(gid = as.character(gid),
+            nearest_green_min        = own_nearest_sec / 60,
+            nearest_green_min_median = own_nearest_sec_median / 60)
+access_atg <- read_parquet(
   here::here("mcda/accessibility/final_metrics.parquet")
 ) %>%
   st_drop_geometry() %>%
-  mutate(
-    unit_id            = as.character(unit_id),
-    nearest_green_min  = nearest_green_sec        / 60,
-    nearest_green_min_median = nearest_green_sec_median / 60
-  )
+  transmute(gid = as.character(unit_id), nearest_green_min_atg = nearest_green_sec / 60)
 
 malta <- malta %>%
-  left_join(
-    access %>% select(unit_id, nearest_green_min, nearest_green_min_median),
-    by = c("gid" = "unit_id")
-  )
+  left_join(access, by = "gid") %>%
+  left_join(access_atg, by = "gid")
+cat("Spearman, own routing vs ATGreen walking time:",
+    round(cor(malta$nearest_green_min, malta$nearest_green_min_atg, method = "spearman",
+              use = "complete.obs"), 3), "\n")
 
 cat("Accessibility matched:", sum(!is.na(malta$nearest_green_min)),
     "out of", nrow(malta), "\n")
@@ -306,17 +310,13 @@ tibble(
   p98           = c(quantile(malta$m1_osm_own,       0.98, na.rm = TRUE),
                     quantile(malta$m2_osm_confluent,  0.98, na.rm = TRUE),
                     quantile(malta$m3_ua_own,         0.98, na.rm = TRUE),
-                    quantile(malta$m4_ua_confluent,   0.98, na.rm = TRUE)),
-  pct_below_who = c(mean(malta$m1_osm_own       < 9, na.rm = TRUE) * 100,
-                    mean(malta$m2_osm_confluent  < 9, na.rm = TRUE) * 100,
-                    mean(malta$m3_ua_own         < 9, na.rm = TRUE) * 100,
-                    mean(malta$m4_ua_confluent   < 9, na.rm = TRUE) * 100)
+                    quantile(malta$m4_ua_confluent,   0.98, na.rm = TRUE))
 ) %>%
   mutate(across(where(is.numeric), ~round(., 1))) %>%
   kable(
     caption   = "Four candidate green space sufficiency metrics (5 min catchment, pop > 5)",
     col.names = c("Metric", "Median (m²/person)", "Mean (m²/person)",
-                  "p98 (m²/person)", "% below WHO 9 m²")
+                  "p98 (m²/person)")
   ) %>%
   kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
                 full_width = FALSE)
@@ -359,7 +359,7 @@ p_diff <- ggplot(malta) +
 p_osm + p_ua + p_diff
 ```
 
-**Choice: OSM / confluent population.** Switching to UA2021 as the green space source produces a median of 0 and pushes over 66% of cells below the WHO threshold, which creates a near-binary variable offering little discrimination for the MCDA. This reflects UA2021's conservative classification (no private gardens, restricted classes) rather than actual crowding. The existing `norm_green_time` criterion already uses the UA2021 green layer for accessibility; using OSM here also avoids double-counting the same green space definition in two criteria. The denominator shift from own-cell to confluent population (OSM, rows 1 → 2) reduces the median from ~112 to ~37 m²/person and raises WHO non-compliance from ~5% to ~30% — that is the pure crowding signal.
+**Choice: Urban Atlas 2021 green urban areas (classes 14110 and 14130, at least 500 m²), not OSM** (updated 2026-11-19). OSM overestimates green space in Malta: with OSM the median is `r round(median(malta$m2_osm_confluent, na.rm = TRUE), 1)` m² per person, a value too high compared with the literature (TODO: add reference). In field checks, polygons tagged as green in OSM (`leisure` = park, garden, nature_reserve, recreation_ground; `landuse` = grass, meadow, forest; `natural` = wood, scrub) were often abandoned land with sparse vegetation, patches too small to be used, or private. Urban Atlas is conservative (median `r round(median(malta$m4_ua_confluent, na.rm = TRUE), 1)` m² per person); the skew and the zeros are handled by the log10 normalisation (see Normalization). Walking time to green (`norm_green_time`) uses the same Urban Atlas green urban areas, so both criteria share one green definition: one measures how far the nearest park is, the other how much park area is shared among the people who can reach it.
 
 The E2SFCA Gaussian further improves on the simple confluent-population ratio by applying distance-decay weighting: green space further from the cell contributes less to the supply score, and competing population further from the green space contributes less to the demand. This is the methodologically sound implementation of the crowding metric.
 
@@ -377,7 +377,9 @@ e2sfca_own <- read_csv(
 ) %>%
   transmute(gid = as.character(gid),
             green_m2_e2sfca_per_person_gauss = green_m2_e2sfca_gauss_newpop,
-            green_m2_e2sfca_per_person       = green_m2_e2sfca_step_newpop)
+            green_m2_e2sfca_per_person       = green_m2_e2sfca_step_newpop,
+            # sensitivity, walking speed 4 km/h (spec 5.3)
+            green_m2_e2sfca_per_person_gauss_4kmh = green_m2_e2sfca_gauss_newpop_4kmh)
 
 exposure_e2sfca <- read_parquet(
   here::here("mcda/exposure/final_metrics.parquet")
@@ -410,12 +412,9 @@ ggplot(malta %>% filter(!is.na(green_m2_e2sfca_per_person_gauss),
                         green_m2_e2sfca_per_person_gauss <= p98_suff),
        aes(x = green_m2_e2sfca_per_person_gauss)) +
   geom_histogram(bins = 50, fill = "#3B1F5E", color = "white", linewidth = 0.2) +
-  geom_vline(xintercept = 9, linetype = "dashed", color = "#E63946", linewidth = 0.8) +
-  annotate("text", x = 9, y = Inf, label = "WHO 9 m²", vjust = 2, hjust = -0.15,
-           color = "#E63946", size = 3.5) +
   labs(
     title    = "Green space sufficiency — E2SFCA Gaussian (capped at p98)",
-    subtitle = paste0("p98 = ", round(p98_suff, 0), " m²/person · WHO threshold: 9 m²/person"),
+    subtitle = paste0("p98 = ", round(p98_suff, 0), " m²/person"),
     x        = "m² of green per person (E2SFCA Gaussian)",
     y        = "Number of cells"
   ) +
@@ -429,19 +428,19 @@ ggplot(malta) +
     option   = "viridis",
     na.value = "grey90",
     name     = "m²/person\n(E2SFCA)",
-    breaks   = c(0, 9, 25, 50, p98_suff),
-    labels   = c("0", "9", "25", "50", paste0("≥", round(p98_suff)))
+    breaks   = c(0, 25, 50, p98_suff),
+    labels   = c("0", "25", "50", paste0("≥", round(p98_suff)))
   ) +
   labs(
     title    = "Green space sufficiency — E2SFCA Gaussian (5 min catchment)",
-    subtitle = "Capped at p98 · Reference: WHO threshold 9 m²/person"
+    subtitle = "Capped at p98"
   ) +
   theme_void()
 ```
 
 ### Sensitivity: Gaussian vs step-weights E2SFCA
 
-Both variants use the same UA2018 green layer and confluent-population denominator; they differ only in distance weighting (continuous Gaussian decay vs Luo & Qi 2009 step function: 1.0 / 0.68 / 0.22 for the 0–5 / 5–10 / 10–15 min bands). The Gaussian version is the MCDA criterion; the step-weights version is kept as a sensitivity check.
+Both variants use the same Urban Atlas 2021 green urban areas (106 patches), the same travel times and the same population (`pop_reallocated_nso`); they differ only in distance weighting (Gaussian decay with σ = 5 min, cut at 15 min, vs a step function with weights 1, 0.7 and 0.4 for the 0 to 5, 5 to 10 and 10 to 15 min bands). The Gaussian version is the MCDA criterion; the step-weights version is kept as a sensitivity check.
 
 ```{r green-sufficiency-step-comparison, fig.height=5}
 both_e2sfca <- malta %>%
@@ -449,12 +448,7 @@ both_e2sfca <- malta %>%
   filter(!is.na(green_m2_e2sfca_per_person_gauss),
          !is.na(green_m2_e2sfca_per_person))
 
-cat("=== WHO 9 m²/person ===\n")
-cat("Gaussian     — below 9:", sprintf("%.1f%%\n",
-    100 * mean(malta$green_m2_e2sfca_per_person_gauss < 9, na.rm = TRUE)))
-cat("Step weights — below 9:", sprintf("%.1f%%\n",
-    100 * mean(malta$green_m2_e2sfca_per_person < 9, na.rm = TRUE)))
-cat("\nSpearman rho (Gaussian vs step):",
+cat("Spearman rho (Gaussian vs step):",
     round(cor(both_e2sfca$green_m2_e2sfca_per_person_gauss,
               both_e2sfca$green_m2_e2sfca_per_person,
               method = "spearman"), 4), "\n")
@@ -466,12 +460,10 @@ ph_gauss <- ggplot(malta %>%
                             green_m2_e2sfca_per_person_gauss <= p98_suff),
                    aes(x = green_m2_e2sfca_per_person_gauss)) +
   geom_histogram(bins = 50, fill = "#3B1F5E", color = "white", linewidth = 0.2) +
-  geom_vline(xintercept = 9, linetype = "dashed", color = "#E63946") +
   labs(title = "Gaussian decay (MCDA)",
-       subtitle = sprintf("Median %.2f · p98 %.0f m²/person · %.1f%% below WHO",
+       subtitle = sprintf("Median %.2f · p98 %.0f m²/person",
                           median(malta$green_m2_e2sfca_per_person_gauss, na.rm = TRUE),
-                          p98_suff,
-                          100 * mean(malta$green_m2_e2sfca_per_person_gauss < 9, na.rm = TRUE)),
+                          p98_suff),
        x = "m²/person (capped at p98)", y = "Cells") +
   theme_minimal()
 
@@ -480,19 +472,17 @@ ph_step <- ggplot(malta %>%
                            green_m2_e2sfca_per_person <= p98_step),
                   aes(x = green_m2_e2sfca_per_person)) +
   geom_histogram(bins = 50, fill = "#2c7fb8", color = "white", linewidth = 0.2) +
-  geom_vline(xintercept = 9, linetype = "dashed", color = "#E63946") +
   labs(title = "Step weights — Luo & Qi 2009 (sensitivity)",
-       subtitle = sprintf("Median %.2f · p98 %.0f m²/person · %.1f%% below WHO",
+       subtitle = sprintf("Median %.2f · p98 %.0f m²/person",
                           median(malta$green_m2_e2sfca_per_person, na.rm = TRUE),
-                          p98_step,
-                          100 * mean(malta$green_m2_e2sfca_per_person < 9, na.rm = TRUE)),
+                          p98_step),
        x = "m²/person (capped at p98)", y = "Cells") +
   theme_minimal()
 
 ph_gauss + ph_step
 ```
 
-The two variants are nearly identical (Spearman ρ ≈ 0.98). The Gaussian version yields a slightly lower median (reflects more aggressive down-weighting of distant green) but the same substantive story: over 91% of Malta falls below the WHO 9 m²/person threshold under both metrics.
+The two variants are nearly identical (Spearman ρ ≈ 0.98). The Gaussian version yields a slightly lower median (reflects more aggressive down-weighting of distant green) but the same substantive story under both metrics.
 
 ## Accessibility and exposure summary
 
@@ -684,13 +674,16 @@ ggplot() +
 
 Over 75% of cells have zero street-tree cover, reflecting Malta's position as one of the most tree-poor countries in Europe. The p98 is 14.18%; cells above are natural parks and the golf course — land uses already captured by the accessibility variable. I cap at p98 to avoid those parks dominating the tree-cover indicator.
 
+<!-- TODO: update text (2026-11-19): the p98 of perc_tree is now computed from the data (11.70%), not 14.18%. -->
+
 ```{r tree-extremes}
+p98_tree <- quantile(malta$perc_tree, 0.98, na.rm = TRUE)
 ggplot() +
   geom_sf(data = malta, fill = "grey90", color = NA) +
-  geom_sf(data = malta %>% filter(perc_tree > 14.18),
+  geom_sf(data = malta %>% filter(perc_tree > p98_tree),
           aes(fill = perc_tree), color = NA) +
   scale_fill_viridis_c(option = "mako", direction = -1, name = "Tree\ncover (%)") +
-  labs(title = "Tree cover: cells above p98 (14.18%)") +
+  labs(title = sprintf("Tree cover: cells above p98 (%.2f%%)", p98_tree)) +
   theme_void()
 ```
 
@@ -759,7 +752,44 @@ run_cor(malta, vars_corr, "Spearman rank correlations: 10 MCDA indicators")
 
 The strongest correlation is **noise vs traffic** (r ≈ 0.55), consistent with traffic being the main source of urban noise — though each captures a distinct spatial dimension. All remaining pairs fall below |r| = 0.50, well under the |r| = 0.70 redundancy threshold.
 
+# Eligibility
+
+## Cells not eligible for greening (airport, port)
+
+Moved here from the Weighted Linear Combination section on 2026-11-19: the green per person
+bounds are computed on eligible cells, so the mask is needed before normalisation.
+
+Added 2026-11-05 (UT2026 poster). Under the available weight rule below, airport and port cells
+entered the top quintile, so cells whose majority Urban Atlas 2021 class is 12400 (airports) or
+12300 (port areas) get no score.
+
+```{r eligibility-mask}
+ua21 <- st_read(here::here("data/urban_atlas/Malta_UA21/CLMS_UA_LCU_S2021_V025ha_MT001L1_VALLETTA_03035_V01_R00_20241025.fgb"),
+                quiet = TRUE, wkt_filter = st_as_text(st_as_sfc(st_bbox(malta)))) %>%
+  select(code_2021) %>%
+  st_make_valid()
+ua_major <- st_intersection(malta %>% select(gid), ua21) %>%
+  mutate(a = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  group_by(gid) %>%
+  slice_max(a, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(gid, ua_code_2021 = code_2021)
+malta <- malta %>%
+  select(-any_of(c("ua_code_2021", "ua_not_eligible"))) %>%
+  left_join(ua_major, by = "gid") %>%
+  mutate(ua_not_eligible = ua_code_2021 %in% c("12400", "12300"))
+
+table(malta$ua_code_2021[malta$ua_not_eligible], useNA = "ifany")
+ggplot(malta) +
+  geom_sf(aes(fill = ua_not_eligible), colour = NA) +
+  scale_fill_manual(values = c(`FALSE` = "grey85", `TRUE` = "#c0392b"), name = "Airport or port") +
+  theme_void()
+```
+
 # Normalization
+
+<!-- TODO: update text (2026-11-19): green per person is now log10 with bounds from eligible populated cells and missing in unpopulated cells (see normalization chunk); the sentence below still says min-max for all. -->
 
 All variables are normalized to [0, 1] where 1 = highest priority for greening. I use min-max normalization. Several variables are capped at the 98th percentile to prevent extreme values from compressing the useful range.
 
@@ -775,6 +805,26 @@ normalize_minmax <- function(x, lower = NULL, upper = NULL) {
   x <- pmax(x, lower)
   (x - lower) / (upper - lower)
 }
+
+# Green per person (decided 2026-11-19; tests in mcda/Malta_green_pp_log_test.Rmd): log10 of
+# m2 per person, no offset; bounds = p2 and p98 of the log over eligible populated cells; zero
+# green per person = 1 (highest priority); missing in unpopulated cells (green per person is
+# undefined where nobody lives) and in unrouted cells. Inverted: less green = higher priority.
+# Population = study population (Total_Population = pop_reallocated_nso, see setup).
+norm_gpp_log <- function(x, populated, eligible) {
+  lx <- ifelse(!is.na(x) & x > 0, log10(x), NA_real_)
+  ref <- populated & eligible
+  lo <- quantile(lx[ref], 0.02, na.rm = TRUE)
+  hi <- quantile(lx[ref], 0.98, na.rm = TRUE)
+  out <- case_when(is.na(x) ~ NA_real_,
+                   x == 0   ~ 1,
+                   TRUE     ~ 1 - (pmin(pmax(lx, lo), hi) - lo) / (hi - lo))
+  out[!populated] <- NA_real_
+  attr(out, "bounds_m2") <- unname(10^c(lo, hi))
+  out
+}
+gpp_populated <- malta$Total_Population > 0
+gpp_eligible  <- !malta$ua_not_eligible
 
 malta <- malta %>%
   mutate(
@@ -810,28 +860,57 @@ malta <- malta %>%
                                 lower = min(no2_avg_21, na.rm = TRUE),
                                 upper = quantile(no2_avg_21, 0.98, na.rm = TRUE)),
 
-    # Inverted: more trees = less priority. Capped at p98 (14.18%);
-    # cells above are parks/golf, captured by accessibility variable.
-    norm_tree = 1 - normalize_minmax(perc_tree, lower = 0, upper = 14.18),
+    # Inverted: more trees = less priority. Capped at p98 of the current data (11.70% on
+    # 2026-11-19; spec 3.4, never hardcoded). Before, a hardcoded 14.18% from an earlier version.
+    # Cells above are parks/golf, captured by accessibility variable.
+    norm_tree = 1 - normalize_minmax(perc_tree, lower = 0,
+                                     upper = quantile(perc_tree, 0.98, na.rm = TRUE)),
 
-    # Capped at p98
+    # Capped at p98 of eligible cells (airport and port excluded; decided 2026-11-20)
     norm_green_time = normalize_minmax(nearest_green_min,
                                        lower = 0,
-                                       upper = quantile(nearest_green_min, 0.98, na.rm = TRUE)),
+                                       upper = quantile(nearest_green_min[!ua_not_eligible], 0.98,
+                                                        na.rm = TRUE)),
+    # Sensitivity: ATGreen's walking time (Valhalla), same normalisation
+    norm_green_time_atg = normalize_minmax(nearest_green_min_atg,
+                                           lower = 0,
+                                           upper = quantile(nearest_green_min_atg[!ua_not_eligible], 0.98,
+                                                            na.rm = TRUE)),
 
     # Cells within 300 m walking distance = minimum priority (WHO threshold)
     norm_dist_rec = normalize_minmax(walk_dist_m,
                                      lower = 300,
                                      upper = quantile(walk_dist_m, 0.98, na.rm = TRUE)),
 
-    # Inverted: less green per person = higher priority. Capped at p98.
-    # Since 2026-11-05 (UT2026 poster) NAs (unrouted cells) stay missing and are handled by the
-    # available weight rule (compute-wlc); before, they were set to 0 (lowest priority contribution).
-    norm_green_exp = 1 - normalize_minmax(green_m2_e2sfca_per_person_gauss,
-                                          lower = 0,
-                                          upper = quantile(green_m2_e2sfca_per_person_gauss,
-                                                           0.98, na.rm = TRUE))
+    # Green per person: log10 version (see norm_gpp_log above). NAs stay missing and are handled
+    # by the available weight rule (compute-wlc).
+    norm_green_exp = as.numeric(norm_gpp_log(green_m2_e2sfca_per_person_gauss,
+                                             gpp_populated, gpp_eligible)),
+
+    # Sensitivity (spec 3.3): the score's version until 2026-11-19, raw m2 per person, min max
+    # capped at p98 over all cells, unpopulated cells included.
+    norm_green_exp_minmax = 1 - normalize_minmax(green_m2_e2sfca_per_person_gauss,
+                                                 lower = 0,
+                                                 upper = quantile(green_m2_e2sfca_per_person_gauss,
+                                                                  0.98, na.rm = TRUE))
   )
+
+# Sanity checks for the new green per person normalisation
+gpp_bounds <- attr(norm_gpp_log(malta$green_m2_e2sfca_per_person_gauss, gpp_populated, gpp_eligible),
+                   "bounds_m2")
+cat("Green per person bounds (m2 per person, p2 and p98 of eligible populated cells):",
+    signif(gpp_bounds, 3), "\n")
+cat("norm_green_exp: populated cells", sum(gpp_populated), "| with a value",
+    sum(!is.na(malta$norm_green_exp)), "| zero green per person (= 1)",
+    sum(malta$green_m2_e2sfca_per_person_gauss == 0 & gpp_populated, na.rm = TRUE), "\n")
+stopifnot(all(is.na(malta$norm_green_exp[!gpp_populated])))
+summary(malta$norm_green_exp)
+hist(malta$norm_green_exp, breaks = 50, main = "norm_green_exp (log10, populated cells)", xlab = "")
+ggplot(malta) +
+  geom_sf(aes(fill = norm_green_exp), colour = NA) +
+  scale_fill_viridis_c(option = "magma", direction = -1, na.value = "grey90",
+                       name = "norm_green_exp\n(grey = unpopulated\nor unrouted)") +
+  theme_void()
 
 norm_vars <- c("norm_lst", "norm_imd", "norm_dist_bs", "norm_Lden",
                "norm_traffic", "norm_no2", "norm_tree", "norm_green_time",
@@ -1019,36 +1098,6 @@ tibble(variable   = names(weights),
 ```
 
 # Weighted Linear Combination
-
-## Cells not eligible for greening (airport, port)
-
-Added 2026-11-05 (UT2026 poster). Under the available weight rule below, airport and port cells
-entered the top quintile, so cells whose majority Urban Atlas 2021 class is 12400 (airports) or
-12300 (port areas) get no score.
-
-```{r eligibility-mask}
-ua21 <- st_read(here::here("data/urban_atlas/Malta_UA21/CLMS_UA_LCU_S2021_V025ha_MT001L1_VALLETTA_03035_V01_R00_20241025.fgb"),
-                quiet = TRUE, wkt_filter = st_as_text(st_as_sfc(st_bbox(malta)))) %>%
-  select(code_2021) %>%
-  st_make_valid()
-ua_major <- st_intersection(malta %>% select(gid), ua21) %>%
-  mutate(a = as.numeric(st_area(.))) %>%
-  st_drop_geometry() %>%
-  group_by(gid) %>%
-  slice_max(a, n = 1, with_ties = FALSE) %>%
-  ungroup() %>%
-  select(gid, ua_code_2021 = code_2021)
-malta <- malta %>%
-  select(-any_of(c("ua_code_2021", "ua_not_eligible"))) %>%
-  left_join(ua_major, by = "gid") %>%
-  mutate(ua_not_eligible = ua_code_2021 %in% c("12400", "12300"))
-
-table(malta$ua_code_2021[malta$ua_not_eligible], useNA = "ifany")
-ggplot(malta) +
-  geom_sf(aes(fill = ua_not_eligible), colour = NA) +
-  scale_fill_manual(values = c(`FALSE` = "grey85", `TRUE` = "#c0392b"), name = "Airport or port") +
-  theme_void()
-```
 
 ## Computing priority scores
 
@@ -1401,11 +1450,9 @@ Replacing the Gaussian decay with the Luo & Qi (2009) step-weights E2SFCA for th
 ```{r green-exp-step-sensitivity}
 malta <- malta %>%
   mutate(
-    # NAs stay missing (available weight rule), as for norm_green_exp
-    norm_green_exp_step = 1 - normalize_minmax(green_m2_e2sfca_per_person,
-                                               lower = 0,
-                                               upper = quantile(green_m2_e2sfca_per_person,
-                                                                0.98, na.rm = TRUE))
+    # Same normalisation as the main norm_green_exp (log10, since 2026-11-19); only the kernel changes
+    norm_green_exp_step = as.numeric(norm_gpp_log(green_m2_e2sfca_per_person,
+                                                  gpp_populated, gpp_eligible))
   )
 
 malta <- malta %>%
@@ -1449,10 +1496,9 @@ ATGreen's own Gaussian E2SFCA (R. Schifanella, run 2026-06-01: GHSL 2020 populat
 ```{r green-exp-atgreen-sensitivity}
 malta <- malta %>%
   mutate(
-    norm_green_exp_atg = 1 - normalize_minmax(green_m2_e2sfca_per_person_gauss_atg,
-                                              lower = 0,
-                                              upper = quantile(green_m2_e2sfca_per_person_gauss_atg,
-                                                               0.98, na.rm = TRUE)),
+    # Same normalisation as the main norm_green_exp (log10, since 2026-11-19); only the input changes
+    norm_green_exp_atg = as.numeric(norm_gpp_log(green_m2_e2sfca_per_person_gauss_atg,
+                                                 gpp_populated, gpp_eligible)),
     priority_atg_exp = wlc_avail(malta %>% mutate(norm_green_exp = norm_green_exp_atg), weights)
   )
 
@@ -1486,6 +1532,145 @@ ggplot(malta) +
 ```
 
 The two priority surfaces are nearly indistinguishable, confirming that the choice of distance-decay function for the green sufficiency criterion does not materially affect the MCDA outcome.
+
+## Green sufficiency: min max normalisation (sensitivity, added 2026-11-19)
+
+The score's normalisation of green per person until 2026-11-19 (raw m² per person, min max capped at
+p98 over all cells, unpopulated cells included; spec 3.3). All other variables and weights are unchanged.
+
+```{r green-exp-minmax-sensitivity}
+malta <- malta %>%
+  mutate(priority_gpp_minmax = wlc_avail(malta %>% mutate(norm_green_exp = norm_green_exp_minmax),
+                                         weights))
+
+summary(malta$norm_green_exp_minmax)
+class_minmax <- cut(malta$priority_gpp_minmax, breaks = q_breaks, labels = 1:5, include.lowest = TRUE)
+q_main_mm  <- dplyr::ntile(malta$priority_citizen, 5)
+q_minmax   <- dplyr::ntile(malta$priority_gpp_minmax, 5)
+
+tibble(
+  check = c("Spearman r, priority (main vs min max)",
+            "Main top quintile also top with min max (%)",
+            "Cells scored, main / min max"),
+  value = c(round(cor(malta$priority_citizen, malta$priority_gpp_minmax,
+                      method = "spearman", use = "complete.obs"), 3),
+            round(100 * mean(q_minmax[q_main_mm == 5] == 5, na.rm = TRUE), 1),
+            paste(sum(!is.na(malta$priority_citizen)), "/", sum(!is.na(malta$priority_gpp_minmax))))
+) %>%
+  kable(caption = "Main (log10 green per person) vs min max green per person") %>%
+  kable_styling(full_width = FALSE)
+```
+
+## Sensitivity: ATGreen walking time and walking speed 4 km/h
+
+`priority_atg_walk`: walking time from ATGreen (Valhalla) instead of our routing (2026-11-20).
+The "without green per person" check is replaced by the leave one out analysis below (2026-11-20).
+
+```{r walk-atg-and-4kmh-sensitivity}
+malta <- malta %>%
+  mutate(priority_atg_walk = wlc_avail(malta %>% mutate(norm_green_time = norm_green_time_atg), weights))
+
+# Sensitivity, walking speed 4 km/h instead of 5 (spec 5.3). Walking time scales by 5/4, so its
+# normalised value is unchanged (min max with a p98 cap is scale invariant); green per person changes
+# because the Gaussian kernel (sigma 5 min) and the 15 min cutoff stay fixed in minutes.
+malta <- malta %>%
+  mutate(norm_green_time_4kmh = normalize_minmax(nearest_green_min * 5 / 4, lower = 0,
+                                                 upper = quantile((nearest_green_min * 5 / 4)[!ua_not_eligible],
+                                                                  0.98, na.rm = TRUE)),
+         norm_green_exp_4kmh = as.numeric(norm_gpp_log(green_m2_e2sfca_per_person_gauss_4kmh,
+                                                       gpp_populated, gpp_eligible)))
+cat("4 km/h: max abs change in norm_green_time:",
+    signif(max(abs(malta$norm_green_time_4kmh - malta$norm_green_time), na.rm = TRUE), 3),
+    "| Spearman green per person 4 vs 5 km/h:",
+    round(cor(malta$green_m2_e2sfca_per_person_gauss_4kmh, malta$green_m2_e2sfca_per_person_gauss,
+              method = "spearman", use = "complete.obs"), 3), "\n")
+summary(malta$green_m2_e2sfca_per_person_gauss_4kmh)
+hist(log10(malta$green_m2_e2sfca_per_person_gauss_4kmh[malta$green_m2_e2sfca_per_person_gauss_4kmh > 0]),
+     breaks = 50, main = "Green per person at 4 km/h (log10 m2, > 0)", xlab = "")
+malta <- malta %>%
+  mutate(priority_4kmh = wlc_avail(malta %>% mutate(norm_green_time = norm_green_time_4kmh,
+                                                    norm_green_exp = norm_green_exp_4kmh), weights))
+
+cmp_main <- function(x) {
+  ok <- !is.na(malta$priority_citizen) & !is.na(x)
+  q_m <- dplyr::ntile(malta$priority_citizen[ok], 5); q_x <- dplyr::ntile(x[ok], 5)
+  c(spearman = round(cor(malta$priority_citizen[ok], x[ok], method = "spearman"), 3),
+    top_quintile_retained_pct = round(100 * mean(q_x[q_m == 5] == 5), 1),
+    cells_changing_quintile_pct = round(100 * mean(q_x != q_m), 1),
+    cells = sum(ok))
+}
+bind_rows(`ATGreen walking time` = cmp_main(malta$priority_atg_walk),
+          `Walking speed 4 km/h` = cmp_main(malta$priority_4kmh), .id = "variant") %>%
+  kable(caption = "Main score vs sensitivity variants (cells scored in both)") %>%
+  kable_styling(full_width = FALSE)
+```
+
+## Leave one out
+
+Each criterion dropped in turn, the other citizen weights rescaled to sum to 1, same cells and available
+weight rule (spec 5.3; added 2026-11-20, replaces the "without green per person" check).
+
+```{r leave-one-out}
+sens_cmp <- function(x, ref = malta$priority_citizen) {
+  ok <- !is.na(ref) & !is.na(x)
+  q_r <- dplyr::ntile(ref[ok], 5); q_x <- dplyr::ntile(x[ok], 5)
+  tibble(spearman = cor(ref[ok], x[ok], method = "spearman"),
+         top_quintile_retained_pct = 100 * mean(q_x[q_r == 5] == 5),
+         cells_changing_quintile_pct = 100 * mean(q_x != q_r),
+         cells = sum(ok))
+}
+crit_label <- c(norm_lst = "Urban heat", norm_imd = "Grey infrastructure", norm_dist_bs = "Blue space",
+                norm_Lden = "Noise", norm_traffic = "Traffic", norm_no2 = "Air quality",
+                norm_tree = "Street greenery", norm_green_time = "Green proximity",
+                norm_dist_rec = "Recreation", norm_green_exp = "Green per person")
+loo_m <- map_dfr(names(weights), function(v) {
+  w <- weights[names(weights) != v]
+  sens_cmp(wlc_avail(malta, w / sum(w))) %>%
+    mutate(criterion_dropped = crit_label[v], citizen_weight_pct = 100 * weights[[v]], .before = 1)
+})
+loo_m %>% mutate(across(where(is.double), ~ round(., 3))) %>%
+  kable(caption = "Leave one out: main score vs score without each criterion") %>%
+  kable_styling(full_width = FALSE)
+summary(loo_m$spearman)
+ggplot(loo_m, aes(reorder(criterion_dropped, spearman), spearman)) + geom_col(fill = "grey50") +
+  coord_flip() + labs(x = NULL, y = "Spearman vs main score") + theme_minimal()
+```
+
+## Sensitivity summary (Table S6)
+
+All variants against the main score on the cells scored in both: Spearman, top quintile retained,
+cells changing quintile (spec 5.1 and 5.2). Saved to `data/malta/malta_sensitivity.rds` for
+`Tables_MCDA.Rmd`. The +/-20% rows are recomputed here with Spearman; the section above reports
+Pearson and all-class agreement.
+
+```{r sensitivity-summary}
+pert_m <- map_dfr(names(weights), function(v) map_dfr(c(-0.2, 0.2), function(delta) {
+  w <- weights; w[v] <- weights[v] * (1 + delta)
+  o <- setdiff(names(weights), v); w[o] <- weights[o] / sum(weights[o]) * (1 - w[v])
+  sens_cmp(wlc_avail(malta, w))
+}))
+fmt_r <- function(x) sprintf("%.3f", x); fmt_p <- function(x) sprintf("%.1f%%", x)
+rng <- function(x, f) paste(f(min(x)), "to", f(max(x)))
+row_of <- function(name, x) { r <- sens_cmp(x)
+  tibble(test_name = name, spearman_r = fmt_r(r$spearman), class_agreement = fmt_p(r$top_quintile_retained_pct),
+         cells_changing_quintile = fmt_p(r$cells_changing_quintile_pct)) }
+malta_sensitivity <- bind_rows(
+  row_of("Citizen vs equal weights", malta$priority_equal),
+  tibble(test_name = "Each weight +/-20% (range)", spearman_r = rng(pert_m$spearman, fmt_r),
+         class_agreement = rng(pert_m$top_quintile_retained_pct, fmt_p),
+         cells_changing_quintile = rng(pert_m$cells_changing_quintile_pct, fmt_p)),
+  loo_m %>% transmute(test_name = paste("Without", tolower(criterion_dropped)), spearman_r = fmt_r(spearman),
+                      class_agreement = fmt_p(top_quintile_retained_pct),
+                      cells_changing_quintile = fmt_p(cells_changing_quintile_pct)),
+  row_of("Traffic: log continuous instead of categorical", malta_b$priority_citizen_b),
+  row_of("Green per person: step weights E2SFCA", malta$priority_step_exp),
+  row_of("Green per person: ATGreen E2SFCA", malta$priority_atg_exp),
+  row_of("Green per person: min max instead of log", malta$priority_gpp_minmax),
+  row_of("Walking time: ATGreen (Valhalla)", malta$priority_atg_walk),
+  row_of("Walking speed 4 km/h", malta$priority_4kmh))
+malta_sensitivity %>% kable(caption = "Sensitivity summary, Malta") %>% kable_styling(full_width = FALSE)
+saveRDS(malta_sensitivity, file.path(data_dir, "malta_sensitivity.rds"))
+```
 
 # Save processed data
 

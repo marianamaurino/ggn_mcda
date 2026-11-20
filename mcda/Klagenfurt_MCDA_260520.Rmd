@@ -47,28 +47,28 @@ cat("Columns:", ncol(klagenfurt), "| Rows:", nrow(klagenfurt), "\n")
 
 ## 1.1 Join Accessibility Metrics
 
-Walking time to nearest green space comes from a network analysis on the street grid.
-The green space definition is still preliminary (class: urban green areas public access, forests, herbaceous vegetation and wetlands from Urban Atlas 2021) and will be revised with
-a more conservative classification. Cells without population (airports, large parks, etc.)
-are excluded from the network analysis — they don't need a priority score anyway.
+Walking time to the nearest Urban Atlas 2021 green space (classes 14110, 14130, 31000 and 40000, at least 500 m², as in Malta; class 32000, herbaceous vegetation, excluded), computed for this study (`mcda/klagenfurt_e2sfca_newpop.R`, since 2026-11-20): OpenStreetMap walking network (pedestrian filter in `mcda/walk_filter.R`), shortest paths at 5 km/h, network origin points every 50 m. A cell takes the mean time over the origin points inside it; cells without a point take the nearest point within 200 m plus the straight line walk to it, and cells with no point within 200 m have no value. An origin point inside a green patch has time 0, and a cell assigned to such a point gets 0. ATGreen's walking time (OSRM routing, including class 32000) is kept as a sensitivity analysis (`nearest_green_min_atg`, `priority_atg_walk`).
 
 ```{r join-accessibility}
-access <- read_parquet(
+access <- read_csv(
+  here::here("data/klagenfurt/accessibility_klagenfurt/own_routing/e2sfca_own_routing_cells.csv"),
+  show_col_types = FALSE
+) %>%
+  transmute(unit_id = as.character(gid), nearest_green_min = own_nearest_min)
+access_atg <- read_parquet(
   here::here("output/accessibility/outputs-accesibility/klagenfurt/new/klagenfurt_nearest_ua2021/results/final_metrics.parquet")
-)
-
-access <- access %>%
-  mutate(
-    unit_id          = as.character(unit_id),
-    nearest_green_min = nearest_green_sec / 60
-  )
+) %>%
+  as.data.frame() %>%
+  transmute(unit_id = as.character(unit_id), nearest_green_min_atg = nearest_green_sec / 60)
 
 klagenfurt$ID <- as.character(klagenfurt$ID)
 
 klagenfurt <- klagenfurt %>%
-  left_join(access %>% select(unit_id, nearest_green_min),
-            by = c("ID" = "unit_id"),
-            suffix = c("_old", ""))
+  left_join(access, by = c("ID" = "unit_id"), suffix = c("_old", "")) %>%
+  left_join(access_atg, by = c("ID" = "unit_id"))
+cat("Spearman, own routing vs ATGreen walking time:",
+    round(cor(klagenfurt$nearest_green_min, klagenfurt$nearest_green_min_atg, method = "spearman",
+              use = "complete.obs"), 3), "\n")
 
 cat("Accessibility matched:", sum(!is.na(klagenfurt$nearest_green_min)),
     "out of", nrow(klagenfurt), "\n")
@@ -234,6 +234,10 @@ klagenfurt <- klagenfurt %>%
     ses %>% st_drop_geometry() %>% select(ID, income, income_weighted),
     by = "ID"
   )
+
+# One row per cell (spec 1.1): the master grid and the income file had 101 repeated cells, which
+# this join multiplied to 12,751 rows; removed at source by mcda/klagenfurt_dedup_inputs.R (2026-11-19)
+stopifnot(nrow(klagenfurt) == 12418, n_distinct(klagenfurt$ID) == 12418)
 
 cat("Income matched:", sum(!is.na(klagenfurt$income)), "out of", nrow(klagenfurt), "\n")
 cat("Income_weighted matched:", sum(!is.na(klagenfurt$income_weighted)), "out of", nrow(klagenfurt), "\n")
@@ -549,6 +553,9 @@ Normalization strategy per variable (decided after examining the distributions a
 | NO2 | log + min-max, capped at p98 | Right-skewed, log compresses the tail and spreads the bulk. |
 | PM2.5 | min-max, capped at p98 | Narrow range (7.5–16 µg/m³), near-normal. |
 | Time to green | Categorical (0–5, 5–10, 10–15, >15 min) | Extremely right-skewed (most cells < 5 min). The health-relevant distinction is between "easily walkable" and "not". |
+<!-- TODO: update text (2026-11-19): walking time to green is now continuous, min-max capped at p98 (spec 3.4), as in Malta. -->
+<!-- TODO: update text: the traffic row says <=50 = 0, the code cuts at 7. -->
+
 | Traffic | Categorical (≤50 = 0, 50–564 = 0.5, >564 = 1) | 90% zero-inflated. Only 10% of cells have major road data. Bimodal among non-zero cells. |
 
 Traffic sensitivity analysis: log of values capped at p98 (continuous alternative).
@@ -587,15 +594,16 @@ klagenfurt <- klagenfurt %>%
                                  upper = quantile(pm25_final, 0.98, na.rm = TRUE)),
 
     # ── Accessibility: time to green space ────────────────────
-    # Missing walking time stays missing (available weight rule, 2026-11-05); before, it fell
-    # through to the last branch and scored 1.00
-    norm_green_time = case_when(
-      is.na(nearest_green_min) ~ NA_real_,
-      nearest_green_min <= 5  ~ 0.00,
-      nearest_green_min <= 10 ~ 0.33,
-      nearest_green_min <= 15 ~ 0.67,
-      TRUE                    ~ 1.00
-    ),
+    # Continuous, min-max capped at p98, as in Malta (spec 3.4, decided 2026-11-19); before, 4
+    # classes (0-5, 5-10, 10-15, >15 min). Missing walking time stays missing (available weight rule)
+    # p98 over eligible cells: in Klagenfurt every cell is eligible (no airport or port, spec 1.3)
+    norm_green_time = normalize_minmax(nearest_green_min,
+                                       lower = 0,
+                                       upper = quantile(nearest_green_min, 0.98, na.rm = TRUE)),
+    # Sensitivity: ATGreen's walking time (OSRM, including class 32000), same normalisation
+    norm_green_time_atg = normalize_minmax(nearest_green_min_atg,
+                                           lower = 0,
+                                           upper = quantile(nearest_green_min_atg, 0.98, na.rm = TRUE)),
 
     # ── Traffic: MAIN (categorical) ───────────────────────────
     norm_traffic_cat = case_when(
@@ -673,7 +681,7 @@ norm_labels <- c(
   norm_dist_bs      = "Dist. Blue Space (min-max, p98)",
   norm_no2          = "NO2 (log, p98)",
   norm_pm25         = "PM2.5 (min-max, p98)",
-  norm_green_time   = "Time to Green (categorical)",
+  norm_green_time   = "Time to Green (min-max, p98)",
   norm_traffic_cat  = "Traffic (categorical)",
   norm_traffic_log  = "Traffic (log capped p98)",
   norm_income_weighted = "Income (spatially weighted, min-max, p2–p98)",
@@ -1440,6 +1448,41 @@ cat("Correlation weighted vs raw income:", round(r_income_k, 3), "\n")
 cat("Top-quintile class agreement:", agree_income_k, "%\n")
 ```
 
+## Walking time: ATGreen instead of our routing
+
+`priority_atg_walk`: walking time from ATGreen (OSRM, green classes including 32000) instead of our
+routing (2026-11-20).
+
+```{r walk-atg-sensitivity}
+klagenfurt <- klagenfurt %>%
+  mutate(priority_atg_walk = wlc_avail(klagenfurt %>% mutate(norm_green_time = norm_green_time_atg), weights))
+ok_w <- !is.na(klagenfurt$priority_citizen) & !is.na(klagenfurt$priority_atg_walk)
+r_atg_walk_k <- cor(klagenfurt$priority_citizen[ok_w], klagenfurt$priority_atg_walk[ok_w], method = "spearman")
+q_base_w <- dplyr::ntile(klagenfurt$priority_citizen[ok_w], 5)
+q_atg_w  <- dplyr::ntile(klagenfurt$priority_atg_walk[ok_w], 5)
+agree_atg_walk_k <- round(100 * mean(q_atg_w[q_base_w == 5] == 5), 1)
+cat("Spearman main vs ATGreen walking time:", round(r_atg_walk_k, 3), "| top quintile retained:",
+    agree_atg_walk_k, "% | cells changing quintile:", round(100 * mean(q_atg_w != q_base_w), 1), "%\n")
+summary(klagenfurt$priority_atg_walk)
+
+# Sensitivity, walking speed 4 km/h instead of 5 (spec 5.3). Walking time is the only criterion that
+# depends on speed; it scales by 5/4, and min max with a p98 cap is scale invariant, so the score
+# should not change (checked here rather than assumed).
+klagenfurt <- klagenfurt %>%
+  mutate(norm_green_time_4kmh = normalize_minmax(nearest_green_min * 5 / 4, lower = 0,
+                                                 upper = quantile(nearest_green_min * 5 / 4, 0.98, na.rm = TRUE)))
+summary(klagenfurt$norm_green_time_4kmh)
+hist(klagenfurt$norm_green_time_4kmh, breaks = 50, main = "norm_green_time at 4 km/h", xlab = "")
+klagenfurt <- klagenfurt %>%
+  mutate(priority_4kmh = wlc_avail(klagenfurt %>% mutate(norm_green_time = norm_green_time_4kmh), weights))
+ok_s <- !is.na(klagenfurt$priority_citizen) & !is.na(klagenfurt$priority_4kmh)
+r_4kmh_k <- cor(klagenfurt$priority_citizen[ok_s], klagenfurt$priority_4kmh[ok_s], method = "spearman")
+q_4kmh <- dplyr::ntile(klagenfurt$priority_4kmh[ok_s], 5); q_base_s <- dplyr::ntile(klagenfurt$priority_citizen[ok_s], 5)
+agree_4kmh_k <- round(100 * mean(q_4kmh[q_base_s == 5] == 5), 1)
+cat("4 km/h: max abs score change", signif(max(abs(klagenfurt$priority_4kmh - klagenfurt$priority_citizen), na.rm = TRUE), 3),
+    "| Spearman", round(r_4kmh_k, 3), "| top quintile retained", agree_4kmh_k, "%\n")
+```
+
 ## Sensitivity summary
 
 ```{r sensitivity-summary-k}
@@ -1450,7 +1493,9 @@ tibble(
     "§8.2 WLC without traffic (6 criteria)",
     "§8.3 Traffic: categorical vs log normalization",
     "§8.4 Citizen vs equal weights",
-    "§8.5 Income: spatially-weighted vs raw"
+    "§8.5 Income: spatially-weighted vs raw",
+    "Walking time: ATGreen (OSRM) instead of own routing",
+    "Walking speed 4 km/h"
   ),
   `Spearman r` = c(
     round(min(sensitivity_results$spearman_r), 3),
@@ -1458,7 +1503,9 @@ tibble(
     round(r_no_traffic_k, 3),
     round(r_traffic_k, 3),
     round(r_equal_k, 3),
-    round(r_income_k, 3)
+    round(r_income_k, 3),
+    round(r_atg_walk_k, 3),
+    round(r_4kmh_k, 3)
   ),
   `Top-quintile overlap (%)` = c(
     round(min(sensitivity_results$top_q_overlap), 1),
@@ -1466,7 +1513,9 @@ tibble(
     agree_no_traffic_k,
     agree_traffic_k,
     agree_equal_k,
-    agree_income_k
+    agree_income_k,
+    agree_atg_walk_k,
+    agree_4kmh_k
   )
 ) %>%
   kable(caption = paste0(
@@ -1476,6 +1525,73 @@ tibble(
   )) %>%
   kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
                 full_width = FALSE)
+```
+
+
+## Leave one out
+
+Each criterion dropped in turn (air quality drops NO2 and PM2.5 together), the other citizen weights
+rescaled to sum to 1, same cells and available weight rule (spec 5.3; added 2026-11-20).
+
+```{r leave-one-out-k}
+sens_cmp <- function(x, ref = klagenfurt$priority_citizen) {
+  ok <- !is.na(ref) & !is.na(x)
+  q_r <- dplyr::ntile(ref[ok], 5); q_x <- dplyr::ntile(x[ok], 5)
+  tibble(spearman = cor(ref[ok], x[ok], method = "spearman"),
+         top_quintile_retained_pct = 100 * mean(q_x[q_r == 5] == 5),
+         cells_changing_quintile_pct = 100 * mean(q_x != q_r),
+         cells = sum(ok))
+}
+crit_groups <- list(`Urban heat` = "norm_lst", `Blue space` = "norm_dist_bs",
+                    `Air quality` = c("norm_no2", "norm_pm25"), `Green proximity` = "norm_green_time",
+                    Traffic = "norm_traffic_cat", `Low income` = "norm_income_weighted")
+stopifnot(setequal(unlist(crit_groups), names(weights)))
+loo_k <- map_dfr(names(crit_groups), function(g) {
+  w <- weights[!names(weights) %in% crit_groups[[g]]]
+  sens_cmp(wlc_avail(klagenfurt, w / sum(w))) %>%
+    mutate(criterion_dropped = g, citizen_weight_pct = 100 * sum(weights[crit_groups[[g]]]), .before = 1)
+})
+loo_k %>% mutate(across(where(is.double), ~ round(., 3))) %>%
+  kable(caption = "Leave one out: main score vs score without each criterion") %>%
+  kable_styling(full_width = FALSE)
+summary(loo_k$spearman)
+ggplot(loo_k, aes(reorder(criterion_dropped, spearman), spearman)) + geom_col(fill = "grey50") +
+  coord_flip() + labs(x = NULL, y = "Spearman vs main score") + theme_minimal()
+```
+
+## Sensitivity summary for Table S6
+
+All variants against the main score on the cells scored in both: Spearman, top quintile retained,
+cells changing quintile (spec 5.1 and 5.2). Saved to `data/klagenfurt/klag_sensitivity.rds` for
+`Tables_MCDA.Rmd`. The +/-20% rows are recomputed here with Spearman and top quintile retained.
+Note: `priority_equal` gives each of the 7 indicators 1/7 (air quality 2/7), not 1/6 per criterion as
+in spec 2.3 (flagged 2026-11-20, not changed).
+
+```{r sensitivity-summary-s6-k}
+pert_k <- map_dfr(names(weights), function(v) map_dfr(c(-0.2, 0.2), function(delta) {
+  w <- weights; w[v] <- weights[v] * (1 + delta)
+  o <- setdiff(names(weights), v); w[o] <- weights[o] / sum(weights[o]) * (1 - w[v])
+  sens_cmp(wlc_avail(klagenfurt, w))
+}))
+fmt_r <- function(x) sprintf("%.3f", x); fmt_p <- function(x) sprintf("%.1f%%", x)
+rng <- function(x, f) paste(f(min(x)), "to", f(max(x)))
+row_of <- function(name, x) { r <- sens_cmp(x)
+  tibble(test_name = name, spearman_r = fmt_r(r$spearman), class_agreement = fmt_p(r$top_quintile_retained_pct),
+         cells_changing_quintile = fmt_p(r$cells_changing_quintile_pct)) }
+klag_sensitivity <- bind_rows(
+  row_of("Citizen vs equal weights", klagenfurt$priority_equal),
+  tibble(test_name = "Each weight +/-20% (range)", spearman_r = rng(pert_k$spearman, fmt_r),
+         class_agreement = rng(pert_k$top_quintile_retained_pct, fmt_p),
+         cells_changing_quintile = rng(pert_k$cells_changing_quintile_pct, fmt_p)),
+  loo_k %>% transmute(test_name = paste("Without", tolower(criterion_dropped)), spearman_r = fmt_r(spearman),
+                      class_agreement = fmt_p(top_quintile_retained_pct),
+                      cells_changing_quintile = fmt_p(cells_changing_quintile_pct)),
+  row_of("Traffic: log continuous instead of categorical", klagenfurt_b$priority_traffic_log),
+  row_of("Income: raw instead of spatially weighted", klagenfurt_inc$priority_income_raw),
+  row_of("Walking time: ATGreen (OSRM)", klagenfurt$priority_atg_walk),
+  row_of("Walking speed 4 km/h", klagenfurt$priority_4kmh))
+klag_sensitivity %>% kable(caption = "Sensitivity summary, Klagenfurt") %>% kable_styling(full_width = FALSE)
+saveRDS(klag_sensitivity, file.path(data_dir, "klag_sensitivity.rds"))
 ```
 
 # 9. Save Outputs

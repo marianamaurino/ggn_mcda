@@ -1,0 +1,398 @@
+---
+title: "Green per person (Malta): does a log transformation suit it?"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    code_folding: show
+---
+
+Follows `mcda/MCDA_paper_results_spec.md`: p98 computed from the data, missing stays missing,
+available weight rule (80%), quintiles within city, Spearman only. Reads the saved Malta score
+(`data/malta/malta_mcda_processed_realloc_pre_gpp_log.rds`, the score before the log change); nothing is written back. Green per person is the
+E2SFCA computed for this study (`green_m2_e2sfca_per_person_gauss`, spec 3.3).
+
+Three normalisations of green per person are compared (1 = highest priority = least green):
+
+- **current**: min-max capped at p98, as in the score;
+- **log**: log(x + c), min-max capped at the p98 of the log values, c = smallest non zero value;
+- **rank**: 1 - percentile rank.
+
+```{r setup, message=FALSE}
+library(dplyr)
+library(ggplot2)
+library(sf)
+library(e1071)   # skewness()
+
+# The score as it was before the log change (2026-11-19); the main file now holds the log version
+malta <- readRDS(here::here("data/malta/malta_mcda_processed_realloc_pre_gpp_log.rds"))
+cat("Cells:", nrow(malta), "| distinct gid:", n_distinct(malta$gid), "\n")
+stopifnot(nrow(malta) == 10657, n_distinct(malta$gid) == 10657)
+```
+
+# 0. Settings
+
+Airport and port cells (not eligible, spec 1.3) are removed. Column names are those of
+`Malta_MCDA_260702_realloc.Rmd`. Weights are not typed in: they are recovered from the saved score
+(on complete cells the score is exactly sum(w_i * s_i)) and compared with the citizen weights.
+
+```{r settings}
+dat_sf <- malta %>% filter(!ua_not_eligible)
+dat    <- st_drop_geometry(dat_sf)
+cat("Eligible cells:", nrow(dat), "| not eligible removed:", sum(malta$ua_not_eligible), "\n")
+
+gpp_col   <- "green_m2_e2sfca_per_person_gauss"   # m2 per person, raw, not normalised
+norm_cols <- c(lst = "norm_lst", no2 = "norm_no2", traffic = "norm_traffic",
+               green_time = "norm_green_time", blue = "norm_dist_bs",
+               tree = "norm_tree", imd = "norm_imd", gpp = "norm_green_exp",
+               noise = "norm_Lden", recreation = "norm_dist_rec")
+
+cc  <- dat[complete.cases(dat[, c(norm_cols, "priority_citizen")]), ]
+fit <- lm(reformulate(unname(norm_cols), "priority_citizen", intercept = FALSE), data = cc)
+weights <- setNames(unname(coef(fit)), names(norm_cols))
+cat("Max |residual| of the weight recovery:", signif(max(abs(resid(fit))), 2), "\n")
+stopifnot(max(abs(resid(fit))) < 1e-9, abs(sum(weights) - 1) < 1e-9)
+knitr::kable(tibble(criterion = names(weights), column = unname(norm_cols),
+                    weight_pct = round(100 * weights, 1)))
+
+x <- dat[[gpp_col]]
+```
+
+# 1. Shape in numbers
+
+```{r shape}
+nz <- x[!is.na(x) & x > 0]
+desc <- tibble(
+  n           = sum(!is.na(x)),
+  missing     = sum(is.na(x)),
+  zeros_pct   = 100 * mean(x == 0, na.rm = TRUE),
+  skew_raw    = skewness(x, na.rm = TRUE),
+  median      = median(x, na.rm = TRUE),
+  p75         = quantile(x, .75, na.rm = TRUE),
+  p98         = quantile(x, .98, na.rm = TRUE),
+  max         = max(x, na.rm = TRUE),
+  min_nonzero = min(nz)
+)
+knitr::kable(desc, digits = 3)
+summary(x)
+
+ggplot(tibble(x = x), aes(x)) + geom_histogram(bins = 60) +
+  labs(x = "Green space per person (m²)", y = "Cells", title = "Raw scale") +
+  theme_minimal()
+```
+
+## Populated and unpopulated cells
+
+Population is the study population (`pop_reallocated_nso`, spec 1.2), joined by gid.
+
+```{r shape-populated}
+pop_nso <- st_read(here::here("data/malta/Population_Malta_reallocated_nso.gpkg"), quiet = TRUE) %>%
+  st_drop_geometry() %>%
+  transmute(gid = as.character(gid), pop_reallocated_nso)
+
+plot_dat <- dat %>%
+  mutate(gid = as.character(gid)) %>%
+  left_join(pop_nso, by = "gid") %>%
+  mutate(populated = if_else(pop_reallocated_nso > 0, "Populated", "Unpopulated"),
+         x = .data[[gpp_col]])
+stopifnot(nrow(plot_dat) == nrow(dat), !anyNA(plot_dat$pop_reallocated_nso))
+
+plot_dat %>%
+  group_by(populated) %>%
+  summarise(cells = n(), n = sum(!is.na(x)), missing = sum(is.na(x)),
+            zeros_pct = 100 * mean(x == 0, na.rm = TRUE),
+            median = median(x, na.rm = TRUE), p98 = quantile(x, .98, na.rm = TRUE)) %>%
+  knitr::kable(digits = 2)
+
+ggplot(filter(plot_dat, !is.na(x), x > 0), aes(x)) +
+  geom_histogram(bins = 60) +
+  scale_x_log10(labels = scales::label_number(big.mark = ",", drop0trailing = TRUE)) +
+  facet_wrap(~ populated, ncol = 1, scales = "free_y") +
+  labs(x = "Green space per person (m², log axis, zeros excluded)", y = "Cells") +
+  theme_minimal()
+```
+
+# 2. Does the log fix the shape?
+
+Populated cells, no offset.
+
+```{r log-shape-populated}
+pop    <- plot_dat$pop_reallocated_nso > 0   # same rows and order as dat (checked in section 1)
+stopifnot(identical(as.character(plot_dat$gid), as.character(dat$gid)))
+x_pop  <- x[pop & !is.na(x)]
+lx_pop <- log10(x_pop[x_pop > 0])            # log only of non zero values
+
+cat("Zeros among populated cells:", round(100 * mean(x_pop == 0), 1), "%\n")
+cat("Skewness, populated non zero cells | log10:", round(skewness(lx_pop), 2),
+    "| raw:", round(skewness(x_pop[x_pop > 0]), 2), "\n")
+
+ggplot(tibble(lx = lx_pop), aes(lx)) + geom_histogram(bins = 50) +
+  labs(x = "log10(m² per person), populated cells, zeros excluded", y = "Cells") +
+  theme_minimal()
+ggplot(tibble(lx = lx_pop), aes(sample = lx)) + stat_qq() + stat_qq_line() +
+  labs(title = "QQ plot, populated non zero cells, log10") + theme_minimal()
+```
+
+# 3. Normalised scores under each method
+
+```{r norm-versions}
+minmax_cap <- function(v, upper) {
+  v <- pmin(v, upper); lo <- min(v, na.rm = TRUE)
+  (v - lo) / (upper - lo)
+}
+
+norm_versions <- function(x, c_off) {
+  p98 <- quantile(x, .98, na.rm = TRUE)
+  lx  <- log(x + c_off)
+  tibble(
+    current = 1 - minmax_cap(x, p98),
+    log     = 1 - minmax_cap(lx, quantile(lx, .98, na.rm = TRUE)),
+    rank    = 1 - percent_rank(x)
+  )
+}
+c_main <- min(nz)                            # offset of the "log" version = smallest non zero value
+nv <- norm_versions(x, c_main)
+
+# check: "current" reproduces the score's norm_green_exp. The p98 is computed here on eligible
+# cells, in the notebook on all cells, so small differences are possible; report them
+cat("current vs saved norm_green_exp, max |diff|:",
+    signif(max(abs(nv$current - dat$norm_green_exp), na.rm = TRUE), 3), "\n")
+
+spread <- nv %>%
+  summarise(across(everything(), list(
+    above_0.9_pct = ~ 100 * mean(.x > 0.9, na.rm = TRUE),
+    iqr           = ~ IQR(.x, na.rm = TRUE)))) %>%
+  tidyr::pivot_longer(everything(), names_to = c("version", ".value"),
+                      names_pattern = "(.*)_(above_0.9_pct|iqr)")
+knitr::kable(spread, digits = 3)
+
+nv %>%
+  tidyr::pivot_longer(everything(), names_to = "version", values_to = "score") %>%
+  ggplot(aes(score)) + geom_histogram(bins = 50) + facet_wrap(~version, ncol = 3) +
+  labs(x = "Normalised green per person (1 = highest priority)", y = "Cells") + theme_minimal()
+```
+
+# 4 and 5. Effective weight and effect on the map
+
+The effective weight of a criterion is its citizen weight times the standard deviation of its
+normalised scores, as a share of the total: a criterion that barely varies contributes little to
+the ranking whatever its weight.
+
+```{r compare}
+wlc_avail <- function(d, ncols, w, min_share = 0.8) {
+  S <- as.matrix(d[, ncols]); W <- matrix(w, nrow(S), length(w), byrow = TRUE)
+  W[is.na(S)] <- 0; S[is.na(S)] <- 0
+  share <- rowSums(W) / sum(w)
+  out <- rowSums(W * S) / rowSums(W)
+  out[share < min_share] <- NA
+  out
+}
+eff_weight <- function(d, ncols, w) {
+  sds <- sapply(ncols, function(cl) sd(d[[cl]], na.rm = TRUE))
+  setNames(round(100 * w * sds / sum(w * sds), 1), names(ncols))
+}
+compare_version <- function(new_gpp) {
+  d <- dat; d[[norm_cols["gpp"]]] <- new_gpp
+  s_new <- wlc_avail(d, norm_cols, weights)
+  ok <- !is.na(s_ref) & !is.na(s_new)
+  q_ref <- ntile(s_ref[ok], 5); q_new <- ntile(s_new[ok], 5)
+  list(
+    spearman       = round(cor(s_ref[ok], s_new[ok], method = "spearman"), 3),
+    top_q_kept_pct = round(100 * mean(q_new[q_ref == 5] == 5), 1),
+    eff_weight_gpp = eff_weight(d, norm_cols, weights)[["gpp"]],
+    moved = tibble(row = which(ok), enters = q_new == 5 & q_ref != 5,
+                   leaves = q_ref == 5 & q_new != 5)
+  )
+}
+
+s_ref <- wlc_avail(dat, norm_cols, weights)
+cat("Reference score vs saved priority_citizen, max |diff|:",
+    signif(max(abs(s_ref - dat$priority_citizen), na.rm = TRUE), 2), "\n")
+stopifnot(max(abs(s_ref - dat$priority_citizen), na.rm = TRUE) < 1e-9)
+
+cat("Citizen weight of green per person:", round(100 * weights[["gpp"]], 1), "%\n")
+cat("Effective weight now:", eff_weight(dat, norm_cols, weights)[["gpp"]], "%\n")
+knitr::kable(tibble(criterion = names(weights), citizen_pct = round(100 * weights, 1),
+                    effective_pct = eff_weight(dat, norm_cols, weights)))
+
+res <- lapply(nv, compare_version)
+knitr::kable(t(sapply(res, function(r) unlist(r[c("spearman", "top_q_kept_pct", "eff_weight_gpp")]))))
+```
+
+## Where cells move (log version)
+
+```{r moved-map, fig.width=7, fig.height=6}
+mv <- res$log$moved
+move <- rep("No change", nrow(dat))
+move[mv$row[mv$enters]] <- "Enters top quintile"
+move[mv$row[mv$leaves]] <- "Leaves top quintile"
+cat("Enters:", sum(mv$enters), "| leaves:", sum(mv$leaves), "\n")
+
+dat_sf %>%
+  mutate(move = factor(move, c("Enters top quintile", "Leaves top quintile", "No change"))) %>%
+  ggplot() +
+  geom_sf(aes(fill = move), colour = NA) +
+  scale_fill_manual(values = c("Enters top quintile" = "#1B7837",
+                               "Leaves top quintile" = "#B2182B",
+                               "No change" = "grey90"), name = NULL) +
+  labs(title = "Top quintile, log vs current normalisation of green per person") +
+  theme_void()
+```
+
+# 6. Final checks
+
+## Saved score vs rebuilt "current" version
+
+```{r check-saved}
+saved   <- dat$norm_green_exp
+rebuilt <- nv$current
+
+# a) How many cells differ, and by how much?
+d_abs <- abs(saved - rebuilt)
+summary(d_abs)
+cat("Share of cells differing by more than 0.001:", round(mean(d_abs > 0.001, na.rm = TRUE), 3), "\n")
+cat("Spearman saved vs rebuilt:",
+    round(cor(saved, rebuilt, method = "spearman", use = "complete.obs"), 4), "\n")
+
+# b) Which cap did the saved version use? Back-calculate it from the saved scores
+lo_raw <- min(x, na.rm = TRUE)
+implied_cap <- lo_raw + (x - lo_raw) / (1 - saved)
+summary(implied_cap[saved > 0.01 & saved < 0.99])
+quantile(x, 0.98, na.rm = TRUE)   # the cap the rebuild used
+```
+
+## Log version with bounds from populated cells
+
+log10 of green per person; bounds are p2 and p98 of the log values over populated cells
+(`pop_reallocated_nso > 0`); zeros get 1 (highest priority).
+
+```{r check-final}
+pop <- plot_dat$pop_reallocated_nso > 0   # same rows and order as dat (checked in section 1)
+stopifnot(identical(as.character(plot_dat$gid), as.character(dat$gid)))
+
+lx_pos <- ifelse(x > 0, log10(x), NA)
+lo_pop <- quantile(lx_pos[pop], 0.02, na.rm = TRUE)
+hi_pop <- quantile(lx_pos[pop], 0.98, na.rm = TRUE)
+cat("Bounds (m² per person): p2 =", signif(10^lo_pop, 3), "| p98 =", signif(10^hi_pop, 3), "\n")
+
+final <- case_when(is.na(x) ~ NA_real_,
+                   x == 0   ~ 1,
+                   TRUE     ~ 1 - (pmin(pmax(lx_pos, lo_pop), hi_pop) - lo_pop) / (hi_pop - lo_pop))
+summary(final)
+
+# Same table as before, for all cells and for populated cells
+spread_tab <- function(v) c(above_0.9_pct = 100 * mean(v > 0.9, na.rm = TRUE),
+                            iqr = IQR(v, na.rm = TRUE))
+knitr::kable(rbind(script_log_all = spread_tab(nv$log),
+                   final_all      = spread_tab(final),
+                   final_pop      = spread_tab(final[pop])), digits = 3)
+
+# How different is the final version from the script's log version?
+cat("Spearman final vs script log:",
+    round(cor(final, nv$log, method = "spearman", use = "complete.obs"), 4), "\n")
+
+ggplot(tibble(v = final[pop]), aes(v)) + geom_histogram(bins = 50) +
+  labs(x = "Normalised green per person (populated cells)", y = "Cells") + theme_minimal()
+```
+
+# 7. Checks before changing the score
+
+Versions compared, all on eligible cells:
+
+- **current**: the saved `norm_green_exp` (min max capped at p98 over all 10,657 cells);
+- **log**: log10, bounds p2 and p98 of the log over eligible populated cells, zero = 1, missing stays missing;
+- **log, unpopulated missing**: as log, but green per person is set to missing in unpopulated cells
+  (`pop_reallocated_nso == 0`); those cells are scored on the other criteria under the 80% rule.
+
+Unpopulated cells are split by their majority Urban Atlas 2021 class (`ua_code_2021`, as for eligibility):
+**urban** = artificial surfaces (classes starting with 1), **rural** = all other classes.
+
+```{r final-versions}
+v_log <- final                                   # section 6
+v_log_na <- if_else(pop, v_log, NA_real_)
+versions <- list(current = dat$norm_green_exp, log = v_log, log_unpop_missing = v_log_na)
+
+cell_type <- case_when(pop ~ "Populated",
+                       substr(dat$ua_code_2021, 1, 1) == "1" ~ "Unpopulated urban",
+                       TRUE ~ "Unpopulated rural")
+table(cell_type, useNA = "ifany")
+```
+
+## 7.1 Zero green per person by population
+
+```{r final-zeros}
+tibble(type = if_else(pop, "Populated", "Unpopulated"), x = x) %>%
+  group_by(type) %>%
+  summarise(cells = n(), with_value = sum(!is.na(x)), zero = sum(x == 0, na.rm = TRUE),
+            zero_pct = 100 * mean(x == 0, na.rm = TRUE)) %>%
+  knitr::kable(digits = 1)
+```
+
+## 7.2 Cells entering the top quintile
+
+```{r final-entering}
+score_of <- function(g) { d <- dat; d[[norm_cols["gpp"]]] <- g; wlc_avail(d, norm_cols, weights) }
+scores <- lapply(versions, score_of)
+stopifnot(max(abs(scores$current - dat$priority_citizen), na.rm = TRUE) < 1e-9)
+
+quint <- function(s) { q <- rep(NA_integer_, length(s)); q[!is.na(s)] <- ntile(s[!is.na(s)], 5); q }
+q_cur <- quint(scores$current)
+
+moves <- function(name) {
+  q_new <- quint(scores[[name]])
+  tibble(row = seq_along(q_cur),
+         move = case_when(q_new == 5 & q_cur != 5 ~ "Enters top quintile",
+                          q_cur == 5 & q_new != 5 ~ "Leaves top quintile",
+                          TRUE ~ "No change"))
+}
+mv_all <- lapply(c("log", "log_unpop_missing"), moves) %>% setNames(c("log", "log_unpop_missing"))
+
+summ_tab <- bind_rows(lapply(names(mv_all), function(nm) {
+  s0 <- scores$current; s1 <- scores[[nm]]; ok <- !is.na(s0) & !is.na(s1)
+  q1 <- quint(s1)
+  tibble(version = nm, scored = sum(!is.na(s1)),
+         spearman = round(cor(s0[ok], s1[ok], method = "spearman"), 3),
+         top_q_kept_pct = round(100 * mean(q1[q_cur == 5] == 5, na.rm = TRUE), 1),
+         change_quintile_pct = round(100 * mean(q_cur[ok] != q1[ok]), 1))
+}))
+knitr::kable(summ_tab)
+
+enter_tab <- bind_rows(lapply(names(mv_all), function(nm) {
+  e <- mv_all[[nm]]$move == "Enters top quintile"
+  tibble(version = nm, type = cell_type[e], zero = x[e] == 0) %>%
+    group_by(version, type) %>%
+    summarise(cells = n(), zero_gpp = sum(zero, na.rm = TRUE), .groups = "drop") %>%
+    mutate(cells_pct = round(100 * cells / sum(cells), 1))
+}))
+knitr::kable(enter_tab)
+```
+
+## 7.3 Effective weights
+
+```{r final-eff-weights}
+eff_tab <- tibble(criterion = names(weights), citizen_pct = round(100 * weights, 1))
+for (nm in names(versions)) {
+  d <- dat; d[[norm_cols["gpp"]]] <- versions[[nm]]
+  eff_tab[[paste0("effective_", nm)]] <- eff_weight(d, norm_cols, weights)
+}
+knitr::kable(eff_tab)
+```
+
+## 7.4 Map of cells entering and leaving the top quintile
+
+```{r final-map, fig.width=10, fig.height=5.5}
+bind_rows(lapply(names(mv_all), function(nm)
+  dat_sf %>% select(gid) %>% mutate(version = nm, move = mv_all[[nm]]$move))) %>%
+  mutate(move = factor(move, c("Enters top quintile", "Leaves top quintile", "No change"))) %>%
+  ggplot() +
+  geom_sf(aes(fill = move), colour = NA) +
+  scale_fill_manual(values = c("Enters top quintile" = "#1B7837",
+                               "Leaves top quintile" = "#B2182B",
+                               "No change" = "grey90"), name = NULL) +
+  facet_wrap(~ version) +
+  theme_void() + theme(legend.position = "bottom")
+```
+
+```{r session}
+sessionInfo()
+```

@@ -1,0 +1,411 @@
+---
+title: "Industrial cells and Street View sample: checks for the MCDA"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+```
+
+Follows `mcda/MCDA_paper_results_spec.md`. Instruction: `mcda/instructions/2026_11_25_industrial_streetview_gpp_sensitivity.md`,
+Parts A and B. Reads the current scores (after the K3 traffic switch, the water constraint and the majority rule of
+25 November 2026). **No score file is changed here**; the service road version of street greenery exists in memory only.
+
+```{r libraries}
+library(dplyr)
+library(tidyr)
+library(sf)
+library(ggplot2)
+library(patchwork)
+library(terra)
+library(exactextractr)
+library(knitr)
+library(kableExtra)
+source(here::here("R/theme_lancet.R"))
+sf_use_s2(FALSE)
+
+OUT_DIR <- here::here("output/figures_mcda/checks_industrial_streetview_2026_11_25")
+SV_DIR  <- file.path(OUT_DIR, "streetview_panels")
+dir.create(SV_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(here::here("mcda/output"), showWarnings = FALSE)
+CANOPY_DIR <- here::here("data/malta/canopy_meta")
+SEED <- 20261125
+INDUSTRIAL <- "12100"
+# Street classes kept for street greenery (spec 3.6; as street_greenery_canopy_malta.Rmd, Step 3a)
+STREET_CLASSES <- c("primary", "secondary", "tertiary", "residential", "unclassified", "living_street",
+                    "pedestrian", "trunk", paste0(c("primary", "secondary", "tertiary", "trunk"), "_link"))
+knitting <- function() isTRUE(getOption("knitr.in.progress"))
+ktab <- function(x, caption, digits = 1) {
+  x <- x %>% mutate(across(where(is.double), ~ round(., digits)))
+  readr::write_csv(x, file.path(OUT_DIR, paste0(gsub("[^A-Za-z0-9]+", "_", sub("\\..*$", "", caption)), ".csv")))
+  if (!knitting()) { cat("\n", caption, "\n", sep = ""); print(as.data.frame(x), row.names = FALSE); return(invisible(x)) }
+  x %>% kable(caption = caption) %>% kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+}
+top_q <- function(p) { q <- rep(NA_integer_, length(p)); q[!is.na(p)] <- ntile(p[!is.na(p)], 5); q }
+```
+
+# Inputs
+
+```{r inputs}
+malta <- readRDS(here::here("data/malta/malta_mcda_processed_realloc.rds"))
+klag  <- readRDS(here::here("data/klagenfurt/klagenfurt_mcda_priority_may.rds"))
+stopifnot(nrow(malta) == 10657, n_distinct(malta$gid) == 10657, nrow(klag) == 12418, n_distinct(klag$ID) == 12418)
+CRS_M <- st_crs(malta)
+score_files <- here::here(c("data/malta/malta_mcda_processed_realloc.rds", "data/klagenfurt/klagenfurt_mcda_priority_may.rds"))
+ktab(tibble(file = sub(paste0(here::here(), "/"), "", score_files), md5 = unname(tools::md5sum(score_files)),
+            modified = format(file.mtime(score_files), "%Y-%m-%d %H:%M")), "Score files read")
+
+hw_m <- st_read(here::here("data/malta/accessibility_malta/own_routing/osm_highways_raw.gpkg"), quiet = TRUE) %>% st_transform(CRS_M)
+hw_k <- st_read(here::here("data/klagenfurt/accessibility_klagenfurt/own_routing/osm_highways_raw.gpkg"), quiet = TRUE) %>% st_transform(st_crs(klag))
+border_m <- st_sf(geometry = readRDS(here::here("data/malta/malta_union_boundary.rds")), crs = 3035)
+border_k <- readRDS(here::here("data/klagenfurt/klagenfurt_boundary.rds")) %>% st_transform(3035) %>% st_union() %>% st_sf(geometry = .)
+councils <- st_read(here::here("data/malta/Population_Malta_Districts.geojson"), quiet = TRUE) %>%
+  st_transform(3035) %>% group_by(NAME) %>% summarise(.groups = "drop") %>% st_intersection(st_union(border_m))
+tiles <- readLines(file.path(CANOPY_DIR, "tiles_malta.txt"))
+r_all <- vrt(file.path(CANOPY_DIR, paste0("chm_", tiles, ".tif")))
+```
+
+# Part A. Industrial cells
+
+Industrial cell = majority Urban Atlas class 12100 (Industrial, commercial, public, military and private units),
+with the majority rule of spec 1.3 (class with the largest total area in the cell): Malta Urban Atlas 2021
+(`ua_code_2021`), Klagenfurt Urban Atlas 2018 (`ua_code_2018`, as for water). Service roads = OSM
+`highway = service` (roads inside estates, car parks, driveways). A road is "inside" a cell if at least 1 m of
+it lies in the cell. Klagenfurt has no street greenery criterion, so its street counts are for information only.
+
+## A1. Counts
+
+```{r A1-counts}
+road_len <- function(cells, id, roads) {
+  if (nrow(roads) == 0 || nrow(cells) == 0) return(tibble(!!id := cells[[id]], len_m = 0))
+  x <- suppressWarnings(st_intersection(cells %>% select(all_of(id)), roads %>% select(highway)))
+  x <- x %>% mutate(len_m = as.numeric(st_length(.))) %>% st_drop_geometry() %>% group_by(.data[[id]]) %>%
+    summarise(len_m = sum(len_m), .groups = "drop")
+  cells %>% st_drop_geometry() %>% select(all_of(id)) %>% left_join(x, by = id) %>% mutate(len_m = coalesce(len_m, 0))
+}
+ind_m <- malta %>% filter(ua_code_2021 == INDUSTRIAL)
+ind_k <- klag %>% filter(!is.na(ua_code_2018), ua_code_2018 == INDUSTRIAL)
+ind_m <- ind_m %>%
+  mutate(kept_street_m = road_len(ind_m, "gid", hw_m %>% filter(highway %in% STREET_CLASSES))$len_m,
+         service_m     = road_len(ind_m, "gid", hw_m %>% filter(highway == "service"))$len_m,
+         no_street_buffer = is.na(street_canopy_pct))
+ind_k <- ind_k %>%
+  mutate(kept_street_m = road_len(ind_k, "ID", hw_k %>% filter(highway %in% STREET_CLASSES))$len_m,
+         service_m     = road_len(ind_k, "ID", hw_k %>% filter(highway == "service"))$len_m)
+
+A1 <- bind_rows(
+  tibble(city = "Malta", industrial_cells = nrow(ind_m), scored = sum(ind_m$scored),
+         no_kept_street = sum(ind_m$no_street_buffer & ind_m$scored),
+         no_kept_street_with_service_roads = sum(ind_m$no_street_buffer & ind_m$scored & ind_m$service_m >= 1),
+         population = sum(ind_m$Total_Population, na.rm = TRUE),
+         population_no_kept_street = sum(ind_m$Total_Population[ind_m$no_street_buffer & ind_m$scored], na.rm = TRUE)),
+  tibble(city = "Klagenfurt", industrial_cells = nrow(ind_k), scored = sum(ind_k$scored),
+         no_kept_street = sum(ind_k$kept_street_m < 1 & ind_k$scored),
+         no_kept_street_with_service_roads = sum(ind_k$kept_street_m < 1 & ind_k$scored & ind_k$service_m >= 1),
+         population = sum(ind_k$popdense_2020, na.rm = TRUE),
+         population_no_kept_street = sum(ind_k$popdense_2020[ind_k$kept_street_m < 1 & ind_k$scored], na.rm = TRUE)))
+ktab(A1, "A1. Industrial cells (majority class 12100). Malta: no kept street = no street buffer, street greenery not applicable (score 0). Klagenfurt: street classes counted for information only (no street greenery criterion)", 0)
+```
+
+```{r A1-plot, fig.width=8, fig.height=3.5}
+A1 %>% select(city, `Scored industrial cells` = scored, `No kept street` = no_kept_street,
+              `No kept street, service roads inside` = no_kept_street_with_service_roads) %>%
+  pivot_longer(-city) %>% mutate(name = factor(name, levels = unique(name))) %>%
+  ggplot(aes(name, value, fill = city)) + geom_col(position = "dodge") +
+  scale_fill_manual(values = c(Malta = "#2166ac", Klagenfurt = "#b2182b"), name = NULL) +
+  labs(x = NULL, y = "Cells") + theme_lancet() + theme(legend.position = "bottom")
+```
+
+## A2. Street greenery in Malta industrial cells
+
+Canopy (height 3 m or more) share of a 10 m buffer, as the main indicator (`street_greenery_canopy_malta.Rmd`).
+For industrial cells with only service roads, the share of a 10 m buffer around those service roads is computed
+here only, as information. The service road version used in A3 takes kept streets and service roads together.
+
+```{r A2-extract}
+r_m <- crop(r_all, ext(vect(st_transform(st_buffer(st_as_sfc(st_bbox(ind_m)), 100), 3857))))
+canopy_share <- function(cells, roads, dist = 10) {
+  b <- st_union(st_buffer(roads, dist))
+  p <- suppressWarnings(st_intersection(cells %>% select(gid), b)) %>% st_collection_extract("POLYGON") %>%
+    group_by(gid) %>% summarise(do_union = TRUE, .groups = "drop")
+  if (nrow(p) == 0) return(tibble(gid = character(), pct = numeric()))
+  e <- exact_extract(r_m, st_transform(p, 3857), fun = function(v, cf) { ok <- !is.na(v); sum(cf[ok] * (v[ok] >= 3)) / sum(cf[ok]) },
+                     progress = FALSE)
+  tibble(gid = p$gid, pct = 100 * e)
+}
+near <- function(roads) roads %>% st_filter(st_buffer(st_as_sfc(st_bbox(ind_m)), 50))
+svc_only <- ind_m %>% filter(no_street_buffer, service_m >= 1)
+svc_share <- canopy_share(svc_only, near(hw_m %>% filter(highway == "service"))) %>% rename(service_canopy_pct = pct)
+var_share <- canopy_share(ind_m, near(hw_m %>% filter(highway %in% c(STREET_CLASSES, "service")))) %>% rename(street_canopy_pct_svc = pct)
+ind_m <- ind_m %>% left_join(svc_share, by = "gid") %>% left_join(var_share, by = "gid")
+# Check: where no service road lies within 10 m of the cell (so no service road buffer reaches it), the
+# combined share equals the main indicator
+svc_near <- lengths(st_is_within_distance(ind_m, hw_m %>% filter(highway == "service"), 10.5)) > 0
+chk <- ind_m %>% st_drop_geometry() %>% filter(!svc_near, !is.na(street_canopy_pct))
+cat("Check cells:", nrow(chk), "| max abs difference (percentage points):",
+    signif(max(abs(chk$street_canopy_pct_svc - chk$street_canopy_pct), na.rm = TRUE), 3), "\n")
+stopifnot(max(abs(chk$street_canopy_pct_svc - chk$street_canopy_pct), na.rm = TRUE) < 0.5)
+
+summ <- function(x, what) tibble(indicator = what, cells = sum(!is.na(x)), zero = sum(x == 0, na.rm = TRUE),
+                                 median = median(x, na.rm = TRUE), p25 = quantile(x, 0.25, na.rm = TRUE),
+                                 p75 = quantile(x, 0.75, na.rm = TRUE), p98 = quantile(x, 0.98, na.rm = TRUE), max = max(x, na.rm = TRUE))
+sc_m <- ind_m %>% st_drop_geometry() %>% filter(scored)
+all_m <- malta %>% st_drop_geometry() %>% filter(scored)
+ktab(bind_rows(summ(all_m$street_canopy_pct, "All scored Malta cells: street canopy (%)"),
+               summ(sc_m$street_canopy_pct, "Industrial cells: street canopy (%), where defined"),
+               summ(sc_m$service_canopy_pct, "Industrial cells with only service roads: service road canopy (%), information"),
+               summ(sc_m$street_canopy_pct_svc, "Industrial cells: kept streets and service roads (%), A3 version")),
+     "A2. Street canopy share of the 10 m buffer (%)")
+```
+
+```{r A2-plot, fig.width=9, fig.height=3.5}
+bind_rows(tibble(group = "All scored cells", x = all_m$street_canopy_pct),
+          tibble(group = "Industrial cells", x = sc_m$street_canopy_pct),
+          tibble(group = "Industrial, service roads only (information)", x = sc_m$service_canopy_pct)) %>%
+  filter(!is.na(x)) %>%
+  ggplot(aes(x)) + geom_histogram(binwidth = 2, fill = "#4E8A5E", colour = "white", linewidth = 0.1) +
+  facet_wrap(~ group, scales = "free_y") + labs(x = "Canopy share of the 10 m buffer (%)", y = "Cells") + theme_lancet()
+```
+
+## A3. Priority with service roads as streets in industrial cells (in memory only)
+
+Street canopy of Malta industrial cells recomputed with kept streets and service roads; every other cell keeps
+its value. Normalisation as the score (spec 3.6): 1 minus min max, 0 to the p98 over eligible cells with a value,
+no street = 0. Weights and available weight rule as the main score (scored cells unchanged, street greenery is
+never missing). Quintiles over all scored cells of each score.
+
+```{r A3-variant}
+vars_m <- c("norm_lst", "norm_imd", "norm_dist_bs", "norm_Lden", "norm_traffic", "norm_no2", "norm_tree",
+            "norm_green_time", "norm_dist_rec", "norm_green_exp")
+d <- st_drop_geometry(malta)
+cc <- d[complete.cases(d[, vars_m]) & !is.na(d$priority_citizen), ]
+w <- coef(lm(reformulate(vars_m, "priority_citizen", intercept = FALSE), data = cc))[vars_m]
+score_avail <- function(df) {
+  S <- as.matrix(df[, vars_m]); A <- !is.na(S); S[!A] <- 0
+  out <- as.numeric(S %*% w) / as.numeric(A %*% w); out[!df$scored] <- NA; out
+}
+stopifnot(max(abs(score_avail(d) - d$priority_citizen), na.rm = TRUE) < 1e-10)
+
+x_var <- d$street_canopy_pct
+iv <- match(ind_m$gid, d$gid)
+x_var[iv] <- ind_m$street_canopy_pct_svc
+up_main <- quantile(d$street_canopy_pct[!d$ua_not_eligible], 0.98, na.rm = TRUE)
+up_var  <- quantile(x_var[!d$ua_not_eligible], 0.98, na.rm = TRUE)
+norm_var <- 1 - pmin(pmax(x_var, 0), up_var) / up_var; norm_var[is.na(norm_var)] <- 0
+stopifnot(max(abs((1 - pmin(pmax(d$street_canopy_pct, 0), up_main) / up_main) %>% replace(is.na(.), 0) - d$norm_tree)) < 1e-10)
+p_var <- score_avail(d %>% mutate(norm_tree = norm_var))
+
+q_main <- top_q(d$priority_citizen); q_var <- top_q(p_var)
+is_ind <- d$ua_code_2021 == INDUSTRIAL & d$scored
+A3_q <- bind_rows(tibble(score = "Current", q = q_main[is_ind]), tibble(score = "Service roads as streets", q = q_var[is_ind])) %>%
+  count(score, q) %>% group_by(score) %>% mutate(pct = 100 * n / sum(n)) %>% ungroup() %>%
+  mutate(quintile = paste0("Q", q)) %>% select(score, quintile, cells = n, pct)
+ktab(A3_q %>% pivot_wider(names_from = score, values_from = c(cells, pct)),
+     "A3a. Priority quintile of scored Malta industrial cells, current vs service roads as streets")
+k <- !is.na(d$priority_citizen) & !is.na(p_var)
+A3 <- tibble(cells_scored = sum(k), industrial_cells_scored = sum(is_ind),
+             industrial_cells_value_changed = sum(abs(norm_var - d$norm_tree)[is_ind] > 1e-12),
+             p98_main = up_main, p98_variant = up_var,
+             spearman_all = cor(d$priority_citizen[k], p_var[k], method = "spearman"),
+             top_quintile_overlap_pct = 100 * sum(q_main == 5 & q_var == 5, na.rm = TRUE) / sum(q_main == 5, na.rm = TRUE),
+             industrial_changing_quintile = sum(q_main[is_ind] != q_var[is_ind]),
+             spearman_industrial = cor(d$priority_citizen[is_ind], p_var[is_ind], method = "spearman"))
+ktab(A3, "A3b. Current score vs service roads as streets in industrial cells (Malta)", 3)
+
+# Klagenfurt: no street greenery criterion; quintile distribution of industrial cells only
+qk <- top_q(klag$priority_citizen)
+ktab(tibble(quintile = paste0("Q", 1:5), cells = tabulate(qk[!is.na(klag$ua_code_2018) & klag$ua_code_2018 == INDUSTRIAL & klag$scored], 5)) %>%
+       mutate(pct = 100 * cells / sum(cells)),
+     "A3c. Priority quintile of scored Klagenfurt industrial cells (current score; no street greenery criterion)")
+```
+
+```{r A3-plot, fig.width=8, fig.height=3.5}
+A3_q %>% ggplot(aes(quintile, pct, fill = score)) + geom_col(position = "dodge") +
+  scale_fill_manual(values = c(Current = "grey60", `Service roads as streets` = "black"), name = NULL) +
+  labs(x = "Priority quintile", y = "Industrial cells (%)") + theme_lancet() + theme(legend.position = "bottom")
+```
+
+## A4. Map: industrial cells by quintile, service roads drawn
+
+```{r A4-map, fig.width=11, fig.height=6.5}
+quint_colours <- c("Q1 (lowest)" = "#1a9641", "Q2" = "#a6d96a", "Q3" = "#ffffbf", "Q4" = "#fdae61",
+                   "Q5 (highest)" = "#d73027", "Not scored" = "grey60")
+qlab <- function(q) factor(ifelse(is.na(q), "Not scored", names(quint_colours)[q]), levels = names(quint_colours))
+ind_map <- function(cells, q, border, roads, tag) {
+  ggplot() + geom_sf(data = border, fill = "grey95", colour = "grey40", linewidth = 0.2) +
+    geom_sf(data = cells %>% mutate(f = qlab(q)), aes(fill = f), colour = NA) +
+    geom_sf(data = roads %>% st_filter(cells), colour = "grey15", linewidth = 0.15) +
+    scale_fill_manual(values = quint_colours, name = "Priority quintile (industrial cells)", drop = FALSE) +
+    lancet_scale_bar("bl") + labs(tag = tag) + theme_lancet_map(base_size = 8) + theme(legend.position = "bottom")
+}
+p_a4 <- ind_map(ind_m, q_main[match(ind_m$gid, d$gid)], border_m, hw_m %>% filter(highway == "service"), "Malta") +
+  ind_map(ind_k, qk[match(ind_k$ID, klag$ID)], border_k, hw_k %>% filter(highway == "service"), "Klagenfurt") +
+  plot_layout(guides = "collect") & theme(legend.position = "bottom")
+p_a4
+save_figure_lancet(p_a4, "industrial_cells_quintile_service_roads", OUT_DIR, height_mm = 120)
+```
+
+## A5. Interactive maps: streets inside industrial cells
+
+Zoom in to see the roads inside each estate. Layers (switch on and off at the top right): industrial cells by
+priority quintile (current score), OSM service roads (orange) and kept street classes (blue, the streets that define
+the street greenery buffer), over Esri World Imagery or OpenStreetMap. Click a cell for its values. Roads are clipped
+to industrial cells plus 20 m. Also saved as standalone HTML in the output folder.
+
+```{r A5-leaflet}
+library(leaflet)
+q_pal <- colorFactor(unname(quint_colours), levels = names(quint_colours))
+leaf_city <- function(cells, q, roads, info) {
+  cells <- cells %>% mutate(quintile = qlab(q)) %>% st_transform(4326)
+  area <- st_union(st_buffer(st_transform(cells, 3035), 20))
+  clip <- function(r) suppressWarnings(st_intersection(r %>% st_filter(area) %>% select(highway, name = any_of("name")), area)) %>%
+    st_collection_extract("LINESTRING") %>% st_transform(4326)
+  svc <- clip(roads %>% filter(highway == "service")); kept <- clip(roads %>% filter(highway %in% STREET_CLASSES))
+  leaflet() %>%
+    addProviderTiles(providers$Esri.WorldImagery, group = "Aerial") %>%
+    addProviderTiles(providers$OpenStreetMap, group = "OpenStreetMap") %>%
+    addPolygons(data = cells, fillColor = ~ q_pal(quintile), fillOpacity = 0.35, color = "white", weight = 1,
+                group = "Industrial cells", popup = info(cells)) %>%
+    addPolylines(data = kept, color = "#2b8cbe", weight = 3, opacity = 0.9, group = "Kept streets",
+                 label = ~ paste0(highway, ifelse(is.na(name), "", paste0(": ", name)))) %>%
+    addPolylines(data = svc, color = "#ff7f00", weight = 3, opacity = 0.9, group = "Service roads",
+                 label = ~ paste0("service", ifelse(is.na(name), "", paste0(": ", name)))) %>%
+    addLegend("bottomright", pal = q_pal, values = factor(names(quint_colours), levels = names(quint_colours)),
+              title = "Priority quintile", opacity = 0.7) %>%
+    addLayersControl(baseGroups = c("Aerial", "OpenStreetMap"),
+                     overlayGroups = c("Industrial cells", "Service roads", "Kept streets"),
+                     options = layersControlOptions(collapsed = FALSE))
+}
+lf_m <- leaf_city(ind_m, q_main[match(ind_m$gid, d$gid)], hw_m, function(x) sprintf(
+  "<b>gid %s</b>, %s<br>Quintile: %s<br>Street canopy: %s<br>No kept street: %s<br>Service roads inside: %.0f m<br>Service road canopy: %s<br>Kept streets and service roads: %s",
+  x$gid, x$NAME, x$quintile, ifelse(is.na(x$street_canopy_pct), "not applicable", sprintf("%.1f%%", x$street_canopy_pct)),
+  ifelse(x$no_street_buffer, "yes", "no"), x$service_m,
+  ifelse(is.na(x$service_canopy_pct), "-", sprintf("%.1f%%", x$service_canopy_pct)),
+  ifelse(is.na(x$street_canopy_pct_svc), "-", sprintf("%.1f%%", x$street_canopy_pct_svc))))
+lf_k <- leaf_city(ind_k, qk[match(ind_k$ID, klag$ID)], hw_k, function(x) sprintf(
+  "<b>ID %s</b><br>Quintile: %s<br>Kept streets inside: %.0f m<br>Service roads inside: %.0f m",
+  x$ID, x$quintile, x$kept_street_m, x$service_m))
+htmlwidgets::saveWidget(lf_m, file.path(OUT_DIR, "industrial_streets_malta.html"), selfcontained = TRUE)
+htmlwidgets::saveWidget(lf_k, file.path(OUT_DIR, "industrial_streets_klagenfurt.html"), selfcontained = TRUE)
+```
+
+### Malta
+
+```{r A5-malta, out.width="100%"}
+lf_m
+```
+
+### Klagenfurt
+
+```{r A5-klagenfurt, out.width="100%"}
+lf_k
+```
+
+# Part B. Street View sample for street greenery (Malta)
+
+## B1. Sample
+
+Pool: scored Malta cells with a street buffer (`street_canopy_pct` defined). Strata: 0%; above 0% and up to the
+median of cells above 0; above the 80th percentile of the pool. Ten cells per stratum at random (seed `r SEED`),
+plus five Valletta cells with `street_canopy_pct` between 15 and 25% (drawn among cells of the Valletta council
+not already sampled).
+
+```{r B1-sample}
+pool <- malta %>% filter(scored, !is.na(street_canopy_pct))
+med_pos <- median(pool$street_canopy_pct[pool$street_canopy_pct > 0])
+p80 <- quantile(pool$street_canopy_pct, 0.80)
+pool <- pool %>% mutate(stratum = case_when(street_canopy_pct == 0 ~ "0%",
+                                            street_canopy_pct <= med_pos ~ "Above 0 to median of cells above 0",
+                                            street_canopy_pct > p80 ~ "Above p80",
+                                            TRUE ~ NA_character_))
+set.seed(SEED)
+smp <- pool %>% filter(!is.na(stratum)) %>% group_by(stratum) %>% slice_sample(n = 10) %>% ungroup()
+vall_pool <- pool %>% filter(NAME == "VALLETTA", street_canopy_pct >= 15, street_canopy_pct <= 25, !gid %in% smp$gid)
+smp <- bind_rows(smp, vall_pool %>% slice_sample(n = min(5, nrow(vall_pool))) %>% mutate(stratum = "Valletta 15 to 25%"))
+B1 <- pool %>% st_drop_geometry() %>% filter(!is.na(stratum)) %>% count(stratum, name = "cells_in_pool") %>%
+  bind_rows(tibble(stratum = "Valletta 15 to 25%", cells_in_pool = nrow(vall_pool))) %>%
+  left_join(smp %>% st_drop_geometry() %>% group_by(stratum) %>%
+              summarise(sampled = n(), min_pct = min(street_canopy_pct), max_pct = max(street_canopy_pct)), by = "stratum")
+ktab(bind_rows(B1, tibble(stratum = paste0("Pool: ", nrow(pool), " cells; median of cells above 0 = ", round(med_pos, 1),
+                                           "%; p80 = ", round(p80, 1), "%"))),
+     "B1. Street View sample: strata, pool and sampled cells")
+```
+
+```{r B1-plot, fig.width=8, fig.height=3.5}
+ggplot(pool, aes(street_canopy_pct)) + geom_histogram(binwidth = 1, fill = "grey75") +
+  geom_vline(xintercept = c(med_pos, p80), linetype = "dashed") +
+  geom_rug(data = smp, aes(colour = stratum), linewidth = 0.8, length = unit(4, "mm")) +
+  labs(x = "Street canopy share of the 10 m buffer (%)", y = "Cells", colour = "Sampled cells") +
+  theme_lancet() + theme(legend.position = "bottom")
+```
+
+## B2. Image panels
+
+Left: canopy of 3 m or more (1 m Meta and WRI canopy height, green) over Esri World Imagery, with the 10 m street
+buffer (yellow) and the cell (white). Right: locator. One PNG per cell in
+`output/figures_mcda/checks_industrial_streetview_2026_11_25/streetview_panels/` and one combined PDF.
+
+```{r B2-panels}
+streets_m <- hw_m %>% filter(highway %in% STREET_CLASSES)
+smp <- smp %>% mutate(order = row_number())
+panel_cell <- function(i) {
+  cell <- smp[i, ]
+  box <- st_buffer(st_centroid(st_geometry(cell)), 110, endCapStyle = "SQUARE")
+  box_w <- st_transform(box, 3857)
+  sat <- tryCatch(maptiles::get_tiles(box_w, provider = "Esri.WorldImagery", zoom = 18, crop = TRUE,
+                                      cachedir = file.path(CANOPY_DIR, "tiles_cache")), error = function(e) NULL)
+  msk <- crop(r_all, ext(vect(box_w))) >= 3
+  msk <- classify(msk, cbind(0, NA))
+  buf <- suppressWarnings(st_intersection(st_union(st_buffer(streets_m %>% st_filter(st_buffer(box, 30)), 10)), box))
+  left <- ggplot()
+  if (!is.null(sat)) left <- left + tidyterra::geom_spatraster_rgb(data = sat)
+  left <- left + tidyterra::geom_spatraster(data = msk, alpha = 0.55) +
+    scale_fill_gradient(low = "#39FF14", high = "#39FF14", na.value = NA, guide = "none") +
+    (if (length(buf)) geom_sf(data = st_transform(st_sf(geometry = buf), 3857), fill = NA, colour = "#FFD700", linewidth = 0.4)) +
+    geom_sf(data = st_transform(cell, 3857), fill = NA, colour = "white", linewidth = 0.7) +
+    coord_sf(crs = 3857, expand = FALSE, datum = NA) + theme_void()
+  loc <- ggplot() + geom_sf(data = councils, fill = "grey92", colour = "grey70", linewidth = 0.1) +
+    geom_sf(data = st_centroid(cell), colour = "#d73027", size = 2) + theme_void()
+  ttl <- sprintf("gid %s, %s: street canopy %.1f%% (%s)", cell$gid, tools::toTitleCase(tolower(cell$NAME)),
+                 cell$street_canopy_pct, cell$stratum)
+  (left + loc + plot_layout(widths = c(2.2, 1))) +
+    plot_annotation(title = ttl, caption = if (is.null(sat)) "Imagery not available" else "Imagery: Esri World Imagery",
+                    theme = theme(plot.title = element_text(size = 10)))
+}
+pdf(file.path(SV_DIR, "streetview_panels_all.pdf"), width = 9, height = 5)
+for (i in seq_len(nrow(smp))) {
+  p <- panel_cell(i)
+  print(p)
+  ggsave(file.path(SV_DIR, sprintf("%02d_gid_%s.png", i, smp$gid[i])), p, width = 9, height = 5, dpi = 200, bg = "white")
+}
+invisible(dev.off())
+cat("Panels written:", nrow(smp), "\n")
+panel_cell(1)
+```
+
+## B3. CSV for the Street View check
+
+```{r B3-csv}
+ll <- st_coordinates(st_transform(st_centroid(st_geometry(smp)), 4326))
+sv <- smp %>% st_drop_geometry() %>%
+  transmute(order, gid, council = NAME, stratum, street_canopy_pct = round(street_canopy_pct, 1),
+            latitude = round(ll[, 2], 6), longitude = round(ll[, 1], 6),
+            streetview_url = sprintf("https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=%.6f,%.6f", latitude, longitude),
+            trees_visible = "", agrees_with_indicator = "", note = "")
+readr::write_csv(sv, here::here("mcda/output/streetview_sample.csv"), na = "")
+ktab(sv %>% select(order, gid, council, stratum, street_canopy_pct, latitude, longitude),
+     "B3. Street View sample (mcda/output/streetview_sample.csv)", 6)
+```
+
+B4: the CSV is for manual review; agreement by stratum is summarised once it is filled.
+
+# Session
+
+```{r session}
+sessionInfo()
+```

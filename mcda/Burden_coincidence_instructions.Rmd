@@ -1,0 +1,49 @@
+# Burden coincidence, Step 3: instructions for Claude Code
+
+One file for the Step 3 work of `mcda/Burden_coincidence_random_weights.Rmd` (cells in the top quintile of three or more criteria vs shuffled). Instructions in the order they were run.
+
+## 1. Fractional tie rule and restricted shuffle (instruction for Claude Code)
+
+25 November 2026.
+
+```
+Follow MCDA_paper_results_spec.md. Never use em dashes in any text you write (hyphens are fine).
+For every comparison give both a figure and a table. Do not commit. Report first.
+Do not change the priority scores; this only changes Burden_coincidence_random_weights.Rmd (Step 3) and a file path.
+
+1. Fractional membership tie rule (both cities, every criterion)
+ - For each criterion, over the cells where it is defined (eligible and not missing), rank cells by burden (highest priority first).
+ - Cells strictly above the class or value that contains the 20% boundary: membership 1.
+ - Cells in the boundary class or tied at the boundary value: membership f = (0.20 minus share strictly above) / share in the boundary class or tie.
+ - All other cells: membership 0.
+ - So every criterion has exactly 20% membership. For continuous criteria without ties at the boundary this is the same as before.
+ - Report per city and criterion: share strictly above, share in the boundary class, f, old top class share (25% fallback) and new share (20.0%).
+
+2. Counting cells with 3 or more burdens
+ - Treat memberships as independent probabilities within a cell and compute, per cell, the probability of 3 or more burdens (Poisson binomial; with only one fractional criterion this is simple). The observed count is the sum over cells.
+ - Do the same for each shuffle.
+ - Report observed, shuffled mean and 5th to 95th percentile, and the ratio.
+
+3. Restricted shuffle
+ - Shuffle each criterion only among the cells where that criterion is defined (e.g. Klagenfurt low income missing in unpopulated cells; Malta green per person missing in unpopulated cells), instead of across all cells.
+ - Report the ratio with the restricted shuffle.
+
+4. Table and figure, per city, four rows: old tie rule + old shuffle (current results); new tie rule + old shuffle; old tie rule + restricted shuffle; new tie rule + restricted shuffle (new main result). Columns: observed, shuffled mean (5th to 95th percentile), ratio. Figure: the four ratios per city as points with intervals, reference line at 1.
+ The main result from now on is new tie rule + restricted shuffle; the others are sensitivity rows.
+
+5. CAMS-REG CSV: copy the cell CSV that the scoring notebooks read from output/ (written by traffic_cams_reg_check.Rmd) to data/malta/ and data/klagenfurt/ (or one shared file in data/), point the notebooks to the new path, check the md5 is identical, and re-run only the chunk that reads it to confirm.
+
+6. Record both changes in mcda/CHANGELOG.md. Update spec 5 (or the Step 3 description) with: "Step 3 tie rule: fractional membership (exactly 20% per criterion); shuffle restricted to cells where each criterion is defined (decided 25 November 2026)."
+```
+
+Result (run 25 November 2026): main ratio Malta 0.984, Klagenfurt 1.276; see `mcda/CHANGELOG.md`, 25 November.
+
+## 2. Zero rule (instruction for Claude Code)
+
+25 November 2026.
+
+```
+In Burden_coincidence_random_weights.Rmd, Step 3 tie rule: cells with a criterion score of 0 (no burden) never get membership. If the 20% boundary falls in the zero class, that criterion keeps only the cells above it (e.g. Klagenfurt traffic 13.6%). Report the new main ratio for both cities next to the current one (Malta 0.984, Klagenfurt 1.276), update the CHANGELOG entry of 25 November and spec 5.4 ("cells with score 0 never count as burdened"). Also move the untracked mcda/burden_coincidence_random_weights.R to the archive folder, since it still has the old Step 3. Do not commit.
+```
+
+Result (run 25 November 2026): main ratio Malta 0.984 (unchanged), Klagenfurt 1.356; script moved to `analysis/archive/R/`.

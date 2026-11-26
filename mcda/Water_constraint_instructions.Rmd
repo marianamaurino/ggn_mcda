@@ -1,0 +1,46 @@
+# Water cells join the constraint, both cities (instruction for Claude Code)
+
+25 November 2026. My decision: cells whose majority Urban Atlas 2021 class is water (50000) are not eligible for greening and are excluded from the priority score, in both cities, with exactly the same majority class rule as the Malta airport and port constraint (spec 1.3). Klagenfurt gets a constraint for the first time (water only; there is still no airport in the study area).
+
+```
+Follow MCDA_paper_results_spec.md. Never use em dashes in any text you write (hyphens are fine).
+For every comparison give both a figure and a table. Do not commit. Report first.
+
+0. Checks
+ - Grids: Malta 10,657 cells by gid; Klagenfurt 12,418 cells by ID. Stop if counts differ.
+ - The current scores include the K3 traffic switch (24 November). If not, stop and ask me.
+ - Do not touch the HIA (Malta HIA reads malta_mcda_processed_realloc_pre_nov19.rds, md5 7df4bad8; there is no Klagenfurt HIA).
+
+1. Backups: copy every current MCDA output of both cities with the suffix _pre_water to ../ggn_analysis_archive. Record checksums in mcda/CHANGELOG.md.
+
+2. Define water cells with the same code path as the airport and port constraint: majority Urban Atlas 2021 class in the cell = 50000. One shared function for both cities.
+ - Report per city: number of water cells, how many were scored before, population in them, and their old priority quintile distribution (Q1 to Q5).
+ - For information only: how many cells would differ under a "water share over 50%" rule instead of the majority class rule.
+ - Map per city: water cells over the study area outline, coloured by their old quintile.
+
+3. Apply the constraint
+ - Malta: constraint = airport and port (12400, 12300) or water (50000), majority class. Klagenfurt: constraint = water (50000), majority class.
+ - Constrained cells are not scored, not used to compute any normalisation bound (p2, p98) and not in any quintile, statistic or Step 3 count. Draw them as in the current maps for the airport and port.
+ - Normalisation bounds are recomputed from the data as usual (spec 3.4: never hardcoded).
+
+4. Rerun everything that depends on the scores, both cities: scores, priority maps, Tables_MCDA, criterion maps, Step 3 (Burden_coincidence_random_weights.Rmd, with the 25 November tie rule and zero rule), and the full sensitivity set of spec 5.3.
+
+5. Report, old (_pre_water) vs new, both cities:
+ - eligible and scored cells; population in scored cells;
+ - Spearman and top quintile overlap with the old score (over cells scored in both);
+ - top 5 councils (Malta) or districts (Klagenfurt) with % of top quintile cells;
+ - any normalisation bound that changed (criterion, old, new);
+ - Step 3 main ratios (old: Malta 0.984, Klagenfurt 1.356);
+ - citizen vs equal weights (Spearman, top quintile overlap);
+ - maps: old vs new priority quintiles side by side;
+ - paths of every new or changed file.
+
+6. Spec and log (repo master mcda/MCDA_paper_results_spec.md)
+ - 1.3: "Constraint (decided 25 November 2026 for water): cells whose majority Urban Atlas 2021 class is airport (12400), port (12300) or water (50000) are not eligible for greening and are not scored. Malta: airport, port and water; Klagenfurt: water only (there is no airport in the Klagenfurt study area)." Replace the "Pending check" sentence. Update the cell counts in 1.3.
+ - Update "Last updated". CHANGELOG entry (what, why, date, backups, counts).
+```
+
+## After the run (not for Claude Code)
+
+- Then run `claude/water_industrial_streetview_prompt_2026_11_25.md` without Part A1 (water is decided), on the new scores.
+- Methods: one sentence for the constraint covering airport, port and water with the majority class rule, and the counts per city.

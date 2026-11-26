@@ -1,0 +1,197 @@
+# Traffic criterion: instructions for Claude Code
+
+24 November 2026. One file for the traffic work of the MCDA paper: what has been tested so far and what was found (section 1), the road type exploration (section 2, Option B, run 24 November 2026), open decisions (section 3), the switch of both scores to K3 (section 4, the instruction to run now), and the earlier CAMS-REG instruction kept for the record (appendix).
+
+## 1. Status: what has been tested
+
+### 1.1 Current criterion (OpenTransportMap)
+
+- Malta: `new_trafficvol` (OpenTransportMap, per cell), normalised to 5 classes (0, 0.25, 0.5, 0.75, 1; `norm_traffic`). Spec 3.4 still says "traffic in 3 categories" and needs rewriting.
+- Klagenfurt: `new_trafficvol` cut into 3 classes (`norm_traffic_cat`: up to 7 = 0, up to 564 = 0.5, above = 1). The values are not AADT (maximum 2,090); the code that built the cell values from OpenTransportMap is not in the repo.
+- Problems: in Klagenfurt only 8.1% of cells are in the top class (ties), and the ranking at counting stations is poor (see 1.2).
+
+### 1.2 CAMS-REG check (run 24 November 2026, `mcda/traffic_cams_reg_check.Rmd`)
+
+Source: Hohenberger et al. 2026, Earth Syst. Sci. Data 18, 3959 to 3978, doi 10.5194/essd-18-3959-2026 (Kuenen is the corresponding author, not the first author). Data: Zenodo concept doi 10.5281/zenodo.15688722, v2, record 19337413 (md5 checked), stored in `../ggn_analysis_archive/cams_reg/` (not in git). CC BY 4.0.
+
+What the paper says: AADT in vehicles per day; OSM geometries (2023); OpenTransportMap (base year 2015) values joined to OSM links; random forest gap filling, R² 0.74 in EU countries (primary 0.47, secondary 0.39, tertiary 0.29); fourth and fifth class roads get 30% and 15% of the mean tertiary AADT in 5 x 5 km cells, minimums 15 and 8 vehicles per day.
+
+Results:
+- Both countries are present; Malta has OpenTransportMap links inside CAMS-REG (393 km).
+- Malta Regional Road: CAMS-REG about 4% of the official count (about 57,000 vehicles per day, 2019).
+- Klagenfurt, 22 Carinthia counting stations placed (JDTV 2019, Land Kärnten): Spearman -0.205, median ratio 0.110 (robustness, highest main road link within 30 m: -0.023).
+- Cell indicator `traffic_vkm` vs the current criterion: Spearman 0.643 (Malta), 0.506 (Klagenfurt).
+- Decision rule (fixed in advance): not met (station Spearman below 0.5). CAMS-REG does not become the main source.
+
+Units check (added 24 November 2026, same notebook):
+- `trafficvol_final x road_length / 1000` equals `vkm_abs_sum_speed_based_urh` exactly on every link in both cities (ratio 1.000 in every class). The Readme label "thousands/day" for `vkm_*` is wrong: they are plain vehicle km per day. The identity cannot tell whether AADT is one direction or both.
+- CAMS-REG doubled on oneway links (both carriageways summed where found): Spearman -0.144, median ratio 0.118. Direction does not explain the poor match.
+- Current criterion at the same 22 stations: Spearman 0.125 (station cell), 0.109 (highest cell within 50 m). The current criterion does not reproduce the station ranks either.
+
+Conclusion: neither modelled traffic source ranks the counted roads correctly. Next: a transparent road type criterion from OSM (Option B).
+
+## 2. Instruction to run now: Option B, road type
+
+```
+Follow MCDA_paper_results_spec.md. Never use em dashes in any text you write (hyphens are fine).
+Create a new notebook mcda/traffic_road_type.Rmd. Do not change any score file, any existing notebook or the HIA. Do not commit. Report first.
+For every comparison give both a figure and a table (my standing preference). Maps in spec 8.2 style.
+
+0. Data
+ - Roads: the OSM extracts already used for walking (data/malta/accessibility_malta/own_routing/osm_highways_raw.gpkg, downloaded 5 November 2026; data/klagenfurt/accessibility_klagenfurt/own_routing/osm_highways_raw.gpkg, 11 November 2026). Report the date of each.
+ - Grids: Malta 10,657 cells by gid; Klagenfurt 12,418 cells by ID. Stop if counts differ. Malta airport and port cells excluded from all statistics (spec 1.3).
+ - Motor traffic classes kept: motorway, trunk, primary, secondary, tertiary (each _link takes its parent class), unclassified, residential, living_street. Excluded (no or negligible motor through traffic): service, track, pedestrian, footway, path, steps, cycleway, construction, proposed.
+
+1. Road inventory (what each city actually has)
+ a. Table per city and OSM class: km, % of total km, number of cells crossed (at least 10 m of the class inside the cell), % of eligible cells, % of population (Malta pop_reallocated_nso; Klagenfurt GHSL 2020) living in those cells.
+ b. Table per city: each cell's highest class present (at least 10 m inside the cell). Count and % of eligible cells and of population by highest class.
+ c. Figures: one map per city with roads coloured by OSM class (motorway to residential, one colour per class); one bar chart per city of km by class; one map per city of each cell's highest class.
+ d. Sanity check on the ground: list the 10 longest named roads per class per city (name, km) so I can judge myself whether the class matches the road I know. Flag known roads: Malta Regional Road (Triq Reġjonali), Kappara and Marsa junctions; Klagenfurt A2, B91 ring (Villacher Ring, Südring), B70, B70c, B70d, B83.
+
+2. Candidate categorisations (fixed in advance; scores evenly spaced from 0 to 1; each cell takes the class of the highest road with at least 10 m inside it; cells with no kept road = lowest class, score 0)
+ - K2: major (motorway, trunk, primary, secondary) = 1; other = 0.
+ - K3: arterial (motorway, trunk, primary) = 1; collector (secondary, tertiary) = 0.5; local or none (unclassified, residential, living_street, no road) = 0.
+ - K4: motorway and trunk = 1; primary = 0.67; secondary and tertiary = 0.33; local or none = 0.
+ - K5: motorway and trunk = 1; primary = 0.75; secondary = 0.5; tertiary = 0.25; local or none = 0.
+ Unclassified is treated as local in all versions; report its km separately (Malta has about 180 km) so I can decide myself whether it belongs with collectors in Malta.
+ Use the same scheme in both cities.
+
+3. Comparison (per city, per candidate)
+ a. Class sizes: % of eligible cells and % of population in each class. Flag any class with under 2% of cells (too small to mean anything) and report the share of cells in the top class (relevant for the Step 3 tie rule: the target is 20%).
+ b. Agreement with the current criterion (Malta new_trafficvol 5 classes; Klagenfurt norm_traffic_cat 3 classes): Spearman and cross table (current class x new class). Figure: maps side by side (current, K2, K3, K4, K5) and a map of cells where current and K3 differ by more than one class.
+ c. Agreement between candidates: Spearman matrix K2 to K5 per city.
+ d. Overlap with other criteria (redundancy check, threshold |rho| = 0.70 as used in the paper): Spearman of each candidate with NO2 and noise (Malta) and with the air quality composite, NO2 and PM2.5 (Klagenfurt), over eligible cells. Table and a small heatmap.
+ e. Counting stations (Klagenfurt, the 22 placed in traffic_cams_reg_check.Rmd): class assigned by each candidate. All are main B roads, so they should all fall in the top or second class; list any that do not.
+ f. Effect on the priority score: rerun the WLC in memory only (do not save) with each candidate replacing the current traffic criterion, using current citizen weights and spec 4.2. Report Spearman and top quintile overlap with the current score, and the five councils (Malta) or districts (Klagenfurt) with most top quintile cells. Maps of the top quintile for current and each candidate.
+
+4. Decision criteria (fixed in advance; state how each candidate meets them, do not choose):
+ 1. Every class contains at least 2% of eligible cells in both cities.
+ 2. The known main roads (step 1d and 3e) fall in the expected classes.
+ 3. |Spearman| with NO2 and noise below 0.70 in both cities.
+ 4. Parsimony: if two candidates meet 1 to 3, prefer the one with fewer classes unless the extra class separates roads that differ clearly on the ground.
+ The priority maps in 3f are for information only and are not a criterion.
+
+5. Report: every table and figure above, which candidates meet criteria 1 to 3, paths of new files, any failed check. Add a short entry to mcda/CHANGELOG.md ("road type traffic exploration, no score changed").
+```
+
+## 3. Open decisions (for myself, not for Claude Code)
+
+- Which road type candidate (if any) replaces the current criterion; the current OpenTransportMap criterion and CAMS-REG `traffic_vkm` would then be sensitivity analyses.
+- Whether unclassified roads count as collectors in Malta.
+- Within cell vs buffer: within cell avoids double counting with NO2 and noise. Depends on how traffic was described to survey respondents.
+- Rewrite spec 3.4 ("traffic in 3 categories"; the Malta score uses 5 classes), Table 1, Methods, Supplementary Table S1; cite Hohenberger et al. 2026 (not Kuenen et al.) wherever CAMS-REG is mentioned.
+- Rerun the HIA only once, after the traffic criterion is final (the HIA reads `malta_mcda_processed_realloc_pre_nov19.rds` until then).
+
+## 4. Switch both scores to the road type traffic indicator K3 (instruction for Claude Code)
+
+24 November 2026. Decision (mine): traffic = OSM road type in three classes (K3), both cities, roads in tunnels excluded. Evidence: mcda/traffic_cams_reg_check.Rmd (CAMS-REG and OpenTransportMap both fail the Carinthia counts, Spearman -0.21 and about 0.1) and mcda/traffic_road_type.Rmd (K3, K4, K5 correlate 0.997 to 1.000; K2 loses the distributor level; all 22 counting stations in the top class; |rho| with NO2 and noise below 0.70; score vs current: Malta 0.983 / 84.3%, Klagenfurt 0.978 / 85.3%). The 40 Malta perimeter cells stay (decided 24 November; Malta grid remains 10,657 cells).
+
+```
+Follow MCDA_paper_results_spec.md. Never use em dashes in any text you write (hyphens are fine).
+For every comparison give both a figure and a table (my standing preference).
+Do not commit. Report first.
+
+0. Checks before changing anything
+ - Spec 3.6 in the repo has the canopy street greenery (23 November). If not, stop and ask.
+ - The canopy switch (mcda/CHANGELOG.md, entry of 2026-11-23) has run: the current Malta score uses street_canopy_pct. If not, stop and ask.
+ - Grids: Malta 10,657 cells by gid; Klagenfurt 12,418 cells by ID. Stop if counts differ.
+
+1. Backups
+ Copy every current MCDA output of both cities (score files, tables, figures, Step 3 outputs, sensitivity outputs) with the suffix _pre_roadtype to ../ggn_analysis_archive (same place as _pre_canopy). Record checksums in mcda/CHANGELOG.md.
+
+2. HIA protection
+ Do not touch, repoint or rerun anything in the HIA; this step is a read only check. Confirm the HIA notebooks still read malta_mcda_processed_realloc_pre_nov19.rds (md5 7df4bad8). List them. If any reads a current score file, stop and report.
+
+3. Build the traffic indicator (new script mcda/traffic_road_type_k3.R, sourced by both scoring notebooks; one function used for both cities)
+ - Roads: the walking network OSM extracts (Malta downloaded 5 November 2026, Klagenfurt 11 November 2026; own_routing/osm_highways_raw.gpkg).
+ - Kept classes: motorway, trunk, primary, secondary, tertiary (each _link takes its parent class), unclassified, residential, living_street. Excluded: service, track, pedestrian, footway, path, steps, cycleway, construction, proposed.
+ - Tunnels: drop ways tagged tunnel = yes (or any tunnel value other than no) or covered = yes. If the extract has no tunnel or covered column, do not guess: get the tunnel and covered tags for the same way ids from the cached Overpass extract of 24 November 2026 (or a new Overpass query limited to those tags, date recorded) and report the source. Report km dropped per city and class, and list the named tunnels (expected in Klagenfurt: Ehrentalerbergtunnel, Falkenbergtunnel, Unterflurtrasse Lendorf, Unterflurtrasse Trettnig). Map them.
+ - Each cell takes the class of the highest kept road with at least 10 m inside it.
+ - K3 score: main (motorway, trunk, primary) = 1; distributor (secondary, tertiary) = 0.5; local (unclassified, residential, living_street) or no kept road = 0. No missing values.
+ - Also compute, for the sensitivity set, K2 (motorway, trunk, primary, secondary = 1; other = 0) and K5 (motorway and trunk = 1; primary = 0.75; secondary = 0.5; tertiary = 0.25; local or none = 0), same tunnel rule.
+ - Consistency check against mcda/traffic_road_type.Rmd Step 3: class sizes of K3 with and without the tunnel rule. Differences must be explained by the tunnel cells only; if not, stop and report.
+
+4. Switch the scores
+ - Malta (Malta_MCDA_260702_realloc.Rmd): norm_traffic = K3 score. Keep the old OpenTransportMap values as norm_traffic_otm and new_trafficvol for the sensitivity analysis.
+ - Klagenfurt (scoring notebook): norm_traffic_cat = K3 score. Keep the old values as norm_traffic_cat_otm.
+ - Weights, missing value rule (spec 4.2), constraint (spec 1.3) and quintiles (spec 4.3) unchanged.
+
+5. Rerun everything that depends on the scores, in both cities
+ Scores, priority maps, Tables_MCDA, the traffic criterion map (spec 8.3; now three classes, discrete legend: main / distributor / local; one palette shared by both cities), Step 3 burden coincidence (Burden_coincidence_random_weights.Rmd), and the full sensitivity set of spec 5.3 with the traffic variants replaced by: K2; K5; CAMS-REG vehicle km per cell, log10(x + 1), min max capped at p98 (from traffic_cams_reg_check.Rmd); current OpenTransportMap criterion; traffic excluded (leave one out).
+
+6. Consistency check against traffic_road_type.Rmd Step 3f (computed without the tunnel rule): Malta Spearman 0.983 and top quintile overlap 84.3%; Klagenfurt 0.978 and 85.3% (new score vs _pre_roadtype). Small differences from the tunnel rule are expected; report them. If a Spearman differs by more than 0.01, stop and report why.
+
+7. Report, old (_pre_roadtype) vs new, both cities:
+ - scored cells; top 5 councils (Malta) or districts (Klagenfurt) with % of top quintile cells; population in top quintile cells;
+ - share of each criterion in the score of top quintile cells;
+ - citizen vs equal weights (Spearman, top quintile overlap); leave one out; the new traffic sensitivity rows;
+ - Step 3 table (top class shares, observed vs shuffled ratio) for both cities; flag the Klagenfurt traffic top class share (was 8.1%);
+ - Spearman matrix of all criteria (redundancy check, |rho| = 0.70);
+ - maps: priority quintiles old vs new side by side, and cells whose quintile changed by 2 or more;
+ - paths of every new or changed file.
+
+8. Spec and log (repo master mcda/MCDA_paper_results_spec.md)
+ - 3.4: replace "traffic in 3 categories" with: "Traffic (both cities, decided 24 November 2026): OSM road type in three classes from the walking network extracts, highest kept road with at least 10 m in the cell, tunnels excluded: main (motorway, trunk, primary) = 1; distributor (secondary, tertiary) = 0.5; local (unclassified, residential, living_street) or no road = 0. Replaces the OpenTransportMap volume classes, which did not reproduce the order of the Carinthia counting stations (traffic_cams_reg_check.Rmd)."
+ - 5.3: replace "traffic excluded and log continuous" with "traffic variants: K2, K5, CAMS-REG vehicle km (log10 + 1), OpenTransportMap criterion; traffic excluded within leave one out".
+ - Update "Last updated". Add a CHANGELOG entry (what, why, date, backups, checksums).
+```
+
+### After the run (not for Claude Code)
+
+- Review the report myself (figures first).
+- Then: Step 3 tie rule and restricted shuffle; Street View check; HIA rerun once on the final score (old vs new HIA).
+- Manuscript: Table 1 traffic row (both cities, OSM road type, three classes), Table S1, Methodological Justifications point 2 (replace the OpenTransportMap text), Supplement paragraph on the CAMS-REG and OpenTransportMap counting station test, Results numbers.
+
+## Appendix: CAMS-REG instruction as run on 24 November 2026 (Option A, for the record)
+
+Replaced the unrun CAMS-REG check of 23 November and a first version that compared CAMS-REG with a road class load built by us (dropped because CAMS-REG already gap fills minor roads with published class fractions, and a citable, validated model leaves fewer researcher choices).
+
+```
+Follow MCDA_paper_results_spec.md. Never use em dashes in any text you write (hyphens are fine).
+Create a new notebook mcda/traffic_cams_reg_check.Rmd. Do not change any score file, any existing notebook or the HIA. Do not commit. Report first.
+
+0. Data
+ - Download the latest version of Zenodo concept record 10.5281/zenodo.15688722 (currently v2, record 19337413) to ../ggn_analysis_archive/cams_reg (ignored by git). Check the md5. If a newer version exists, use it and report what changed.
+ - Extract only Readme.txt, em_vkm_vector_dataset.gpkg and cities_polygons.gpkg. Read the gpkg with a spatial filter (bounding box of each study area plus 500 m), never the whole file into memory.
+ - From Readme.txt report verbatim: the traffic field name, unit and definition (AADT? both directions? all vehicles?), the road class field and its values, any field that says whether a link's traffic comes from OpenTransportMap, the random forest, or the spatial gap filling, the OSM extract date. If there is no per link traffic field, stop and report.
+
+1. Coverage
+ - Clip to the Malta study area and the Klagenfurt study area (spec 1.1), 500 m margin. Report link counts and length by country code and road class. If MT or AT is absent, stop and report.
+ - Share of links and of road length (by class) whose traffic comes from OpenTransportMap vs random forest vs spatial gap filling, per city (if the Readme gives a flag; otherwise infer from the paper's class rules and say so). This tells us whether Malta has OpenTransportMap data at all.
+ - Compare CAMS-REG geometry with our current OSM extract (the one used for walking): total km by class in each study area, and km of current OSM drivable roads (classes of spec 3.6 plus motorway) with no CAMS-REG link within 10 m. Map the missing roads.
+
+2. Plausibility
+ - Table per city and road class: number of links, km, AADT median, p10, p90, share at the minimum values (15 or 8).
+ - Malta: CAMS-REG AADT on the Regional Road (Msida to Santa Venera) vs the official count of about 57,000 vehicles/day (2019); also the Kappara and Marsa junction roads if counts are found (Transport Malta).
+ - Klagenfurt: CAMS-REG vs Carinthia automatic counting points and ASFINAG A2 counters in the study area (find the official open data, report source and year). Table: point, official AADT, CAMS-REG, ratio; Spearman across points.
+ - Absolute levels may be low (paper reports underestimation); what matters for a relative index is rank. Report ratios but judge on rank.
+
+3. Cell indicator (both cities, same 100 m grid: Malta 10,657 cells by gid; Klagenfurt 12,418 cells by ID; stop if counts differ)
+ - traffic_vkm = sum over links in the cell of (AADT x length of the link inside the cell, km) = vehicle km per day in the cell.
+ - Class filter: all CAMS-REG classes except service and track in the main version (consistent with spec 3.6; the paper reports the largest underestimation there). Sensitivity: all classes; main roads only (motorway, trunk, primary, secondary, tertiary and links).
+ - Cells with no kept link: 0 (real value, no traffic; not missing, not "not applicable").
+ - Report per city: share of cells at 0, median and IQR among cells above 0, skewness, p98.
+
+4. Comparison with the current criterion (OpenTransportMap)
+ - Spearman and top quintile overlap (spec 5.1, 5.2) of traffic_vkm vs Malta new_trafficvol and vs the Klagenfurt current traffic score. Eligible cells (Malta airport and port excluded, spec 1.3); also cells above 0 in either.
+ - Cross table of current classes vs traffic_vkm quintiles.
+ - Maps per city: current criterion, traffic_vkm (log colour scale for display only), and cells whose quintile changes by 2 or more. Spec 8.2 style.
+ - Klagenfurt: share of cells in the top quintile, now and with traffic_vkm (ties problem: was 8.1%).
+
+5. Do not normalise and do not rerun any score.
+
+6. Decision rule (fixed in advance; state the outcome):
+ - CAMS-REG becomes the main traffic source in both cities if: MT and AT are present; the traffic field is AADT per link; and in each city the counting point ranks are not contradicted (Spearman across points >= 0.5 where at least 5 points exist; otherwise report the points one by one).
+ - If Malta has no OpenTransportMap data inside CAMS-REG, still report all results, flag it clearly, and stop so I can decide myself (it affects the "same source in both cities" argument).
+ - In all cases the current OpenTransportMap criterion becomes a sensitivity analysis only.
+
+7. Report: every table above, the Readme fields verbatim, the outcome of Step 6, paths of new files, any failed check. Add a short entry to mcda/CHANGELOG.md ("CAMS-REG traffic check run, no score changed").
+```
+
+Follow-up run the same day (units check, added to the same notebook):
+
+```
+1. For the clipped links of both cities: compare trafficvol_final x road_length / 1000 with vkm_abs_sum_speed_based_urh x 1000 (vehicle km per day). Report the median ratio and its range by highway class.
+2. Recompute the Klagenfurt counting station Spearman with CAMS-REG values doubled on oneway links (both carriageways summed where two oneway links serve the same station).
+3. Run the same 22 station test on the current criterion (new_trafficvol from OpenTransportMap): Spearman and median ratio.
+```

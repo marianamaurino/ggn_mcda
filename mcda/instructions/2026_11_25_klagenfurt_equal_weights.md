@@ -1,0 +1,4 @@
+Before starting, save this whole instruction verbatim as mcda/instructions/2026_11_25_klagenfurt_equal_weights.md (create the folder if needed).
+
+Follow MCDA_paper_results_spec.md. Never use em dashes. Do not commit. Report first.
+Spec 2.3 says Klagenfurt equal weights are 1/6 per criterion; air quality is one criterion, so NO2 and PM2.5 get 1/12 each. Klagenfurt_MCDA_260520.Rmd currently uses 1/7 per indicator (air quality 2/7). My decision: fix the scoring notebook to 1/6 per criterion. Rerun the Klagenfurt equal weights score and everything that uses it (Table S6, Tables_MCDA, figures, Burden_coincidence_random_weights.Rmd). Report the new citizen vs equal Spearman and top quintile overlap (expected 0.990 and 93.4%, as in C2b), and list every table or text where the old values (0.977, 92.0%, and the older 0.972, 92.2%) appear. Record in the CHANGELOG.

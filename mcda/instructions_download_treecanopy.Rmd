@@ -1,0 +1,73 @@
+Follow MCDA_paper_results_spec.md. If anything here contradicts it, stop and ask before running.
+
+GOAL
+Build an alternative Malta street greenery indicator from the Meta and WRI 1 m canopy height map, compare it with the current one (perc_tree, Urban Atlas 2018 Street Tree Layer), and rerun the score and Step 3 with it. Do NOT overwrite any current score file, table or figure: everything new gets the suffix _canopy. Do not touch the HIA code (the HIA uses its own street tree fraction).
+
+Work in a new notebook: mcda/street_greenery_canopy_malta.Rmd
+
+STEP 0. Checks before anything else
+a. Grid: Malta must have 10,657 cells. If not, stop and report.
+b. Find where perc_tree is read and how it becomes a priority score (direction, normalisation, Table S1). Report: number of distinct values, share of scored cells at the most common value, share at maximum priority (expected about 90%).
+
+STEP 1. Download the canopy height map
+a. Source: s3://dataforgood-fb-data (public, no AWS account, anonymous access). Prefer version 2: first list forests/v2/global/ and find the tile index. If version 2 has no usable index, use version 1: forests/v1/alsgedi_global_v6_float/ with tiles.geojson. Report which version you used and why.
+b. Download only the tiles that intersect the Malta grid bounding box (with a 200 m margin). Save to data/malta/canopy_meta/ and keep it out of git.
+c. Record tile IDs and, if the metadata has them, the image acquisition dates per tile. Report the date range over Malta.
+
+STEP 2. Canopy mask
+a. Canopy = height of 3 m or more. Also compute 2 m and 5 m as sensitivity.
+b. Work at the native 1 m resolution. Do not resample to 100 m before computing shares. Put the grid and the raster in the same CRS (reproject the vector, not the raster, if possible).
+
+STEP 3. Street buffer
+a. Streets from OpenStreetMap (reuse the walking network extract if it has highway tags; otherwise osmdata). Keep highway = primary, secondary, tertiary, residential, unclassified, living_street, pedestrian, trunk and their _link versions. Exclude service, track, footway, path, steps, cycleway, construction, proposed. Report the kept classes and total length.
+b. Buffer 10 m each side of the centreline (sensitivity: 15 m). Dissolve, then intersect with the grid.
+c. Main indicator: street_canopy_pct = canopy area inside the street buffer / street buffer area, per cell (%).
+d. Cells with no street buffer: NA, not 0. They are then handled by the existing available weight rule. Report how many cells and how much population they hold.
+e. Second alternative: cell_canopy_pct = canopy area / cell area (whole cell, no street restriction).
+f. Airport and port constraint cells (459) are excluded as in the spec.
+
+STEP 4. Quality checks (report all)
+a. Distribution of street_canopy_pct: summary, share of cells at 0, number of distinct values, share at the most common value. Compare with perc_tree.
+b. Spearman between street_canopy_pct and perc_tree; cross table "zero in Street Tree Layer" vs "zero in canopy".
+c. Side by side maps (perc_tree vs street_canopy_pct) for three zooms: Valletta and Floriana, Sliema and Gżira, Ħamrun and Marsa. Add one panel per zoom with the canopy mask over a satellite basemap (visual check only). Use R/fig_style.R (theme_lancet(), save_fig()).
+
+STEP 5. Rerun with the new indicator (citizen weights)
+a. Normalise street_canopy_pct exactly as perc_tree is normalised now (same method, same direction: less canopy = higher priority).
+b. Priority score with street_canopy_pct replacing perc_tree. Report Spearman with the current score, top quintile overlap, top 5 councils by share of cells in the top quintile (current vs _canopy), and the share of the score explained by street greenery in top quintile cells.
+c. Step 3 (burden coincidence, Burden_coincidence_random_weights.Rmd logic, same tie rule): share of scored cells in the street greenery top class, count of cells in the top class of 3 or more criteria, observed vs shuffled ratio. Current vs _canopy in one table.
+d. Repeat b and c for cell_canopy_pct and for the 2 m, 5 m and 15 m buffer variants, in one compact sensitivity table.
+
+Follow MCDA_paper_results_spec.md. If anything here contradicts it, stop and ask before running.
+Add Steps 7 and 8 to mcda/street_greenery_canopy_malta.Rmd. Do not overwrite any current file; new outputs keep the _canopy suffix. No hyphens in any text you write.
+
+STEP 7. Fair comparison of the canopy indicator
+
+7a. Option (b) as the main canopy variant. Eligible cells with no street buffer get street greenery criterion score = 0 ("not applicable": no street, no street tree need). This is NOT missing data: the 80% available weight rule is unchanged for every other criterion. Check that scored cells = 10,194, as in the current score.
+Compare with the current score (Street Tree Layer): scored cells, Spearman, top quintile overlap, % of cells changing quintile, street greenery share of the score in top quintile cells, top 5 councils (current vs canopy, with %). Repeat the Step 5c table (street greenery top class %, % of cells in the top class of 3 or more criteria, shuffled %, ratio) under option (b).
+
+7b. Populated cells. Keep the quintiles computed over all scored cells (as in the main map), then report among populated cells only (Total_Population > 0): Spearman, top quintile overlap, and the share of the population living in top quintile cells, current vs canopy.
+
+7c. Variants compared directly with each other, not with the current score. All under option (b), all cells and populated cells:
+- 10 m vs 15 m buffer (3 m height)
+- 3 m vs 2 m height (10 m buffer)
+- 3 m vs 5 m height (10 m buffer)
+Report Spearman and top quintile overlap in one table.
+
+STEP 8. Street half width in Malta (centreline to facade)
+
+8a. Streets: the same kept OSM classes as Step 3. Buildings: OSM building footprints for the study area (osmdata or the existing extract). Report the number of buildings. If coverage looks incomplete in a visual check, say so and suggest Microsoft Global ML Building Footprints as an alternative (do not download it without asking).
+8b. Transects: every 20 m along each kept street, a line perpendicular to the street, 30 m to each side of the centreline. Skip transects within 15 m of a street junction (they hit crossing streets or open space).
+8c. Half width = distance from the centreline to the first building the transect meets, on each side separately. A side with no building within 30 m = NA (open side, not a street canyon). Full width = sum of both sides, only where both are measured.
+8d. Report: number of transects and of measured sides; median, IQR, p75 and p90 of half width; the same by highway class and by Urban Atlas 2021 class of the cell (urban fabric classes separately); share of measured sides with half width up to 10 m and up to 15 m; median full width.
+8e. Visual check: one figure with 3 zooms (a historic core such as Valletta or Birkirkara, Sliema, one newer residential area) showing transects and buildings over a satellite basemap (visual only). Use R/theme_lancet.R.
+
+FINAL REPORT
+Short summary with: the Step 7a, 7b and 7c tables, the Step 8d table, and one line saying whether the street half width supports a 10 m buffer (for example "median half width X m; Y% of measured sides within 10 m"). Flag anything odd. Do not commit.
+
+OUTPUTS
+- mcda/street_greenery_canopy_malta.Rmd and its HTML
+- data/malta/street_greenery_canopy_cells.csv (cell ID, street_canopy_pct, cell_canopy_pct, variants, street buffer area)
+- tables and figures with the _canopy suffix
+
+FINAL REPORT
+A short summary with: version and dates used, ties before and after, Spearman and overlap with the current score, Step 3 table, and anything odd. No hyphens in any text you write.

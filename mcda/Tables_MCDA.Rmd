@@ -44,6 +44,15 @@ malta_sensitivity    <- load_rds("malta_sensitivity",
                                   file.path(data_dir, "malta_sensitivity.rds"))
 klag_sensitivity     <- load_rds("klag_sensitivity",
                                   here::here("data/klagenfurt/klag_sensitivity.rds"))  # written by Klagenfurt_MCDA_260520.Rmd
+# Median instead of mean weights (spec 5.3, added 2026-11-25), written by survey_allocation_style.Rmd
+median_weights_sens  <- load_rds("median_weights_sensitivity",
+                                  here::here("data/citydata_outputs/median_weights_sensitivity.rds"))
+if (!is.null(median_weights_sens)) {
+  add_median <- function(s, cn) if (is.null(s)) s else
+    bind_rows(s, median_weights_sens %>% filter(city == cn) %>% select(-city))
+  malta_sensitivity <- add_median(malta_sensitivity, "Malta")
+  klag_sensitivity  <- add_median(klag_sensitivity, "Klagenfurt")
+}
 
 # ── track which objects are present ───────────────────────────────────────────
 obj_status <- list(
@@ -238,6 +247,10 @@ t1_data <- tibble(
     "Both",
     "Malta"
   ),
+  # TODO: update text (2026-11-23): Malta street greenery is now street canopy (Meta and WRI canopy
+  # height v2, canopy of 3 m or more in a 10 m street buffer, spec 3.6), not the Street Tree Layer.
+  # TODO: update text (2026-11-24): traffic in both cities is now OSM road type in three classes (K3, spec 3.4:
+  # main, distributor, local or none; tunnels excluded), not OpenTransportMap traffic volume.
   Indicator = c(
     "Land Surface Temperature (°C, annual mean)",
     "Street tree cover (%)",

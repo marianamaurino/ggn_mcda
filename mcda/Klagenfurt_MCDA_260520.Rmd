@@ -555,10 +555,46 @@ Normalization strategy per variable (decided after examining the distributions a
 | Time to green | Categorical (0–5, 5–10, 10–15, >15 min) | Extremely right-skewed (most cells < 5 min). The health-relevant distinction is between "easily walkable" and "not". |
 <!-- TODO: update text (2026-11-19): walking time to green is now continuous, min-max capped at p98 (spec 3.4), as in Malta. -->
 <!-- TODO: update text: the traffic row says <=50 = 0, the code cuts at 7. -->
+<!-- TODO: update text (2026-11-24): traffic is now OSM road type K3 (spec 3.4); the OpenTransportMap classes in the row below are norm_traffic_cat_otm, sensitivity only. -->
 
 | Traffic | Categorical (≤50 = 0, 50–564 = 0.5, >564 = 1) | 90% zero-inflated. Only 10% of cells have major road data. Bimodal among non-zero cells. |
 
 Traffic sensitivity analysis: log of values capped at p98 (continuous alternative).
+
+## Cells not eligible for greening (water)
+
+Added 2026-11-25 (spec 1.3): cells whose majority Urban Atlas class is water (50000) are not eligible
+for greening and are not scored, with the same majority rule as the Malta airport and port constraint
+(shared function `mcda/ua_constraint.R`). Klagenfurt uses Urban Atlas 2018 because the 2021 layer was
+not available on 25 November 2026 (to be checked against 2021 when it can be downloaded). Constraint
+cells are excluded from every normalisation bound.
+
+```{r eligibility-mask}
+source(here::here("mcda/ua_constraint.R"))
+ua18 <- read_csv(here::here("data/klagenfurt/klagenfurt_ua2018_class_area_cells.csv"), show_col_types = FALSE,
+                 col_types = cols(ID = col_character(), .default = col_double()))
+ua_major_k <- ua_pieces_from_table(ua18, "ID") %>% ua_majority() %>%
+  transmute(ID = id, ua_code_2018 = ua_code, water_share_ua = water_share)
+klagenfurt <- klagenfurt %>%
+  select(-any_of(c("ua_code_2018", "ua_not_eligible", "water_share_ua", "water_cell"))) %>%
+  mutate(ID_chr = as.character(ID)) %>%
+  left_join(ua_major_k, by = c("ID_chr" = "ID")) %>%
+  select(-ID_chr) %>%
+  mutate(ua_not_eligible = ua_constrained(ua_code_2018, "Klagenfurt"),
+         water_cell      = ua_not_eligible)
+stopifnot(nrow(klagenfurt) == 12418, n_distinct(klagenfurt$ID) == 12418, sum(!is.na(klagenfurt$ua_code_2018)) == 11996)
+
+table(klagenfurt$ua_code_2018[klagenfurt$ua_not_eligible], useNA = "ifany")
+cat("Constraint (water) cells:", sum(klagenfurt$ua_not_eligible),
+    "| water share > 50% (information only):", sum(klagenfurt$water_share_ua > 0.5, na.rm = TRUE),
+    "| cells without Urban Atlas 2018 data:", sum(is.na(klagenfurt$ua_code_2018)), "\n")
+summary(klagenfurt$water_share_ua)
+hist(klagenfurt$water_share_ua[klagenfurt$water_share_ua > 0], breaks = 40, main = "Water share of the cell (cells with any water)", xlab = "")
+ggplot(klagenfurt) +
+  geom_sf(aes(fill = ifelse(ua_not_eligible, "Water", "Eligible")), colour = NA) +
+  scale_fill_manual(values = c(Eligible = "grey85", Water = "#2c7fb8"), name = "Constraint") +
+  theme_void()
+```
 
 ```{r normalization}
 normalize_minmax <- function(x, lower = NULL, upper = NULL) {
@@ -569,44 +605,75 @@ normalize_minmax <- function(x, lower = NULL, upper = NULL) {
   (x - lower) / (upper - lower)
 }
 
-p98_traffic <- quantile(klagenfurt$new_trafficvol, 0.98, na.rm = TRUE)
+# Bounds over eligible cells only (water cells excluded from every bound, 2026-11-25)
+elig_k <- !klagenfurt$ua_not_eligible
+p98_traffic <- quantile(klagenfurt$new_trafficvol[elig_k], 0.98, na.rm = TRUE)
+
+# Traffic (spec 3.4, decided 2026-11-24): OSM road type in three classes (K3), tunnels excluded, built by
+# mcda/traffic_road_type_k3.R (same function in both cities). K2 and K5 kept for the sensitivity analysis.
+# The previous OpenTransportMap classes (new_trafficvol) are kept as norm_traffic_cat_otm.
+source(here::here("mcda/traffic_road_type_k3.R"))
+rt_klag <- road_type_k3(
+  klagenfurt, "ID",
+  osm_path  = here::here("data/klagenfurt/accessibility_klagenfurt/own_routing/osm_highways_raw.gpkg"),
+  tags_path = here::here("data/klagenfurt/accessibility_klagenfurt/own_routing/osm_tunnel_covered_tags_2026-11-24.json"),
+  boundary  = klag_border)
+stopifnot(identical(as.character(rt_klag$cells$ID), as.character(klagenfurt$ID)))
+klagenfurt <- klagenfurt %>%
+  mutate(road_class = rt_klag$cells$road_class, traffic_k2 = rt_klag$cells$K2,
+         traffic_k3 = rt_klag$cells$K3, traffic_k5 = rt_klag$cells$K5)
+# Sensitivity: CAMS-REG vehicle km per cell (mcda/traffic_cams_reg_check.Rmd, Step 3, without service and track;
+# copied from output/figures_mcda/traffic_cams_reg_check/ to data/ on 2026-11-25, md5 identical)
+cams_vkm_k <- read_csv(here::here("data/klagenfurt/traffic_vkm_klagenfurt_cams.csv"),
+                       show_col_types = FALSE)
+stopifnot(nrow(cams_vkm_k) == 12418)
+klagenfurt$traffic_vkm_cams <- cams_vkm_k$traffic_vkm[match(as.character(klagenfurt$ID), as.character(cams_vkm_k$ID))]
+stopifnot(!anyNA(klagenfurt$traffic_vkm_cams))
 
 klagenfurt <- klagenfurt %>%
   mutate(
     # ── Heat ──────────────────────────────────────────────────
     norm_lst = normalize_minmax(lst,
-                                lower = min(lst, na.rm = TRUE),
-                                upper = quantile(lst, 0.98, na.rm = TRUE)),
+                                lower = min(lst[elig_k], na.rm = TRUE),
+                                upper = quantile(lst[elig_k], 0.98, na.rm = TRUE)),
 
     # ── Distance to blue space ────────────────────────────────
     norm_dist_bs = normalize_minmax(dist_bs,
                                     lower = 0,
-                                    upper = quantile(dist_bs, 0.98, na.rm = TRUE)),
+                                    upper = quantile(dist_bs[elig_k], 0.98, na.rm = TRUE)),
 
     # ── NO2 ───────────────────────────────────────────────────
     norm_no2 = normalize_minmax(log1p(no2_final),
-                                lower = log1p(min(no2_final, na.rm = TRUE)),
-                                upper = log1p(quantile(no2_final, 0.98, na.rm = TRUE))),
+                                lower = log1p(min(no2_final[elig_k], na.rm = TRUE)),
+                                upper = log1p(quantile(no2_final[elig_k], 0.98, na.rm = TRUE))),
 
     # ── PM2.5 ─────────────────────────────────────────────────
     norm_pm25 = normalize_minmax(pm25_final,
-                                 lower = min(pm25_final, na.rm = TRUE),
-                                 upper = quantile(pm25_final, 0.98, na.rm = TRUE)),
+                                 lower = min(pm25_final[elig_k], na.rm = TRUE),
+                                 upper = quantile(pm25_final[elig_k], 0.98, na.rm = TRUE)),
 
     # ── Accessibility: time to green space ────────────────────
     # Continuous, min-max capped at p98, as in Malta (spec 3.4, decided 2026-11-19); before, 4
     # classes (0-5, 5-10, 10-15, >15 min). Missing walking time stays missing (available weight rule)
-    # p98 over eligible cells: in Klagenfurt every cell is eligible (no airport or port, spec 1.3)
+    # p98 over eligible cells (water cells excluded since 2026-11-25, spec 1.3)
     norm_green_time = normalize_minmax(nearest_green_min,
                                        lower = 0,
-                                       upper = quantile(nearest_green_min, 0.98, na.rm = TRUE)),
+                                       upper = quantile(nearest_green_min[elig_k], 0.98, na.rm = TRUE)),
     # Sensitivity: ATGreen's walking time (OSRM, including class 32000), same normalisation
     norm_green_time_atg = normalize_minmax(nearest_green_min_atg,
                                            lower = 0,
-                                           upper = quantile(nearest_green_min_atg, 0.98, na.rm = TRUE)),
+                                           upper = quantile(nearest_green_min_atg[elig_k], 0.98, na.rm = TRUE)),
 
-    # ── Traffic: MAIN (categorical) ───────────────────────────
-    norm_traffic_cat = case_when(
+    # Traffic (spec 3.4, since 2026-11-24): OSM road type, K3 (main 1, distributor 0.5, local or none 0)
+    norm_traffic_cat = traffic_k3,
+    # Sensitivity variants (spec 5.3): K2, K5, CAMS-REG vehicle km (log10(x + 1), min max 0 to p98, capped;
+    # eligible cells), and the previous OpenTransportMap classes (main until 2026-11-23)
+    norm_traffic_k2 = traffic_k2,
+    norm_traffic_k5 = traffic_k5,
+    norm_traffic_cams = normalize_minmax(log10(traffic_vkm_cams + 1), lower = 0,
+                                         upper = quantile(log10(traffic_vkm_cams + 1)[elig_k], 0.98)),
+    # ── Traffic: previous main (OpenTransportMap categorical), sensitivity only ──
+    norm_traffic_cat_otm = case_when(
       new_trafficvol <= 7    ~ 0.0,
       new_trafficvol <= 564  ~ 0.5,
       TRUE                   ~ 1.0
@@ -621,17 +688,30 @@ klagenfurt <- klagenfurt %>%
     # Inverted: low income = high priority. Capped at p2–p98.
     norm_income_weighted = 1 - normalize_minmax(
       income_weighted,
-      lower = quantile(income_weighted, 0.02, na.rm = TRUE),
-      upper = quantile(income_weighted, 0.98, na.rm = TRUE)
+      lower = quantile(income_weighted[elig_k], 0.02, na.rm = TRUE),
+      upper = quantile(income_weighted[elig_k], 0.98, na.rm = TRUE)
     ),
 
     # ── SES: Income raw (sensitivity) ─────────────────────────
     norm_income = 1 - normalize_minmax(
       income,
-      lower = quantile(income, 0.02, na.rm = TRUE),
-      upper = quantile(income, 0.98, na.rm = TRUE)
+      lower = quantile(income[elig_k], 0.02, na.rm = TRUE),
+      upper = quantile(income[elig_k], 0.98, na.rm = TRUE)
     )
   )
+
+# Sanity checks for the traffic criterion (spec 3.4, K3 since 2026-11-24)
+cat("Road type tunnels dropped (km by class):\n")
+print(st_drop_geometry(rt_klag$tunnels) %>% group_by(class) %>% summarise(km = round(sum(km), 2), ways = n()))
+cat("Cells whose class changes with the tunnel rule:", sum(rt_klag$cells$K3 != rt_klag$cells$K3_with_tunnels), "\n")
+print(table(road_class = klagenfurt$road_class, norm_traffic_cat = klagenfurt$norm_traffic_cat))
+summary(klagenfurt$norm_traffic_cat)
+summary(klagenfurt$norm_traffic_cams)
+ggplot(klagenfurt) +
+  geom_sf(aes(fill = factor(norm_traffic_cat, levels = c(0, 0.5, 1), labels = c("Local or none", "Distributor", "Main"))),
+          colour = NA) +
+  scale_fill_manual(values = c("grey90", "#9e9ac8", "#54278f"), name = "Traffic (K3)") +
+  theme_void()
 
 # Main analysis variable set
 norm_vars <- c("norm_lst", "norm_dist_bs", "norm_no2", "norm_pm25",
@@ -1098,7 +1178,7 @@ tibble(
   criterion    = names(weights),
   survey_avg   = round(raw_weights, 0),
   weight       = round(weights, 3),
-  equal_weight = round(1 / length(norm_vars), 3)
+  equal_weight = round(ifelse(names(weights) %in% c("norm_no2", "norm_pm25"), 1 / 12, 1 / 6), 3)
 ) %>%
   kable(caption = paste0("Citizen-derived weights vs equal weights (",
                          length(norm_vars),
@@ -1119,7 +1199,7 @@ MIN_WEIGHT_AVAILABLE <- 0.80
 crit_mat <- function(df, w) as.matrix(as.data.frame(df)[, names(w), drop = FALSE])
 klagenfurt <- klagenfurt %>%
   mutate(weight_available = as.numeric((!is.na(crit_mat(klagenfurt, weights))) %*% weights) / sum(weights),
-         scored = weight_available >= MIN_WEIGHT_AVAILABLE - 1e-12)
+         scored = weight_available >= MIN_WEIGHT_AVAILABLE - 1e-12 & !ua_not_eligible)
 
 # Weighted mean over available criteria, NA for cells outside the scored set
 wlc_avail <- function(df, w, keep = klagenfurt$scored) {
@@ -1131,7 +1211,11 @@ wlc_avail <- function(df, w, keep = klagenfurt$scored) {
   out[!keep | den == 0] <- NA
   out
 }
-weights_equal <- setNames(rep(1 / length(norm_vars), length(norm_vars)), norm_vars)
+# Equal weights at the criterion level (spec 2.3): 6 criteria at 1/6, air quality split 1/12 NO2 + 1/12 PM2.5
+# (fixed 2026-11-25; was 1/7 per indicator, air quality 2/7)
+weights_equal <- setNames(rep(1 / 6, length(norm_vars)), norm_vars)
+weights_equal[c("norm_no2", "norm_pm25")] <- 1 / 12
+stopifnot(abs(sum(weights_equal) - 1) < 1e-12)
 
 klagenfurt <- klagenfurt %>%
   mutate(priority_equal   = wlc_avail(klagenfurt, weights_equal),
@@ -1196,8 +1280,8 @@ ggplot(klagenfurt) +
 tibble(
   criterion = names(weights),
   citizen_weight = round(weights, 3),
-  equal_weight = round(1/length(norm_vars), 3),
-  diff = round(weights - 1/length(norm_vars), 3)
+  equal_weight = round(weights_equal[names(weights)], 3),
+  diff = round(weights - weights_equal[names(weights)], 3)
 ) %>%
   arrange(diff)
 ```
@@ -1384,8 +1468,10 @@ p1 + p2
 
 ## 8.3 Traffic: categorical vs log normalization
 
+<!-- TODO: update text (2026-11-24): this compares the OpenTransportMap log version with the K3 main score; it is no longer in Table S6 (replaced by "Traffic variants" below). -->
+
 ```{r traffic-log-sens}
-p98_traffic_k <- quantile(klagenfurt$new_trafficvol, 0.98, na.rm = TRUE)
+p98_traffic_k <- quantile(klagenfurt$new_trafficvol[!klagenfurt$ua_not_eligible], 0.98, na.rm = TRUE)
 
 klagenfurt_b <- klagenfurt %>%
   mutate(
@@ -1465,22 +1551,7 @@ cat("Spearman main vs ATGreen walking time:", round(r_atg_walk_k, 3), "| top qui
     agree_atg_walk_k, "% | cells changing quintile:", round(100 * mean(q_atg_w != q_base_w), 1), "%\n")
 summary(klagenfurt$priority_atg_walk)
 
-# Sensitivity, walking speed 4 km/h instead of 5 (spec 5.3). Walking time is the only criterion that
-# depends on speed; it scales by 5/4, and min max with a p98 cap is scale invariant, so the score
-# should not change (checked here rather than assumed).
-klagenfurt <- klagenfurt %>%
-  mutate(norm_green_time_4kmh = normalize_minmax(nearest_green_min * 5 / 4, lower = 0,
-                                                 upper = quantile(nearest_green_min * 5 / 4, 0.98, na.rm = TRUE)))
-summary(klagenfurt$norm_green_time_4kmh)
-hist(klagenfurt$norm_green_time_4kmh, breaks = 50, main = "norm_green_time at 4 km/h", xlab = "")
-klagenfurt <- klagenfurt %>%
-  mutate(priority_4kmh = wlc_avail(klagenfurt %>% mutate(norm_green_time = norm_green_time_4kmh), weights))
-ok_s <- !is.na(klagenfurt$priority_citizen) & !is.na(klagenfurt$priority_4kmh)
-r_4kmh_k <- cor(klagenfurt$priority_citizen[ok_s], klagenfurt$priority_4kmh[ok_s], method = "spearman")
-q_4kmh <- dplyr::ntile(klagenfurt$priority_4kmh[ok_s], 5); q_base_s <- dplyr::ntile(klagenfurt$priority_citizen[ok_s], 5)
-agree_4kmh_k <- round(100 * mean(q_4kmh[q_base_s == 5] == 5), 1)
-cat("4 km/h: max abs score change", signif(max(abs(klagenfurt$priority_4kmh - klagenfurt$priority_citizen), na.rm = TRUE), 3),
-    "| Spearman", round(r_4kmh_k, 3), "| top quintile retained", agree_4kmh_k, "%\n")
+# The walking speed 4 km/h variant was removed on 2026-11-25 (spec 5.3; see CHANGELOG).
 ```
 
 ## Sensitivity summary
@@ -1494,8 +1565,7 @@ tibble(
     "§8.3 Traffic: categorical vs log normalization",
     "§8.4 Citizen vs equal weights",
     "§8.5 Income: spatially-weighted vs raw",
-    "Walking time: ATGreen (OSRM) instead of own routing",
-    "Walking speed 4 km/h"
+    "Walking time: ATGreen (OSRM) instead of own routing"
   ),
   `Spearman r` = c(
     round(min(sensitivity_results$spearman_r), 3),
@@ -1504,8 +1574,7 @@ tibble(
     round(r_traffic_k, 3),
     round(r_equal_k, 3),
     round(r_income_k, 3),
-    round(r_atg_walk_k, 3),
-    round(r_4kmh_k, 3)
+    round(r_atg_walk_k, 3)
   ),
   `Top-quintile overlap (%)` = c(
     round(min(sensitivity_results$top_q_overlap), 1),
@@ -1514,8 +1583,7 @@ tibble(
     agree_traffic_k,
     agree_equal_k,
     agree_income_k,
-    agree_atg_walk_k,
-    agree_4kmh_k
+    agree_atg_walk_k
   )
 ) %>%
   kable(caption = paste0(
@@ -1559,13 +1627,33 @@ ggplot(loo_k, aes(reorder(criterion_dropped, spearman), spearman)) + geom_col(fi
   coord_flip() + labs(x = NULL, y = "Spearman vs main score") + theme_minimal()
 ```
 
+## Traffic variants (spec 5.3)
+
+Added 2026-11-24 with the switch to road type K3. Each variant replaces `norm_traffic_cat`, citizen weights,
+available weight rule; traffic has no missing values, so the scored cells do not change. Traffic excluded is
+in the leave one out table.
+
+```{r traffic-variants-k}
+traffic_variants_k <- c(`Traffic: road type K2`                        = "norm_traffic_k2",
+                        `Traffic: road type K5`                        = "norm_traffic_k5",
+                        `Traffic: CAMS-REG vehicle km (log10(x + 1))`  = "norm_traffic_cams",
+                        `Traffic: OpenTransportMap classes (previous)` = "norm_traffic_cat_otm")
+traffic_scores_k <- map(traffic_variants_k, function(v) wlc_avail(klagenfurt %>% mutate(norm_traffic_cat = .data[[v]]), weights))
+traffic_sens_k <- imap_dfr(traffic_scores_k, ~ sens_cmp(.x) %>% mutate(variant = .y, scored_cells = sum(!is.na(.x)), .before = 1))
+traffic_sens_k %>% mutate(across(where(is.double), ~ round(., 3))) %>%
+  kable(caption = "Traffic variants vs the main score (cells scored in both)") %>%
+  kable_styling(full_width = FALSE)
+klagenfurt <- klagenfurt %>% mutate(priority_traffic_k2 = traffic_scores_k[[1]], priority_traffic_k5 = traffic_scores_k[[2]],
+                                    priority_traffic_cams = traffic_scores_k[[3]], priority_traffic_otm = traffic_scores_k[[4]])
+```
+
 ## Sensitivity summary for Table S6
 
 All variants against the main score on the cells scored in both: Spearman, top quintile retained,
 cells changing quintile (spec 5.1 and 5.2). Saved to `data/klagenfurt/klag_sensitivity.rds` for
 `Tables_MCDA.Rmd`. The +/-20% rows are recomputed here with Spearman and top quintile retained.
-Note: `priority_equal` gives each of the 7 indicators 1/7 (air quality 2/7), not 1/6 per criterion as
-in spec 2.3 (flagged 2026-11-20, not changed).
+`priority_equal` gives 1/6 per criterion (air quality 1/12 NO2 + 1/12 PM2.5), as in spec 2.3 (fixed
+2026-11-25; before, 1/7 per indicator, air quality 2/7).
 
 ```{r sensitivity-summary-s6-k}
 pert_k <- map_dfr(names(weights), function(v) map_dfr(c(-0.2, 0.2), function(delta) {
@@ -1586,10 +1674,9 @@ klag_sensitivity <- bind_rows(
   loo_k %>% transmute(test_name = paste("Without", tolower(criterion_dropped)), spearman_r = fmt_r(spearman),
                       class_agreement = fmt_p(top_quintile_retained_pct),
                       cells_changing_quintile = fmt_p(cells_changing_quintile_pct)),
-  row_of("Traffic: log continuous instead of categorical", klagenfurt_b$priority_traffic_log),
+  imap_dfr(traffic_scores_k, ~ row_of(.y, .x)),
   row_of("Income: raw instead of spatially weighted", klagenfurt_inc$priority_income_raw),
-  row_of("Walking time: ATGreen (OSRM)", klagenfurt$priority_atg_walk),
-  row_of("Walking speed 4 km/h", klagenfurt$priority_4kmh))
+  row_of("Walking time: ATGreen (OSRM)", klagenfurt$priority_atg_walk))
 klag_sensitivity %>% kable(caption = "Sensitivity summary, Klagenfurt") %>% kable_styling(full_width = FALSE)
 saveRDS(klag_sensitivity, file.path(data_dir, "klag_sensitivity.rds"))
 ```

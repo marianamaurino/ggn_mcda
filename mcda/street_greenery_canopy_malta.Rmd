@@ -1,0 +1,1361 @@
+---
+title: "Street greenery from canopy height: Malta"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: false
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 9, fig.height = 5)
+```
+
+Alternative Malta street greenery indicator from the Meta and WRI 1 m canopy height map, compared with
+the current one (`perc_tree`, Urban Atlas 2018 Street Tree Layer). Follows
+`mcda/instructions_download_treecanopy.Rmd` and `mcda/MCDA_paper_results_spec.md`. Nothing current is
+overwritten: every new output has the suffix `_canopy`. The HIA is not touched.
+
+```{r libs}
+library(dplyr)
+library(tidyr)
+library(sf)
+library(terra)
+library(exactextractr)
+library(ggplot2)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+source(here::here("R/theme_lancet.R"))   # theme_lancet_map(), save_figure_lancet(); R/fig_style.R does not exist
+
+SEED   <- 20261120
+N_PERM <- 200
+CRS_M  <- 3035
+CANOPY_DIR <- here::here("data/malta/canopy_meta")
+OUT_DIR    <- here::here("output/figures_mcda/street_greenery_canopy")
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+terraOptions(memfrac = 0.3, progress = 0)
+
+knitting <- function() isTRUE(getOption("knitr.in.progress"))
+ktab <- function(x, caption, digits = 3) {
+  x <- x %>% mutate(across(where(is.double), ~ round(., digits)))
+  if (!knitting()) { cat("\n", caption, "\n", sep = ""); print(as.data.frame(x), row.names = FALSE); return(invisible(x)) }
+  x %>% kable(caption = caption) %>% kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+}
+```
+
+# Step 0. Checks
+
+```{r step0-grid}
+malta <- readRDS(here::here("data/malta/malta_mcda_processed_realloc_pre_canopy.rds"))  # Street Tree Layer score (before the canopy switch, 2026-11-23)
+stopifnot(nrow(malta) == 10657, n_distinct(malta$gid) == 10657)
+stopifnot(st_crs(malta)$epsg == CRS_M)
+cat("Grid:", nrow(malta), "cells,", n_distinct(malta$gid), "distinct gid\n")
+```
+
+`perc_tree` (Urban Atlas 2018 Street Tree Layer, % of the cell) becomes `norm_tree` in
+`Malta_MCDA_260702_realloc.Rmd` (chunk `normalization`, about line 866):
+`norm_tree = 1 - normalize_minmax(perc_tree, lower = 0, upper = p98(perc_tree))`, with the p98 over all
+10,657 cells. Direction: less tree cover = higher priority (Table S1: cost criterion, min max capped at
+p98).
+
+```{r step0-ties}
+normalize_minmax <- function(x, lower = NULL, upper = NULL) {
+  if (is.null(lower)) lower <- min(x, na.rm = TRUE)
+  if (is.null(upper)) upper <- max(x, na.rm = TRUE)
+  x <- pmin(x, upper); x <- pmax(x, lower)
+  (x - lower) / (upper - lower)
+}
+p98_tree_all <- quantile(malta$perc_tree, 0.98, na.rm = TRUE)
+stopifnot(max(abs(malta$norm_tree - (1 - normalize_minmax(malta$perc_tree, 0, p98_tree_all)))) < 1e-12)
+
+tie_stats <- function(x, norm) {
+  tab <- sort(table(x), decreasing = TRUE)
+  tibble(cells = sum(!is.na(x)), distinct_values = length(tab),
+         most_common_value = as.numeric(names(tab)[1]),
+         most_common_pct = 100 * tab[[1]] / sum(!is.na(x)),
+         zero_pct = 100 * mean(x[!is.na(x)] == 0),
+         max_priority_pct = 100 * mean(norm[!is.na(norm)] == 1))
+}
+sc <- malta$scored
+ktab(bind_cols(tibble(set = "Scored cells, perc_tree"), tie_stats(malta$perc_tree[sc], malta$norm_tree[sc])),
+     "Step 0b. perc_tree among scored cells: ties", 1)
+cat("p98 of perc_tree (all cells, as in the score):", round(p98_tree_all, 2), "%\n")
+```
+
+## Sources compared
+
+| | Current: Urban Atlas Street Tree Layer 2018 | New: Meta and WRI canopy height v2 | Option: Urban Atlas Street Tree Layer 2021 |
+|---|---|---|---|
+| File | `data_raw/urban_atlas_2018/malta/MT001L1_VALLETTA_UA2018_STL_v012.gpkg` | `data/malta/canopy_meta/chm_*.tif` | not downloaded |
+| Image dates | 8 June to 4 July 2018 (file metadata) | 9 July 2019 and 18 January 2020 (Step 1c) | 2021 reference year |
+| Data type | Vector polygons of tree patches and rows (857 in the Valletta FUA) | Raster of canopy height in metres | Vector polygons |
+| Resolution | Imagery 2 to 4 m (Pléiades, KOMPSAT, Planet, SPOT6, SuperView); minimum mapping unit 500 m², minimum width 10 m | About 1 m pixels | Derived from the 5 m Woody Vegetation Layer; minimum mapping unit 500 m², no minimum width |
+| What counts as tree | Contiguous trees over artificial surfaces, mapped by photo interpretation | Every pixel with height of 3 m or more (2 m and 5 m as sensitivity) | Woody vegetation over artificial surfaces |
+| Indicator per 100 m cell | `perc_tree` = area of tree polygons inside the cell / cell area × 100 (whole cell, not only streets; built in `analysis/01_malta_regression_300m.Rmd` section 5) | `street_canopy_pct` = canopy area inside a 10 m street buffer / street buffer area × 100; `cell_canopy_pct` = canopy area / cell area × 100 | Same as `perc_tree` |
+| Cells at zero (eligible) | 90.2% | 20.1% (street), 10.0% (cell) | unknown |
+
+Most other Malta criteria are from 2021 (NO2 annual mean 2021, LST 2021, Urban Atlas 2021 green spaces, NSO Census 2021 population). The Street Tree Layer 2021 would match that year; the 2018 layer and the canopy map (2019 to 2020) do not.
+
+# Step 1. Canopy height map
+
+```{r step1-version}
+tiles <- readLines(file.path(CANOPY_DIR, "tiles_malta.txt"))
+```
+
+Version 2 (`forests/v2/global/dinov3_global_chm_v2_ml3/`) has a tile index (`tiles.geojson`), so v2 is
+used. Tiles that intersect the grid bounding box plus 200 m: `r paste(tiles, collapse = ", ")`, downloaded
+anonymously from `s3://dataforgood-fb-data` to `data/malta/canopy_meta/` (under `data/`, outside git),
+with their acquisition date polygons (`metadata/<tile>.geojson`). The rasters are 1 byte canopy height in
+metres, Web Mercator (EPSG:3857), pixel 1.19 m in projected units (about 0.97 m on the ground at 36° N).
+
+```{r step1-dates}
+border <- readRDS(here::here("data/malta/malta_union_boundary.rds")) %>% st_transform(CRS_M)
+grid_union <- st_union(malta)
+meta <- bind_rows(lapply(tiles, function(t)
+  st_read(file.path(CANOPY_DIR, paste0("meta_", t, ".geojson")), quiet = TRUE) %>% mutate(tile = t))) %>%
+  st_make_valid() %>% st_transform(CRS_M)
+meta_in <- suppressWarnings(st_intersection(meta, grid_union))
+dates <- meta_in %>% mutate(area_km2 = as.numeric(st_area(.)) / 1e6) %>% st_drop_geometry() %>%
+  group_by(tile, acq_date) %>% summarise(area_km2 = sum(area_km2), .groups = "drop") %>%
+  mutate(pct_of_grid = 100 * area_km2 / (as.numeric(st_area(grid_union)) / 1e6))
+ktab(dates, "Step 1c. Image acquisition dates over the Malta grid", 2)
+```
+
+# Step 2 and 3. Canopy share inside the street buffer
+
+Canopy = height of 3 m or more (2 m and 5 m as sensitivity), at the native 1 m resolution. The vector layers
+are reprojected to the raster's CRS; the raster is not resampled. Shares are coverage weighted pixel
+shares, so the Web Mercator scale factor cancels out.
+
+```{r step3-streets}
+STREET_CLASSES <- c("primary", "secondary", "tertiary", "residential", "unclassified", "living_street",
+                    "pedestrian", "trunk", paste0(c("primary", "secondary", "tertiary", "trunk"), "_link"))
+hw <- st_read(here::here("data/malta/accessibility_malta/own_routing/osm_highways_raw.gpkg"), quiet = TRUE) %>%
+  st_transform(CRS_M)
+streets <- hw %>% filter(highway %in% STREET_CLASSES) %>% st_intersection(st_buffer(grid_union, 50))
+street_len <- streets %>% mutate(len_km = as.numeric(st_length(.)) / 1000) %>% st_drop_geometry() %>%
+  count(highway, wt = len_km, name = "length_km") %>% arrange(desc(length_km))
+ktab(bind_rows(street_len, tibble(highway = "Total", length_km = sum(street_len$length_km))),
+     "Step 3a. OSM street classes kept and length inside the grid (km)", 1)
+cat("Classes in the extract not kept:", paste(setdiff(unique(hw$highway), STREET_CLASSES), collapse = ", "), "\n")
+```
+
+```{r step3-extract}
+CACHE <- file.path(CANOPY_DIR, "canopy_extract_cells.rds")
+grid <- malta %>% select(gid)
+
+if (!file.exists(CACHE)) {
+  r_list <- lapply(tiles, function(t) rast(file.path(CANOPY_DIR, paste0("chm_", t, ".tif"))))
+  ext_m  <- ext(vect(st_transform(st_buffer(st_as_sfc(st_bbox(malta)), 300), 3857)))
+  r <- do.call(merge, lapply(r_list, function(x) crop(x, intersect(ext(x), ext_m))))
+  shares <- function(v, cf) {
+    ok <- !is.na(v); w <- cf[ok]; v <- v[ok]
+    data.frame(valid_px = sum(w), c2 = sum(w * (v >= 2)) / sum(w), c3 = sum(w * (v >= 3)) / sum(w),
+               c5 = sum(w * (v >= 5)) / sum(w))
+  }
+  extract_pieces <- function(pieces) {
+    e <- exact_extract(r, st_transform(pieces, 3857), fun = shares, progress = FALSE)
+    bind_cols(st_drop_geometry(pieces), e)
+  }
+  buf_cells <- function(dist) {
+    b <- st_union(st_buffer(streets, dist))
+    p <- suppressWarnings(st_intersection(grid, b)) %>% st_collection_extract("POLYGON") %>%
+      group_by(gid) %>% summarise(do_union = TRUE, .groups = "drop")
+    p %>% mutate(buffer_m2 = as.numeric(st_area(.)))
+  }
+  b10 <- buf_cells(10); b15 <- buf_cells(15)
+  out <- list(
+    street10 = extract_pieces(b10), street15 = extract_pieces(b15),
+    cell = extract_pieces(grid %>% mutate(buffer_m2 = as.numeric(st_area(.)))),
+    canopy3_mask_crs = crs(r, describe = TRUE)$code)
+  saveRDS(out, CACHE)
+}
+ex <- readRDS(CACHE)
+cells <- malta %>% st_drop_geometry() %>% select(gid, NAME, Total_Population, ua_not_eligible, scored, perc_tree) %>%
+  left_join(ex$street10 %>% transmute(gid, street_buffer_m2 = buffer_m2, street_canopy_pct = 100 * c3,
+                                      street_canopy_pct_2m = 100 * c2, street_canopy_pct_5m = 100 * c5), by = "gid") %>%
+  left_join(ex$street15 %>% transmute(gid, street_buffer15_m2 = buffer_m2, street_canopy_pct_buf15 = 100 * c3), by = "gid") %>%
+  left_join(ex$cell %>% transmute(gid, cell_canopy_pct = 100 * c3), by = "gid")
+stopifnot(nrow(cells) == 10657)
+# Airport and port (spec 1.3): not eligible, kept out of every statistic and score below
+elig <- !cells$ua_not_eligible
+```
+
+```{r step3-nobuffer}
+nob <- cells %>% filter(!ua_not_eligible) %>%
+  summarise(eligible_cells = n(), cells_without_street_buffer = sum(is.na(street_canopy_pct)),
+            pct_cells = 100 * cells_without_street_buffer / eligible_cells,
+            population_without = sum(Total_Population[is.na(street_canopy_pct)]),
+            pct_population = 100 * population_without / sum(Total_Population),
+            without_buffer_15m = sum(is.na(street_canopy_pct_buf15)))
+ktab(nob, "Step 3d. Eligible cells with no street buffer (street_canopy_pct = NA)", 1)
+```
+
+# Step 4. Quality checks
+
+```{r step4-dist}
+e <- cells %>% filter(!ua_not_eligible)
+qtab <- bind_rows(lapply(c("perc_tree", "street_canopy_pct", "cell_canopy_pct", "street_canopy_pct_2m",
+                           "street_canopy_pct_5m", "street_canopy_pct_buf15"), function(v) {
+  x <- e[[v]]; s <- summary(x)
+  tibble(indicator = v, cells = sum(!is.na(x)), min = s[["Min."]], median = s[["Median"]], mean = s[["Mean"]],
+         p98 = quantile(x, 0.98, na.rm = TRUE), max = s[["Max."]],
+         zero_pct = 100 * mean(x[!is.na(x)] == 0), distinct_values = n_distinct(x[!is.na(x)]),
+         most_common_pct = 100 * max(table(x)) / sum(!is.na(x)))
+}))
+ktab(qtab, "Step 4a. Distribution over eligible cells (%)", 2)
+summary(e$street_canopy_pct)
+```
+
+```{r step4-hist, fig.height=3.5}
+e %>% select(perc_tree, street_canopy_pct, cell_canopy_pct) %>%
+  pivot_longer(everything(), names_to = "indicator", values_to = "pct") %>% filter(!is.na(pct)) %>%
+  ggplot(aes(pct)) + geom_histogram(bins = 60, fill = "grey40") + facet_wrap(~ indicator, scales = "free_y") +
+  scale_x_continuous(limits = c(-1, 60), oob = scales::squish) +
+  labs(x = "% (values above 60 shown at 60)", y = "Cells") + theme_minimal(base_size = 10)
+```
+
+```{r step4-agreement}
+both <- e %>% filter(!is.na(street_canopy_pct))
+ktab(tibble(pair = c("street_canopy_pct vs perc_tree", "cell_canopy_pct vs perc_tree",
+                     "street_canopy_pct vs cell_canopy_pct"),
+            cells = c(nrow(both), sum(!is.na(e$cell_canopy_pct)), nrow(both)),
+            spearman = c(cor(both$street_canopy_pct, both$perc_tree, method = "spearman"),
+                         cor(e$cell_canopy_pct, e$perc_tree, method = "spearman", use = "complete.obs"),
+                         cor(both$street_canopy_pct, both$cell_canopy_pct, method = "spearman"))),
+     "Step 4b. Spearman correlation, eligible cells")
+xt <- both %>% mutate(stl = ifelse(perc_tree == 0, "STL zero", "STL above zero"),
+                      can = ifelse(street_canopy_pct == 0, "Canopy zero", "Canopy above zero")) %>%
+  count(stl, can) %>% mutate(pct = 100 * n / sum(n)) %>%
+  pivot_wider(names_from = can, values_from = c(n, pct))
+ktab(xt, "Step 4b. Zero in Street Tree Layer vs zero street canopy (cells with a street buffer)", 1)
+```
+
+```{r step4-maps, fig.width=10, fig.height=10}
+zooms <- list(`Valletta and Floriana` = c("VALLETTA", "FLORIANA"),
+              `Sliema and Gzira` = c("SLIEMA", "GZIRA"),
+              `Hamrun and Marsa` = c("HAMRUN", "MARSA"))
+grid_vals <- malta %>% select(gid) %>% left_join(cells %>% select(gid, perc_tree, street_canopy_pct, ua_not_eligible), by = "gid")
+r_all <- vrt(file.path(CANOPY_DIR, paste0("chm_", tiles, ".tif")))
+fill_sc <- scale_fill_viridis_c(option = "viridis", limits = c(0, 30), oob = scales::squish, na.value = "grey85",
+                                name = "%", breaks = c(0, 10, 20, 30), labels = c("0", "10", "20", "30+"))
+zoom_row <- function(nm) {
+  z <- malta %>% filter(NAME %in% zooms[[nm]])
+  bb <- st_bbox(z)
+  g <- grid_vals %>% st_filter(st_as_sfc(bb)) %>% mutate(across(c(perc_tree, street_canopy_pct), ~ ifelse(ua_not_eligible, NA, .)))
+  outline <- st_union(z)
+  m1 <- ggplot(g) + geom_sf(aes(fill = perc_tree), colour = NA) + geom_sf(data = outline, fill = NA, colour = "grey20", linewidth = 0.3) +
+    fill_sc + coord_sf(xlim = bb[c(1, 3)], ylim = bb[c(2, 4)], expand = FALSE) + labs(tag = paste0(nm, "\nStreet Tree Layer")) + theme_lancet_map()
+  m2 <- ggplot(g) + geom_sf(aes(fill = street_canopy_pct), colour = NA) + geom_sf(data = outline, fill = NA, colour = "grey20", linewidth = 0.3) +
+    fill_sc + coord_sf(xlim = bb[c(1, 3)], ylim = bb[c(2, 4)], expand = FALSE) + labs(tag = " \nStreet canopy (3 m)") + theme_lancet_map()
+  bb_w <- st_as_sfc(bb) %>% st_transform(3857)
+  sat <- tryCatch(maptiles::get_tiles(bb_w, provider = "Esri.WorldImagery", zoom = 16, crop = TRUE,
+                                      cachedir = file.path(CANOPY_DIR, "tiles_cache")), error = function(e) NULL)
+  msk <- crop(r_all, ext(vect(bb_w))) >= 3
+  msk <- classify(msk, cbind(0, NA))
+  m3 <- ggplot()
+  if (!is.null(sat)) m3 <- m3 + tidyterra::geom_spatraster_rgb(data = sat)
+  m3 <- m3 + tidyterra::geom_spatraster(data = msk, maxcell = 4e6) +
+    scale_fill_gradient(low = "#39FF14", high = "#39FF14", na.value = NA, guide = "none") +
+    geom_sf(data = st_transform(outline, 3857), fill = NA, colour = "white", linewidth = 0.3) +
+    coord_sf(crs = 3857, expand = FALSE) + labs(tag = " \nCanopy 3 m on imagery") + theme_lancet_map()
+  if (nm == names(zooms)[3]) m3 <- m3 + lancet_scale_bar()
+  list(m1, m2, m3)
+}
+maps <- unlist(lapply(names(zooms), zoom_row), recursive = FALSE)
+p_maps <- wrap_plots(maps, ncol = 3) + plot_layout(guides = "collect")
+p_maps
+save_figure_lancet(p_maps, "street_greenery_maps_canopy", OUT_DIR, height_mm = 220)
+```
+
+# Step 5. Score with the canopy indicator
+
+`street_canopy_pct` is normalised like `perc_tree`: `1 - min max(x, 0, p98)`, less canopy = higher
+priority. The p98 is taken over eligible cells with a value (airport and port excluded, Step 2f); the
+current `norm_tree` uses the p98 over all cells. Citizen weights are recovered exactly from the saved
+score. The available weight rule is re-applied, so cells with no street buffer (NA) are scored on their
+other criteria when these carry at least 80% of the weight.
+
+```{r step5-setup}
+m_vars <- c("norm_lst", "norm_imd", "norm_dist_bs", "norm_Lden", "norm_traffic", "norm_no2", "norm_tree",
+            "norm_green_time", "norm_dist_rec", "norm_green_exp")
+m_lab  <- c("Urban heat", "Grey infrastructure", "Blue space", "Noise", "Traffic", "Air quality",
+            "Street greenery", "Green proximity", "Recreation", "Green per person")
+d0 <- st_drop_geometry(malta)
+cc <- d0[complete.cases(d0[, m_vars]) & !is.na(d0$priority_citizen), ]
+fit <- lm(reformulate(m_vars, "priority_citizen", intercept = FALSE), data = cc)
+stopifnot(max(abs(residuals(fit))) < 1e-8)
+w <- coef(fit)[m_vars]
+ktab(tibble(criterion = m_lab, weight_pct = 100 * w), "Citizen weights (%)", 1)
+
+norm_cost <- function(x) {
+  up <- quantile(x[elig], 0.98, na.rm = TRUE)
+  1 - normalize_minmax(x, 0, up)
+}
+score_variant <- function(norm_tree_new) {
+  S <- as.matrix(d0[, m_vars]); S[, "norm_tree"] <- norm_tree_new
+  A <- !is.na(S); S0 <- S; S0[!A] <- 0
+  wa <- as.numeric(A %*% w) / sum(w)
+  scored <- wa >= 0.8 - 1e-12 & !d0$ua_not_eligible
+  p <- as.numeric(S0 %*% w) / as.numeric(A %*% w); p[!scored] <- NA
+  list(S = S, scored = scored, priority = p)
+}
+# Current score reproduced
+cur <- score_variant(d0$norm_tree)
+stopifnot(identical(cur$scored, d0$scored), max(abs(cur$priority - d0$priority_citizen), na.rm = TRUE) < 1e-10)
+
+variants <- list(
+  `Current (Street Tree Layer)`   = d0$norm_tree,
+  `Street canopy 3 m, 10 m buffer` = norm_cost(cells$street_canopy_pct),
+  `Cell canopy 3 m`               = norm_cost(cells$cell_canopy_pct),
+  `Street canopy 2 m, 10 m buffer` = norm_cost(cells$street_canopy_pct_2m),
+  `Street canopy 5 m, 10 m buffer` = norm_cost(cells$street_canopy_pct_5m),
+  `Street canopy 3 m, 15 m buffer` = norm_cost(cells$street_canopy_pct_buf15))
+runs <- lapply(variants, score_variant)
+summary(variants[[2]][elig]); hist(variants[[2]][elig], breaks = 50, main = "norm_tree_canopy (street canopy 3 m, 10 m buffer)", xlab = "")
+```
+
+```{r step5-compare}
+top_q <- function(p) { q <- rep(NA, length(p)); q[!is.na(p)] <- dplyr::ntile(p[!is.na(p)], 5); q }
+contrib_tree <- function(run) {
+  q <- top_q(run$priority); top <- which(q == 5)
+  c5 <- colMeans(run$S[top, , drop = FALSE], na.rm = TRUE) * w
+  100 * c5["norm_tree"] / sum(c5)
+}
+compare <- function(nm) {
+  rv <- runs[[nm]]; both <- cur$scored & rv$scored
+  qc <- top_q(ifelse(both, cur$priority, NA)); qv <- top_q(ifelse(both, rv$priority, NA))
+  tibble(variant = nm, scored_cells = sum(rv$scored), common_cells = sum(both),
+         spearman = cor(cur$priority[both], rv$priority[both], method = "spearman"),
+         top_quintile_overlap_pct = 100 * mean(qv[which(qc == 5)] == 5),
+         cells_changing_quintile_pct = 100 * mean(qc[both] != qv[both]),
+         street_greenery_share_top_quintile_pct = contrib_tree(rv))
+}
+cmp_tab <- bind_rows(lapply(names(runs), compare))
+ktab(cmp_tab[1:2, ], "Step 5b. Citizen score with the canopy indicator vs current", 3)
+
+council_top <- function(run) tibble(NAME = d0$NAME, q = top_q(run$priority)) %>% filter(!is.na(q)) %>%
+  group_by(NAME) %>% summarise(cells = n(), top_quintile_pct = 100 * mean(q == 5), .groups = "drop") %>%
+  arrange(desc(top_quintile_pct))
+ct <- council_top(cur) %>% slice(1:5) %>% mutate(rank = 1:5) %>% select(rank, current = NAME, current_pct = top_quintile_pct) %>%
+  bind_cols(council_top(runs[[2]]) %>% slice(1:5) %>% select(canopy = NAME, canopy_pct = top_quintile_pct))
+ktab(ct, "Step 5b. Top 5 councils by share of scored cells in the top quintile", 1)
+```
+
+```{r step5-step3}
+topclass <- function(S) apply(S, 2, function(x) {
+  q <- quantile(x, 0.8, na.rm = TRUE); t <- !is.na(x) & x >= q
+  if (mean(t[!is.na(x)]) > 0.25) t <- !is.na(x) & x > q
+  t
+})
+step3 <- function(nm) {
+  rv <- runs[[nm]]; S <- rv$S[rv$scored, ]
+  tc <- topclass(S); obs <- rowSums(tc)
+  set.seed(SEED)
+  perm <- replicate(N_PERM, mean(rowSums(apply(tc, 2, sample)) >= 3))
+  tibble(variant = nm, scored_cells = nrow(S),
+         street_greenery_top_class_pct = 100 * mean(tc[, "norm_tree"]),
+         street_greenery_max_priority_pct = 100 * mean(S[, "norm_tree"] == 1, na.rm = TRUE),
+         cells_top_3plus = sum(obs >= 3), top_3plus_pct = 100 * mean(obs >= 3),
+         top_3plus_pct_shuffled = 100 * mean(perm), ratio_to_shuffled = mean(obs >= 3) / mean(perm))
+}
+s3_tab <- bind_rows(lapply(names(runs), step3))
+ktab(s3_tab[1:2, ], "Step 5c. Burden coincidence (Step 3 logic, same tie rule): current vs canopy", 3)
+```
+
+## Sensitivity
+
+```{r step5-sens}
+sens <- cmp_tab %>% select(variant, scored_cells, spearman, top_quintile_overlap_pct, street_greenery_share_top_quintile_pct) %>%
+  left_join(s3_tab %>% select(variant, street_greenery_top_class_pct, top_3plus_pct, ratio_to_shuffled), by = "variant")
+ktab(sens, "Step 5d. All variants: agreement with the current score and Step 3", 3)
+```
+
+```{r step5-map, fig.width=10, fig.height=5}
+pm <- malta %>% select(gid) %>% mutate(current = top_q(cur$priority), canopy = top_q(runs[[2]]$priority)) %>%
+  pivot_longer(c(current, canopy), names_to = "score", values_to = "quintile") %>%
+  mutate(score = factor(score, c("current", "canopy"), c("Current (Street Tree Layer)", "Street canopy 3 m")))
+p_q <- ggplot(pm) + geom_sf(aes(fill = factor(quintile)), colour = NA) + facet_wrap(~ score) +
+  scale_fill_viridis_d(option = "magma", direction = -1, na.value = "grey90", name = "Quintile", na.translate = FALSE) +
+  geom_sf(data = border, fill = NA, colour = "grey30", linewidth = 0.3) + theme_lancet_map()
+p_q
+save_figure_lancet(p_q, "priority_quintiles_canopy", OUT_DIR, height_mm = 90)
+```
+
+Street greenery criterion score (normalised, 1 = highest priority = least tree cover) with the current
+indicator and with the canopy indicator. Grey: no street buffer (canopy, NA); white: airport and port.
+
+```{r step5-criterion-map, fig.width=10, fig.height=5}
+crit_map <- malta %>% select(gid) %>%
+  mutate(`Street Tree Layer 2018` = ifelse(elig, d0$norm_tree, NA),
+         `Street canopy 3 m (10 m buffer)` = ifelse(elig, variants[[2]], NA)) %>%
+  filter(elig) %>%
+  pivot_longer(-c(gid, geometry), names_to = "indicator", values_to = "score") %>%
+  mutate(indicator = factor(indicator, c("Street Tree Layer 2018", "Street canopy 3 m (10 m buffer)")))
+# Outline each cell in its own fill colour, so no seams between cells (spec 8.2); one scale bar
+p_crit <- ggplot(crit_map) + geom_sf(aes(fill = score, colour = score), linewidth = 0.05) + facet_wrap(~ indicator) +
+  geom_sf(data = border, fill = NA, colour = "grey30", linewidth = 0.3) +
+  scale_fill_viridis_c(option = "magma", direction = -1, limits = c(0, 1), na.value = "grey80",
+                       name = "Street greenery\npriority (0 to 1)", aesthetics = c("fill", "colour")) +
+  lancet_scale_bar(data = data.frame(indicator = factor("Street Tree Layer 2018", levels(crit_map$indicator)))) +
+  theme_lancet_map() + theme(strip.text = element_text(size = 9))
+p_crit
+save_figure_lancet(p_crit, "street_greenery_score_maps_canopy", OUT_DIR, height_mm = 90)
+```
+
+# Step 6. Cells with no street buffer
+
+Eligible cells (airport and port excluded) where `street_canopy_pct` is NA because no kept OSM street
+passes within 10 m of the cell.
+
+```{r step6-setup}
+ua_lab <- c(`11100` = "Continuous urban fabric", `11210` = "Discontinuous dense urban fabric",
+            `11220` = "Discontinuous medium density urban fabric", `11230` = "Discontinuous low density urban fabric",
+            `11240` = "Discontinuous very low density urban fabric", `11300` = "Isolated structures",
+            `12100` = "Industrial, commercial, public, military and private units",
+            `12210` = "Fast transit roads", `12220` = "Other roads", `12230` = "Railways",
+            `12300` = "Port areas", `12400` = "Airports", `13100` = "Mineral extraction and dump sites",
+            `13300` = "Construction sites", `13400` = "Land without current use", `14100` = "Green urban areas",
+            `14110` = "Green urban areas", `14130` = "Green urban areas (other)", `14200` = "Sports and leisure facilities",
+            `21000` = "Arable land", `22000` = "Permanent crops", `23000` = "Pastures",
+            `24000` = "Complex and mixed cultivation", `31000` = "Forests", `32000` = "Herbaceous vegetation",
+            `33000` = "Open spaces with little or no vegetation", `40000` = "Wetlands", `50000` = "Water")
+nob_cells <- cells %>% filter(!ua_not_eligible, is.na(street_canopy_pct)) %>%
+  left_join(d0 %>% select(gid, ua_code_2021), by = "gid") %>%
+  mutate(ua_code_2021 = as.character(ua_code_2021),
+         ua_class = coalesce(unname(ua_lab[ua_code_2021]), ua_code_2021),
+         scored_current = cur$scored[match(gid, d0$gid)],
+         scored_canopy  = runs[[2]]$scored[match(gid, d0$gid)],
+         loses_score    = scored_current & !scored_canopy)
+stopifnot(!any(nob_cells$scored_canopy & !nob_cells$scored_current))
+```
+
+## 6.1 Count
+
+```{r step6-count}
+ktab(tibble(cells_without_buffer = nrow(nob_cells), pct_of_eligible = 100 * nrow(nob_cells) / sum(elig),
+            population = sum(nob_cells$Total_Population), populated_cells = sum(nob_cells$Total_Population > 0),
+            pct_of_population = 100 * sum(nob_cells$Total_Population) / sum(cells$Total_Population[elig])),
+     "6.1 Eligible cells with no street buffer", 1)
+summary(nob_cells$Total_Population)
+```
+
+## 6.2 Land use
+
+Urban Atlas 2021 majority class of each cell.
+
+```{r step6-landuse}
+lu_tab <- nob_cells %>% group_by(ua_class) %>%
+  summarise(cells = n(), pct_cells = 100 * n() / nrow(nob_cells), populated_cells = sum(Total_Population > 0),
+            population = sum(Total_Population), loses_score = sum(loses_score), .groups = "drop") %>%
+  arrange(desc(cells))
+ktab(lu_tab, "6.2 Cells with no street buffer by Urban Atlas 2021 class", 1)
+```
+
+## 6.3 Scoring
+
+A cell loses its score when it was scored in the current score but not with the canopy indicator: street
+greenery (`r round(100 * w["norm_tree"], 1)`% of the weight) and at least one more criterion are missing, so
+less than 80% of the weight is available. The table shows which other criteria are missing.
+
+```{r step6-scoring}
+lose <- nob_cells %>% filter(loses_score)
+ktab(tibble(cells_without_buffer = nrow(nob_cells), scored_current = sum(nob_cells$scored_current),
+            lose_score = nrow(lose), pct_lose = 100 * nrow(lose) / nrow(nob_cells),
+            population_losing = sum(lose$Total_Population), populated_cells_losing = sum(lose$Total_Population > 0)),
+     "6.3 Cells with no street buffer that lose their score", 1)
+miss_other <- d0[match(lose$gid, d0$gid), setdiff(m_vars, "norm_tree")]
+ktab(tibble(criterion = m_lab[m_vars != "norm_tree"], cells_missing = colSums(is.na(miss_other)),
+            pct_of_losing = 100 * colSums(is.na(miss_other)) / nrow(lose)) %>% filter(cells_missing > 0),
+     "6.3 Other criteria missing in the cells that lose their score", 1)
+```
+
+## 6.4 Map
+
+```{r step6-map, fig.width=8, fig.height=7}
+councils <- malta %>% group_by(NAME) %>% summarise(.groups = "drop")
+map_df <- malta %>% select(gid) %>% inner_join(nob_cells %>% select(gid, loses_score), by = "gid") %>%
+  mutate(status = ifelse(loses_score, "No street buffer, loses score", "No street buffer, still scored"))
+p_nob <- ggplot() +
+  geom_sf(data = malta %>% filter(!ua_not_eligible), fill = "grey92", colour = NA) +
+  geom_sf(data = map_df, aes(fill = status), colour = NA) +
+  geom_sf(data = councils, fill = NA, colour = "grey70", linewidth = 0.15) +
+  geom_sf(data = border, fill = NA, colour = "grey30", linewidth = 0.3) +
+  scale_fill_manual(values = c(`No street buffer, still scored` = "#F2A541", `No street buffer, loses score` = "#B2182B"),
+                    name = NULL) +
+  lancet_scale_bar() + theme_lancet_map() + theme(legend.position = "bottom")
+p_nob
+save_figure_lancet(p_nob, "no_street_buffer_map_canopy", OUT_DIR, height_mm = 150)
+```
+
+## 6.5 Three options for these cells
+
+(a) NA, handled by the available weight rule (the Step 5 run). (b) Street greenery priority = 0 (not
+applicable: no street, so no street tree need). (c) The current value from the Street Tree Layer
+(`norm_tree`). Every other cell keeps its canopy value.
+
+```{r step6-options}
+nc_main <- variants[[2]]
+na_idx <- which(is.na(cells$street_canopy_pct) & elig)
+opt_b <- nc_main; opt_b[na_idx] <- 0
+opt_c <- nc_main; opt_c[na_idx] <- d0$norm_tree[na_idx]
+runs_opt <- list(`(a) NA` = runs[[2]], `(b) Priority 0` = score_variant(opt_b), `(c) Street Tree Layer value` = score_variant(opt_c))
+opt_tab <- bind_rows(lapply(names(runs_opt), function(nm) {
+  rv <- runs_opt[[nm]]; both <- cur$scored & rv$scored
+  qc <- top_q(ifelse(both, cur$priority, NA)); qv <- top_q(ifelse(both, rv$priority, NA))
+  tibble(option = nm, scored_cells = sum(rv$scored),
+         spearman = cor(cur$priority[both], rv$priority[both], method = "spearman"),
+         top_quintile_overlap_pct = 100 * mean(qv[which(qc == 5)] == 5),
+         top5_councils = paste(council_top(rv)$NAME[1:5], collapse = ", "))
+}))
+opt_tab <- bind_rows(tibble(option = "Current score", scored_cells = sum(cur$scored), spearman = 1,
+                            top_quintile_overlap_pct = 100, top5_councils = paste(council_top(cur)$NAME[1:5], collapse = ", ")),
+                     opt_tab)
+ktab(opt_tab, "6.5 Options for cells with no street buffer, compared with the current score", 3)
+```
+
+## 6.6 Populated cells with no street buffer
+
+For each cell: distance from the cell to the nearest kept street, to the nearest OSM way of any class, and
+the class of that way. Reading: a kept street within 10 to 30 m means the buffer just misses the cell (buffer
+problem); a service road, footway, track or steps inside or next to the cell means the cell is served by a
+class we exclude (class choice); no OSM way within 50 m in a built up class suggests a street missing in OSM.
+
+```{r step6-populated}
+pop_nob <- malta %>% select(gid) %>% inner_join(nob_cells %>% filter(Total_Population > 0), by = "gid")
+streets_u <- st_union(streets)
+any_way <- hw %>% filter(!is.na(highway)) %>% st_filter(st_buffer(st_as_sfc(st_bbox(pop_nob)), 200))
+near_any <- st_nearest_feature(pop_nob, any_way)
+diag <- pop_nob %>% mutate(
+  dist_kept_street_m = as.numeric(st_distance(., streets_u))[seq_len(nrow(pop_nob))],
+  nearest_way_class  = any_way$highway[near_any],
+  dist_any_way_m     = as.numeric(st_distance(., any_way[near_any, ], by_element = TRUE))) %>%
+  st_drop_geometry() %>%
+  mutate(reading = case_when(
+    dist_kept_street_m <= 30 ~ "Buffer: kept street within 30 m",
+    dist_any_way_m <= 10     ~ paste0("Class choice: served by ", nearest_way_class),
+    dist_any_way_m > 50 & substr(ua_code_2021, 1, 2) == "11" ~ "Possible street missing in OSM",
+    TRUE                     ~ "No street nearby (non residential land)")) %>%
+  select(gid, council = NAME, ua_class, population = Total_Population, dist_kept_street_m, nearest_way_class,
+         dist_any_way_m, loses_score, reading) %>%
+  arrange(desc(population))
+ktab(diag %>% count(reading, wt = NULL, name = "cells") %>%
+       left_join(diag %>% group_by(reading) %>% summarise(population = sum(population)), by = "reading"),
+     "6.6 Populated cells with no street buffer, by likely reason", 1)
+ktab(head(diag, 40), paste0("6.6 Populated cells with no street buffer (", nrow(diag), " cells; 40 most populated shown, all in the CSV)"), 1)
+readr::write_csv(diag, file.path(OUT_DIR, "populated_no_street_buffer_canopy.csv"))
+```
+
+## 6.7 Summary
+
+```{r step6-summary}
+s <- list(n = nrow(nob_cells), pct = 100 * nrow(nob_cells) / sum(elig), pop = sum(nob_cells$Total_Population),
+          lose = nrow(lose), lose_pop = sum(lose$Total_Population), top_lu = lu_tab$ua_class[1:3])
+cat(sprintf(paste0("%d eligible cells (%.1f%%) have no street buffer; they hold %.0f residents. ",
+                   "The most common land uses are %s. %d of them lose their score under option (a), with %.0f residents. ",
+                   "Options: %s."),
+            s$n, s$pct, s$pop, paste(s$top_lu, collapse = ", "), s$lose, s$lose_pop,
+            paste(sprintf("%s Spearman %.3f, top quintile overlap %.1f%%, %d cells scored", opt_tab$option[-1],
+                          opt_tab$spearman[-1], opt_tab$top_quintile_overlap_pct[-1], opt_tab$scored_cells[-1]),
+                  collapse = "; ")))
+```
+
+# Step 7. Fair comparison of the canopy indicator
+
+Option (b) as the main canopy variant: eligible cells with no street buffer get street greenery
+criterion score = 0 (not applicable: no street, no street tree need). This is treated as a value, not as
+missing data, so the 80% available weight rule is unchanged for every other criterion. Note: spec 4.2
+says missing values are never set to 0; here the zero is a definition (no street), not an imputed value.
+
+```{r step7-setup}
+to_opt_b <- function(norm_x) { norm_x[is.na(norm_x) & elig] <- 0; norm_x }
+step3_run <- function(rv, nm) {
+  S <- rv$S[rv$scored, ]; tc <- topclass(S); obs <- rowSums(tc)
+  set.seed(SEED)
+  perm <- replicate(N_PERM, mean(rowSums(apply(tc, 2, sample)) >= 3))
+  tibble(variant = nm, scored_cells = nrow(S),
+         street_greenery_top_class_pct = 100 * mean(tc[, "norm_tree"]),
+         top_3plus_pct = 100 * mean(obs >= 3), top_3plus_pct_shuffled = 100 * mean(perm),
+         ratio_to_shuffled = mean(obs >= 3) / mean(perm))
+}
+# Two scores compared on the cells scored in both; quintiles over all scored cells of each score
+pair_cmp <- function(ra, rb, subset = rep(TRUE, length(ra$priority))) {
+  qa <- top_q(ra$priority); qb <- top_q(rb$priority)
+  k <- ra$scored & rb$scored & subset
+  c(cells = sum(k),
+    spearman = cor(ra$priority[k], rb$priority[k], method = "spearman"),
+    top_quintile_overlap_pct = 100 * sum(qa == 5 & qb == 5 & k) / sum(qa == 5 & k),
+    cells_changing_quintile_pct = 100 * mean(qa[k] != qb[k]))
+}
+runs_b <- list(
+  `Street canopy 3 m, 10 m buffer` = score_variant(to_opt_b(norm_cost(cells$street_canopy_pct))),
+  `Street canopy 3 m, 15 m buffer` = score_variant(to_opt_b(norm_cost(cells$street_canopy_pct_buf15))),
+  `Street canopy 2 m, 10 m buffer` = score_variant(to_opt_b(norm_cost(cells$street_canopy_pct_2m))),
+  `Street canopy 5 m, 10 m buffer` = score_variant(to_opt_b(norm_cost(cells$street_canopy_pct_5m))))
+canb <- runs_b[[1]]
+stopifnot(sum(canb$scored) == 10194, identical(canb$scored, cur$scored))
+cat("Scored cells under option (b):", sum(canb$scored), "(current:", sum(cur$scored), ")\n")
+summary(canb$S[canb$scored, "norm_tree"])
+hist(canb$S[canb$scored, "norm_tree"], breaks = 50, main = "Street greenery score, option (b)", xlab = "")
+```
+
+## 7a. Option (b) vs the current score
+
+```{r step7a}
+pc <- pair_cmp(cur, canb)
+t7a <- tibble(comparison = "Canopy option (b) vs current (Street Tree Layer)", scored_cells = sum(canb$scored),
+              spearman = pc[["spearman"]], top_quintile_overlap_pct = pc[["top_quintile_overlap_pct"]],
+              cells_changing_quintile_pct = pc[["cells_changing_quintile_pct"]],
+              street_greenery_share_top_quintile_current_pct = contrib_tree(cur),
+              street_greenery_share_top_quintile_canopy_pct = contrib_tree(canb))
+ktab(t7a, "7a. Canopy option (b) compared with the current score", 3)
+
+ct_b <- council_top(cur) %>% slice(1:5) %>% mutate(rank = 1:5) %>%
+  select(rank, current = NAME, current_pct = top_quintile_pct) %>%
+  bind_cols(council_top(canb) %>% slice(1:5) %>% select(canopy = NAME, canopy_pct = top_quintile_pct))
+ktab(ct_b, "7a. Top 5 councils by share of scored cells in the top quintile (%)", 1)
+
+s3_b <- bind_rows(step3_run(cur, "Current (Street Tree Layer)"), step3_run(canb, "Canopy option (b)"))
+ktab(s3_b, "7a. Burden coincidence (Step 3 logic, same tie rule) under option (b)", 3)
+```
+
+## 7b. Populated cells
+
+Quintiles computed over all scored cells, as in the main map; reported among populated cells only.
+
+```{r step7b}
+pop <- d0$Total_Population; popd <- pop > 0
+pcp <- pair_cmp(cur, canb, popd)
+pop_q5 <- function(rv) { q <- top_q(rv$priority); 100 * sum(pop[q == 5 & popd], na.rm = TRUE) / sum(pop[rv$scored & popd]) }
+t7b <- tibble(set = "Populated scored cells", cells = pcp[["cells"]], spearman = pcp[["spearman"]],
+              top_quintile_overlap_pct = pcp[["top_quintile_overlap_pct"]],
+              population_in_top_quintile_current_pct = pop_q5(cur),
+              population_in_top_quintile_canopy_pct = pop_q5(canb))
+ktab(t7b, "7b. Current vs canopy option (b), populated cells", 3)
+```
+
+## 7c. Variants compared with each other
+
+```{r step7c}
+pairs <- list(c("Street canopy 3 m, 10 m buffer", "Street canopy 3 m, 15 m buffer"),
+              c("Street canopy 3 m, 10 m buffer", "Street canopy 2 m, 10 m buffer"),
+              c("Street canopy 3 m, 10 m buffer", "Street canopy 5 m, 10 m buffer"))
+lab_pair <- c("10 m vs 15 m buffer (3 m height)", "3 m vs 2 m height (10 m buffer)", "3 m vs 5 m height (10 m buffer)")
+t7c <- bind_rows(lapply(seq_along(pairs), function(i) {
+  a <- runs_b[[pairs[[i]][1]]]; b <- runs_b[[pairs[[i]][2]]]
+  pa <- pair_cmp(a, b); pp <- pair_cmp(a, b, popd)
+  tibble(comparison = lab_pair[i], spearman_all = pa[["spearman"]], top_quintile_overlap_all_pct = pa[["top_quintile_overlap_pct"]],
+         spearman_populated = pp[["spearman"]], top_quintile_overlap_populated_pct = pp[["top_quintile_overlap_pct"]])
+}))
+ktab(t7c, "7c. Canopy variants under option (b), compared with each other", 3)
+```
+
+# Step 8. Street half width (centreline to facade)
+
+## 8a. Streets and buildings
+
+Streets: the kept OSM classes of Step 3. Buildings, main source: Microsoft Global ML Building Footprints
+(github.com/microsoft/GlobalMLBuildingFootprints, CDLA Permissive 2.0), release folder `2026-02-03`,
+uploaded 2026-02-23, two quadkey files for Malta, saved in `data/malta/buildings_microsoft/` (outside git).
+The files have no imagery capture dates (height and confidence are −1 for every footprint). Secondary
+source: OSM footprints (`building` key), downloaded with `osmdata` from Overpass on 23 November 2026,
+cached in `data/malta/canopy_meta/osm_buildings_malta.gpkg`.
+
+```{r step8a}
+MS_DIR <- here::here("data/malta/buildings_microsoft")
+ms_links <- readr::read_csv(file.path(MS_DIR, "dataset-links.csv"), show_col_types = FALSE) %>% filter(Location == "Malta")
+ktab(ms_links %>% select(QuadKey, Size, UploadDate) %>% mutate(release = sub(".*global-buildings/([0-9-]+)/.*", "\\1", ms_links$Url)),
+     "8a. Microsoft footprint files used")
+area_mask <- st_buffer(grid_union, 50)
+bld_osm <- st_read(file.path(CANOPY_DIR, "osm_buildings_malta.gpkg"), quiet = TRUE) %>% st_transform(CRS_M)
+bld_ms  <- st_read(file.path(MS_DIR, "malta_buildings.geojsonl"), quiet = TRUE) %>% st_make_valid() %>%
+  st_transform(CRS_M) %>% st_filter(area_mask)
+cat("Buildings in the study area: Microsoft", nrow(bld_ms), "| OSM", nrow(bld_osm), "\n")
+
+cover <- function(b, nm) suppressWarnings(st_intersection(malta %>% select(gid), st_union(b))) %>%
+  mutate(!!nm := 100 * as.numeric(st_area(.)) / 1e4) %>% st_drop_geometry()
+cov_cells <- d0 %>% select(gid, ua_code_2021, NAME) %>% mutate(ua_code_2021 = as.character(ua_code_2021)) %>%
+  left_join(cover(bld_osm, "osm_cover_pct"), by = "gid") %>% left_join(cover(bld_ms, "ms_cover_pct"), by = "gid") %>%
+  mutate(across(c(osm_cover_pct, ms_cover_pct), ~ coalesce(., 0)))
+ktab(cov_cells %>% filter(substr(ua_code_2021, 1, 2) == "11") %>% group_by(ua_class = unname(ua_lab[ua_code_2021])) %>%
+       summarise(cells = n(), median_cover_microsoft_pct = median(ms_cover_pct), median_cover_osm_pct = median(osm_cover_pct),
+                 no_building_microsoft_pct = 100 * mean(ms_cover_pct == 0), no_building_osm_pct = 100 * mean(osm_cover_pct == 0),
+                 .groups = "drop") %>% arrange(desc(cells)),
+     "8a. Completeness check: building footprint cover in urban fabric cells, Microsoft vs OSM", 1)
+summary(cov_cells$ms_cover_pct)
+hist(cov_cells$ms_cover_pct[substr(cov_cells$ua_code_2021, 1, 2) == "11"], breaks = 50,
+     main = "Microsoft building cover, urban fabric cells (%)", xlab = "")
+```
+
+## 8b and 8c. Transects and half width
+
+Every 20 m along each kept street, a line perpendicular to it, 30 m to each side. Transects within 15 m of a
+junction (a node shared by three or more kept street segments) are skipped. Half width = distance from the
+centreline to the first building the transect meets, per side; no building within 30 m = NA (open side).
+Full width = sum of both sides where both are measured. The same transects are used for both building sources.
+
+```{r step8-transects}
+CACHE8 <- file.path(CANOPY_DIR, "street_halfwidth_transects.rds")
+if (!file.exists(CACHE8)) {
+  sl <- hw %>% filter(highway %in% STREET_CLASSES) %>% st_cast("LINESTRING", warn = FALSE) %>%
+    mutate(way = row_number())
+  # Junctions: node degree from all kept segments (interior vertex 2, endpoint 1); degree >= 3
+  vx <- bind_rows(lapply(seq_len(nrow(sl)), function(i) {
+    xy <- st_coordinates(sl$geom[i])[, 1:2, drop = FALSE]; n <- nrow(xy)
+    tibble(x = xy[, 1], y = xy[, 2], deg = c(1, rep(2, max(n - 2, 0)), 1)[seq_len(n)])
+  })) %>% mutate(key = paste(round(x, 1), round(y, 1))) %>%
+    group_by(key) %>% summarise(x = first(x), y = first(y), deg = sum(deg), .groups = "drop") %>% filter(deg >= 3)
+  junc <- st_as_sf(vx, coords = c("x", "y"), crs = CRS_M)
+  # Points every 20 m with the local direction
+  tr <- bind_rows(lapply(seq_len(nrow(sl)), function(i) {
+    xy <- st_coordinates(sl$geom[i])[, 1:2, drop = FALSE]
+    d <- c(0, cumsum(sqrt(rowSums(diff(xy)^2)))); L <- max(d)
+    if (L < 20) return(NULL)
+    s <- seq(10, L - 10, by = 20); seg <- pmin(findInterval(s, d, rightmost.closed = TRUE), nrow(xy) - 1)
+    f <- (s - d[seg]) / (d[seg + 1] - d[seg])
+    px <- xy[seg, 1] + f * (xy[seg + 1, 1] - xy[seg, 1]); py <- xy[seg, 2] + f * (xy[seg + 1, 2] - xy[seg, 2])
+    dx <- xy[seg + 1, 1] - xy[seg, 1]; dy <- xy[seg + 1, 2] - xy[seg, 2]; len <- sqrt(dx^2 + dy^2)
+    tibble(way = sl$way[i], highway = sl$highway[i], x = px, y = py, nx = -dy / len, ny = dx / len)
+  })) %>% filter(is.finite(nx)) %>% mutate(tid = row_number())
+  pts <- st_as_sf(tr, coords = c("x", "y"), crs = CRS_M, remove = FALSE)
+  near_j <- lengths(st_is_within_distance(pts, junc, 15)) > 0
+  in_grid <- lengths(st_intersects(pts, grid_union)) > 0
+  pts <- pts[!near_j & in_grid, ]
+  sides <- bind_rows(lapply(c(left = 1, right = -1), function(sg) {
+    p <- st_drop_geometry(pts)
+    geo <- lapply(seq_len(nrow(p)), function(j)
+      st_linestring(rbind(c(p$x[j], p$y[j]), c(p$x[j] + sg * 30 * p$nx[j], p$y[j] + sg * 30 * p$ny[j]))))
+    st_sf(tid = p$tid, side = ifelse(sg == 1, "left", "right"), geometry = st_sfc(geo, crs = CRS_M))
+  }))
+  saveRDS(list(pts = pts, sides = sides, n_junctions = nrow(junc), n_before_junction_filter = nrow(tr),
+               n_junction_skipped = sum(near_j)), CACHE8)
+}
+T8 <- readRDS(CACHE8)
+sides_geo <- T8$sides %>% mutate(sid = row_number()) %>% select(sid, tid, side)
+
+# Distance from the centreline point to the first building along each side, per building source
+half_width <- function(bld, cache) {
+  if (file.exists(cache)) return(readRDS(cache))
+  hit <- suppressWarnings(st_intersection(sides_geo, bld %>% select()))
+  o <- st_as_sf(st_drop_geometry(T8$pts)[match(hit$tid, T8$pts$tid), c("x", "y")], coords = c("x", "y"), crs = CRS_M)
+  out <- hit %>% mutate(d = as.numeric(st_distance(o, hit, by_element = TRUE))) %>% st_drop_geometry() %>%
+    group_by(sid) %>% summarise(half_width_m = min(d), .groups = "drop")
+  saveRDS(out, cache); out
+}
+hw_ms  <- half_width(bld_ms,  file.path(MS_DIR, "street_halfwidth_microsoft.rds"))
+hw_osm <- half_width(bld_osm, file.path(CANOPY_DIR, "street_halfwidth_osm.rds"))
+
+pts8 <- T8$pts %>% st_join(malta %>% select(gid), join = st_within) %>%
+  left_join(cov_cells %>% select(gid, ua_code_2021, osm_cover_pct, ms_cover_pct), by = "gid")
+sides8 <- st_drop_geometry(sides_geo) %>%
+  left_join(hw_ms, by = "sid") %>%
+  left_join(hw_osm %>% rename(half_width_osm_m = half_width_m), by = "sid") %>%
+  left_join(st_drop_geometry(pts8) %>% select(tid, highway, gid, ua_code_2021, osm_cover_pct, ms_cover_pct), by = "tid") %>%
+  mutate(ua_class = coalesce(unname(ua_lab[ua_code_2021]), ua_code_2021))
+full8 <- sides8 %>% group_by(tid) %>%
+  summarise(full_width_m = if (n() == 2 && all(!is.na(half_width_m))) sum(half_width_m) else NA_real_,
+            full_width_osm_m = if (n() == 2 && all(!is.na(half_width_osm_m))) sum(half_width_osm_m) else NA_real_,
+            .groups = "drop")
+cat("Transect points before junction filter:", T8$n_before_junction_filter, "| skipped near a junction:",
+    T8$n_junction_skipped, "| junctions:", T8$n_junctions, "| transects kept:", nrow(T8$pts), "\n")
+summary(sides8$half_width_m)
+hist(sides8$half_width_m, breaks = 60, main = "Half width, measured sides, Microsoft (m)", xlab = "m")
+```
+
+## 8d. Results
+
+Main: Microsoft footprints. OSM as secondary columns. "Well mapped OSM cells": OSM building cover of at
+least 30% of the cell.
+
+```{r step8d}
+hw_stats <- function(d, by = NULL, col = "half_width_m") {
+  g <- if (is.null(by)) d %>% mutate(group = "All") else d %>% mutate(group = .data[[by]])
+  g %>% mutate(v = .data[[col]]) %>% group_by(group) %>% summarise(
+    transects = n_distinct(tid), sides = n(), measured_sides = sum(!is.na(v)), measured_pct = 100 * mean(!is.na(v)),
+    median_m = median(v, na.rm = TRUE), q25_m = quantile(v, 0.25, na.rm = TRUE), q75_m = quantile(v, 0.75, na.rm = TRUE),
+    p90_m = quantile(v, 0.90, na.rm = TRUE),
+    within_10m_pct = 100 * mean(v <= 10, na.rm = TRUE), within_15m_pct = 100 * mean(v <= 15, na.rm = TRUE),
+    .groups = "drop")
+}
+with_osm <- function(d, by = NULL) {
+  hw_stats(d, by) %>%
+    left_join(hw_stats(d, by, "half_width_osm_m") %>%
+                select(group, osm_measured_pct = measured_pct, osm_median_m = median_m, osm_within_10m_pct = within_10m_pct),
+              by = "group") %>% arrange(desc(sides))
+}
+well <- sides8 %>% filter(osm_cover_pct >= 30)
+t8_all <- bind_rows(with_osm(sides8) %>% mutate(group = "All transects"),
+                    with_osm(well) %>% mutate(group = "Well mapped OSM cells"))
+ktab(t8_all, "8d. Street half width (m): Microsoft (main), OSM (secondary columns)", 1)
+ktab(tibble(set = c("All transects", "Well mapped OSM cells"),
+            median_full_width_m = c(median(full8$full_width_m, na.rm = TRUE), median(full8$full_width_m[full8$tid %in% well$tid], na.rm = TRUE)),
+            transects_with_full_width = c(sum(!is.na(full8$full_width_m)), sum(!is.na(full8$full_width_m[full8$tid %in% well$tid]))),
+            osm_median_full_width_m = c(median(full8$full_width_osm_m, na.rm = TRUE), median(full8$full_width_osm_m[full8$tid %in% well$tid], na.rm = TRUE))),
+     "8d. Full width (both sides measured), Microsoft and OSM", 1)
+t8_hw <- with_osm(sides8, "highway")
+ktab(t8_hw, "8d. Half width by highway class", 1)
+t8_ua <- with_osm(sides8 %>% filter(!is.na(ua_class)), "ua_class") %>% filter(sides >= 100)
+ktab(t8_ua, "8d. Half width by Urban Atlas 2021 class of the cell (classes with 100 or more sides)", 1)
+readr::write_csv(bind_rows(t8_all, t8_hw, t8_ua), file.path(OUT_DIR, "street_halfwidth_canopy.csv"))
+```
+
+## 8d. Check: Microsoft vs OSM on the same transects
+
+In well mapped OSM cells, sides measured with both sources. A systematic difference would point to shifted
+Microsoft footprints (imagery offset or building lean, parallax).
+
+```{r step8-check}
+both8 <- well %>% filter(!is.na(half_width_m), !is.na(half_width_osm_m)) %>% mutate(diff_m = half_width_m - half_width_osm_m)
+t8_chk <- tibble(sides_both_measured = nrow(both8), median_microsoft_m = median(both8$half_width_m),
+                 median_osm_m = median(both8$half_width_osm_m), median_difference_m = median(both8$diff_m),
+                 diff_q25_m = quantile(both8$diff_m, 0.25), diff_q75_m = quantile(both8$diff_m, 0.75),
+                 within_1m_pct = 100 * mean(abs(both8$diff_m) <= 1),
+                 spearman = cor(both8$half_width_m, both8$half_width_osm_m, method = "spearman"))
+ktab(t8_chk, "8d. Microsoft minus OSM half width on the same sides, well mapped OSM cells", 2)
+summary(both8$diff_m)
+ggplot(both8, aes(diff_m)) + geom_histogram(binwidth = 0.5, fill = "grey40") +
+  coord_cartesian(xlim = c(-10, 10)) + labs(x = "Microsoft minus OSM half width (m)", y = "Sides") + theme_minimal(base_size = 10)
+readr::write_csv(t8_chk, file.path(OUT_DIR, "street_halfwidth_ms_vs_osm_canopy.csv"))
+```
+
+## 8e. Visual check
+
+Microsoft footprints (filled) and OSM footprints (white outline), transects coloured by whether they hit a
+Microsoft building within 30 m.
+
+```{r step8e, fig.width=10, fig.height=4.5}
+zoom8 <- list(Valletta = "VALLETTA", Sliema = "SLIEMA", Swieqi = "SWIEQI")
+ms_w <- st_transform(bld_ms, 3857); osm_w <- st_transform(bld_osm, 3857)
+side_geo <- sides_geo %>% left_join(hw_ms, by = "sid") %>%
+  mutate(status = ifelse(is.na(half_width_m), "No building within 30 m", "Building hit")) %>% st_transform(3857)
+z8 <- lapply(names(zoom8), function(nm) {
+  cen <- malta %>% filter(NAME == zoom8[[nm]]) %>% st_union() %>% st_centroid()
+  box <- st_buffer(cen, 300, endCapStyle = "SQUARE") %>% st_transform(3857)
+  sat <- tryCatch(maptiles::get_tiles(box, provider = "Esri.WorldImagery", zoom = 17, crop = TRUE,
+                                      cachedir = file.path(CANOPY_DIR, "tiles_cache")), error = function(e) NULL)
+  bb <- st_bbox(box)
+  p <- ggplot()
+  if (!is.null(sat)) p <- p + tidyterra::geom_spatraster_rgb(data = sat)
+  p + geom_sf(data = st_crop(ms_w, bb), fill = "#F2A541", colour = NA, alpha = 0.5) +
+    geom_sf(data = st_crop(osm_w, bb), fill = NA, colour = "white", linewidth = 0.2) +
+    geom_sf(data = st_crop(side_geo, bb), aes(colour = status), linewidth = 0.3) +
+    scale_colour_manual(values = c(`Building hit` = "#00E5FF", `No building within 30 m` = "#FF2D55"), name = NULL) +
+    coord_sf(crs = 3857, xlim = bb[c(1, 3)], ylim = bb[c(2, 4)], expand = FALSE) +
+    labs(tag = nm) + theme_lancet_map()
+})
+z8[[3]] <- z8[[3]] + lancet_scale_bar()
+p8 <- wrap_plots(z8, ncol = 3) + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+p8
+save_figure_lancet(p8, "street_halfwidth_transects_canopy", OUT_DIR, height_mm = 85)
+```
+
+# Step 9. Log decision for street greenery
+
+Distributions and normalisation bounds use eligible cells with a street buffer only (airport and port
+excluded). In the score, cells with no street buffer get criterion score 0 (option (b), spec 4.2 "not
+applicable"). Nothing in the main scoring notebook changes.
+
+## 9a. Distributions
+
+```{r step9a, fig.width=10, fig.height=3.5}
+skew <- function(x) e1071::skewness(x[!is.na(x)], type = 2)
+sg <- cells$street_canopy_pct[elig & !is.na(cells$street_canopy_pct)]
+t9a <- tibble(cells_with_buffer = length(sg), cells_at_zero = sum(sg == 0), zero_pct = 100 * mean(sg == 0),
+              skewness_raw = skew(sg), skewness_raw_above_0 = skew(sg[sg > 0]),
+              skewness_log10_above_0 = skew(log10(sg[sg > 0])), skewness_log10_plus1_all = skew(log10(sg + 1)))
+ktab(t9a, "9a. street_canopy_pct, eligible cells with a street buffer", 2)
+
+h9 <- bind_rows(tibble(panel = "street_canopy_pct (%), all cells", x = sg),
+                tibble(panel = "log10(street_canopy_pct + 1), all cells", x = log10(sg + 1)),
+                tibble(panel = "log10(street_canopy_pct), cells above 0", x = log10(sg[sg > 0]))) %>%
+  mutate(panel = factor(panel, unique(panel)))
+p9a <- ggplot(h9, aes(x)) + geom_histogram(bins = 60, fill = "grey40") +
+  facet_wrap(~ panel, scales = "free") + labs(x = NULL, y = "Cells") + theme_lancet()
+p9a
+save_figure_lancet(p9a, "street_canopy_log_hist_canopy", OUT_DIR, height_mm = 70)
+
+# Every Malta criterion: skewness of the raw indicator and of the criterion score as the score reads it
+# (norm_*), eligible cells with a value. Transform as in Malta_MCDA_260702_realloc.Rmd, chunk normalization.
+crit9 <- tribble(
+  ~criterion,            ~indicator,                          ~norm,             ~transform_in_score,
+  "Urban heat",          "lst",                               "norm_lst",        "min max, min to p98",
+  "Grey infrastructure", "imd",                               "norm_imd",        "min max, 0 to 100",
+  "Blue space",          "dist_bs",                           "norm_dist_bs",    "min max, 0 to p98",
+  "Noise",               "Lden",                              "norm_Lden",       "min max, min to p98",
+  "Traffic",             "new_trafficvol",                    "norm_traffic",    "classes (0, 0.25, 0.5, 0.75, 1)",
+  "Air quality",         "no2_avg_21",                        "norm_no2",        "min max, min to p98",
+  "Street greenery",     "perc_tree",                         "norm_tree",       "1 minus min max, 0 to p98",
+  "Green proximity",     "nearest_green_min",                 "norm_green_time", "min max, 0 to p98 (eligible)",
+  "Recreation",          "walk_dist_m",                       "norm_dist_rec",   "min max, 300 m to p98",
+  "Green per person",    "green_m2_e2sfca_per_person_gauss",  "norm_green_exp",  "LOG: log10, p2 to p98, cost")
+sk_lin <- skew(norm_cost(cells$street_canopy_pct)[elig])
+t9a_all <- crit9 %>% rowwise() %>%
+  mutate(cells = sum(!is.na(d0[[norm]][elig])),
+         skewness_raw = skew(d0[[indicator]][elig]),
+         skewness_score = skew(d0[[norm]][elig])) %>% ungroup() %>%
+  bind_rows(tibble(criterion = "Street greenery (canopy)", indicator = "street_canopy_pct",
+                   norm = "norm_cost(street_canopy_pct)", transform_in_score = "1 minus min max, 0 to p98 (linear, candidate)",
+                   cells = length(sg), skewness_raw = skew(sg), skewness_score = sk_lin))
+ktab(t9a_all %>% select(-norm), "9a. Skewness of every Malta criterion (eligible cells with a value)", 2)
+```
+
+Only green per person is log transformed in the current score (traffic log continuous is a sensitivity
+analysis only, spec 5.3). Positive skewness of a score means most cells sit at low priority.
+
+## 9b. Linear vs log normalisation
+
+```{r step9b, fig.width=10, fig.height=3.5}
+# Green per person rule (spec 3.4) mirrored for a cost criterion
+norm_cost_log <- function(x) {
+  lx  <- ifelse(!is.na(x) & x > 0, log10(x), NA_real_)
+  ref <- elig & !is.na(lx)
+  lo <- quantile(lx[ref], 0.02); hi <- quantile(lx[ref], 0.98)
+  out <- case_when(is.na(x) ~ NA_real_,
+                   x == 0   ~ 1,
+                   TRUE     ~ 1 - (pmin(pmax(lx, lo), hi) - lo) / (hi - lo))
+  attr(out, "bounds_pct") <- unname(10^c(lo, hi))
+  out
+}
+n_lin <- norm_cost(cells$street_canopy_pct)
+n_log <- norm_cost_log(cells$street_canopy_pct)
+b_log <- attr(n_log, "bounds_pct"); n_log <- as.numeric(n_log)
+cat("Linear: p98 bound =", round(quantile(sg, 0.98), 2), "%\n")
+cat("Log: p2 and p98 bounds of cells above 0 =", round(b_log, 3), "% (cells at or below the p2 bound also score 1)\n")
+
+hb <- elig & !is.na(cells$street_canopy_pct)
+summary(n_lin[hb]); summary(n_log[hb])
+h9b <- bind_rows(tibble(panel = "Linear", score = n_lin[hb]), tibble(panel = "Log", score = n_log[hb])) %>%
+  mutate(panel = factor(panel, c("Linear", "Log")))
+p9b <- ggplot(h9b, aes(score)) + geom_histogram(bins = 50, fill = "grey40") + facet_wrap(~ panel) +
+  labs(x = "Street greenery criterion score (1 = highest priority)", y = "Cells") + theme_lancet()
+p9b
+save_figure_lancet(p9b, "street_greenery_norm_lin_log_canopy", OUT_DIR, height_mm = 70)
+
+at_q <- function(p) {
+  v <- quantile(sg, p, names = FALSE)
+  tibble(canopy_quantile = paste0("p", 100 * p), street_canopy_pct = v,
+         score_linear = 1 - normalize_minmax(v, 0, quantile(sg, 0.98, names = FALSE)),
+         score_log = if (v == 0) 1 else 1 - (min(max(log10(v), log10(b_log[1])), log10(b_log[2])) - log10(b_log[1])) /
+                                         (log10(b_log[2]) - log10(b_log[1])))
+}
+t9b <- bind_rows(lapply(c(0.25, 0.5, 0.75), at_q))
+t9b_dist <- tibble(normalisation = c("Linear", "Log"),
+                   mean = c(mean(n_lin[hb]), mean(n_log[hb])), median = c(median(n_lin[hb]), median(n_log[hb])),
+                   at_1_pct = 100 * c(mean(n_lin[hb] == 1), mean(n_log[hb] == 1)),
+                   at_0_pct = 100 * c(mean(n_lin[hb] == 0), mean(n_log[hb] == 0)),
+                   skewness = c(skew(n_lin[hb]), skew(n_log[hb])))
+ktab(t9b, "9b. Score of a cell at the median (and quartiles) of street canopy", 3)
+ktab(t9b_dist, "9b. Normalised scores, cells with a street buffer", 3)
+```
+
+## 9c. Effect on the priority score (option b)
+
+```{r step9c}
+lin9 <- canb
+log9 <- score_variant(to_opt_b(n_log))
+stopifnot(sum(log9$scored) == 10194, identical(log9$scored, cur$scored),
+          isTRUE(all.equal(unname(lin9$S[, "norm_tree"]), unname(to_opt_b(n_lin)))))
+pa <- pair_cmp(lin9, log9); pp <- pair_cmp(lin9, log9, popd)
+t9c <- tibble(set = c("All scored cells", "Populated scored cells"),
+              cells = c(pa[["cells"]], pp[["cells"]]),
+              spearman = c(pa[["spearman"]], pp[["spearman"]]),
+              top_quintile_overlap_pct = c(pa[["top_quintile_overlap_pct"]], pp[["top_quintile_overlap_pct"]]),
+              cells_changing_quintile_pct = c(pa[["cells_changing_quintile_pct"]], pp[["cells_changing_quintile_pct"]]))
+ktab(t9c, "9c. Log vs linear (both option b); quintiles over all scored cells", 3)
+
+t9c_share <- tibble(score = c("Current (Street Tree Layer)", "Canopy linear", "Canopy log"),
+                    street_greenery_share_top_quintile_pct = c(contrib_tree(cur), contrib_tree(lin9), contrib_tree(log9)),
+                    population_in_top_quintile_pct = c(pop_q5(cur), pop_q5(lin9), pop_q5(log9)))
+ktab(t9c_share, "9c. Street greenery share of the score and population in top quintile cells (%)", 1)
+
+ct9 <- council_top(cur) %>% slice(1:5) %>% mutate(rank = 1:5) %>%
+  select(rank, current = NAME, current_pct = top_quintile_pct) %>%
+  bind_cols(council_top(lin9) %>% slice(1:5) %>% select(linear = NAME, linear_pct = top_quintile_pct)) %>%
+  bind_cols(council_top(log9) %>% slice(1:5) %>% select(log = NAME, log_pct = top_quintile_pct))
+ktab(ct9, "9c. Top 5 councils by share of scored cells in the top quintile (%)", 1)
+
+s3_9 <- bind_rows(step3_run(cur, "Current (Street Tree Layer)"), step3_run(lin9, "Canopy linear, option (b)"),
+                  step3_run(log9, "Canopy log, option (b)"))
+ktab(s3_9, "9c. Burden coincidence (Step 3 logic, same tie rule)", 3)
+
+readr::write_csv(t9a_all, file.path(OUT_DIR, "skewness_criteria_canopy.csv"))
+readr::write_csv(t9b, file.path(OUT_DIR, "norm_lin_log_at_quantiles_canopy.csv"))
+readr::write_csv(t9b_dist, file.path(OUT_DIR, "norm_lin_log_distribution_canopy.csv"))
+readr::write_csv(t9c, file.path(OUT_DIR, "log_vs_linear_canopy.csv"))
+readr::write_csv(ct9, file.path(OUT_DIR, "top_councils_lin_log_canopy.csv"))
+readr::write_csv(s3_9, file.path(OUT_DIR, "step3_lin_log_canopy.csv"))
+```
+
+## 9d. Third normalisation: log10(street_canopy_pct + 1)
+
+Canopy in percent (0 to 100). Bounds: lower 0 (log10(1)), upper = p98 of log10(street_canopy_pct + 1) over
+eligible cells with a street buffer, capped there. Score = 1 minus min max within those bounds (canopy 0 =
+1). Cells with no street buffer: 0 (option b).
+
+```{r step9d-norm, fig.width=10, fig.height=3.5}
+norm_cost_log1p <- function(x) {
+  lx <- log10(x + 1)
+  hi <- quantile(lx[elig & !is.na(x)], 0.98, names = FALSE)
+  out <- 1 - pmin(lx, hi) / hi
+  attr(out, "upper_log") <- hi
+  out
+}
+n_l1 <- norm_cost_log1p(cells$street_canopy_pct)
+hi_l1 <- attr(n_l1, "upper_log"); n_l1 <- as.numeric(n_l1)
+cat("log10(x + 1): upper bound =", round(hi_l1, 3), "(canopy", round(10^hi_l1 - 1, 2), "%)\n")
+summary(n_l1[hb])
+
+# Score as a function of canopy (%) under each normalisation, checked against the cell values
+p98_lin <- quantile(sg, 0.98, names = FALSE)
+lo_l <- log10(b_log[1]); hi_l <- log10(b_log[2])
+f_lin <- function(v) 1 - pmin(v, p98_lin) / p98_lin
+f_log <- function(v) ifelse(v == 0, 1, 1 - (pmin(pmax(log10(v), lo_l), hi_l) - lo_l) / (hi_l - lo_l))
+f_l1  <- function(v) 1 - pmin(log10(v + 1), hi_l1) / hi_l1
+stopifnot(isTRUE(all.equal(unname(f_lin(sg)), unname(n_lin[hb]))),
+          isTRUE(all.equal(unname(f_log(sg)), unname(n_log[hb]))),
+          isTRUE(all.equal(unname(f_l1(sg)),  unname(n_l1[hb]))))
+
+labs3 <- c("Linear", "log10(x)", "log10(x + 1)")
+h9d <- bind_rows(tibble(normalisation = labs3[1], score = n_lin[hb]),
+                 tibble(normalisation = labs3[2], score = n_log[hb]),
+                 tibble(normalisation = labs3[3], score = n_l1[hb])) %>%
+  mutate(normalisation = factor(normalisation, labs3))
+p9d <- ggplot(h9d, aes(score)) + geom_histogram(bins = 50, fill = "grey40") + facet_wrap(~ normalisation) +
+  labs(x = "Street greenery criterion score (1 = highest priority)", y = "Cells") + theme_lancet()
+p9d
+save_figure_lancet(p9d, "street_greenery_norm_three_canopy", OUT_DIR, height_mm = 70)
+
+t9d_dist <- h9d %>% group_by(normalisation) %>%
+  summarise(cells = n(), mean = mean(score), median = median(score), at_1_pct = 100 * mean(score == 1),
+            at_0_pct = 100 * mean(score == 0), skewness = skew(score), .groups = "drop")
+ktab(t9d_dist, "9d. Normalised scores, cells with a street buffer", 3)
+
+# 2. Score at selected canopy values
+qv <- quantile(sg, c(0.25, 0.5, 0.75, 0.98), names = FALSE)
+pts <- tibble(canopy = c("0", "p25", "1%", "median", "p75", "p98"),
+              street_canopy_pct = c(0, qv[1], 1, qv[2], qv[3], qv[4])) %>%
+  mutate(linear = f_lin(street_canopy_pct), log10_x = f_log(street_canopy_pct), log10_x_plus1 = f_l1(street_canopy_pct))
+ktab(pts, "9d. Score at selected canopy values (%)", 3)
+
+# 3. Share of the score scale (1 to 0) spent in each canopy band, next to the share of cells in the band
+bands <- tibble(band = c("0 to 1%", "1 to 10%", "10% or more"), from = c(0, 1, 10), to = c(1, 10, 100))
+t9d_scale <- bands %>%
+  mutate(cells_pct = 100 * c(mean(sg < 1), mean(sg >= 1 & sg < 10), mean(sg >= 10)),
+         linear_pct = 100 * (f_lin(from) - f_lin(to)),
+         log10_x_pct = 100 * (f_log(from) - f_log(to)),
+         log10_x_plus1_pct = 100 * (f_l1(from) - f_l1(to))) %>%
+  select(-from, -to)
+ktab(t9d_scale, "9d. Share of the score scale used by each canopy band (%), and share of cells in it", 1)
+```
+
+```{r step9d-effect}
+l19 <- score_variant(to_opt_b(n_l1))
+stopifnot(sum(l19$scored) == 10194, identical(l19$scored, cur$scored))
+pa1 <- pair_cmp(lin9, l19); pp1 <- pair_cmp(lin9, l19, popd)
+t9d <- tibble(set = c("All scored cells", "Populated scored cells"),
+              cells = c(pa1[["cells"]], pp1[["cells"]]),
+              spearman = c(pa1[["spearman"]], pp1[["spearman"]]),
+              top_quintile_overlap_pct = c(pa1[["top_quintile_overlap_pct"]], pp1[["top_quintile_overlap_pct"]]),
+              cells_changing_quintile_pct = c(pa1[["cells_changing_quintile_pct"]], pp1[["cells_changing_quintile_pct"]]))
+ktab(t9d, "9d. log10(x + 1) vs linear (both option b); quintiles over all scored cells", 3)
+
+t9d_share <- tibble(score = c("Current (Street Tree Layer)", "Canopy linear", "Canopy log10(x)", "Canopy log10(x + 1)"),
+                    street_greenery_share_top_quintile_pct = c(contrib_tree(cur), contrib_tree(lin9), contrib_tree(log9), contrib_tree(l19)),
+                    population_in_top_quintile_pct = c(pop_q5(cur), pop_q5(lin9), pop_q5(log9), pop_q5(l19)))
+ktab(t9d_share, "9d. Street greenery share of the score and population in top quintile cells (%)", 1)
+
+ct9d <- council_top(cur) %>% slice(1:5) %>% mutate(rank = 1:5) %>%
+  select(rank, current = NAME, current_pct = top_quintile_pct) %>%
+  bind_cols(council_top(lin9) %>% slice(1:5) %>% select(linear = NAME, linear_pct = top_quintile_pct)) %>%
+  bind_cols(council_top(l19) %>% slice(1:5) %>% select(log10_x_plus1 = NAME, log10_x_plus1_pct = top_quintile_pct))
+ktab(ct9d, "9d. Top 5 councils by share of scored cells in the top quintile (%)", 1)
+
+s3_9d <- bind_rows(s3_9, step3_run(l19, "Canopy log10(x + 1), option (b)"))
+ktab(s3_9d, "9d. Burden coincidence (Step 3 logic, same tie rule)", 3)
+
+readr::write_csv(t9d_dist, file.path(OUT_DIR, "norm_three_distribution_canopy.csv"))
+readr::write_csv(pts, file.path(OUT_DIR, "norm_three_at_values_canopy.csv"))
+readr::write_csv(t9d_scale, file.path(OUT_DIR, "norm_three_scale_bands_canopy.csv"))
+readr::write_csv(t9d, file.path(OUT_DIR, "log1p_vs_linear_canopy.csv"))
+readr::write_csv(t9d_share, file.path(OUT_DIR, "share_top_quintile_three_canopy.csv"))
+readr::write_csv(ct9d, file.path(OUT_DIR, "top_councils_log1p_canopy.csv"))
+readr::write_csv(s3_9d, file.path(OUT_DIR, "step3_three_canopy.csv"))
+```
+
+## 9e. Which cells move: zero canopy, entering and leaving the top quintile
+
+Urban Atlas 2021 majority class per cell (labels as in Step 6). Top quintile = quintiles over all scored
+cells of each score, option (b).
+
+```{r step9e}
+q_lin <- top_q(lin9$priority); q_l1 <- top_q(l19$priority)
+c9 <- cells %>% select(gid, Total_Population, ua_not_eligible, street_canopy_pct) %>%
+  left_join(d0 %>% select(gid, ua_code_2021), by = "gid") %>%
+  mutate(ua_code_2021 = as.character(ua_code_2021),
+         ua_class = coalesce(unname(ua_lab[ua_code_2021]), ua_code_2021),
+         top_linear = q_lin[match(gid, d0$gid)] %in% 5,
+         top_log1p  = q_l1[match(gid, d0$gid)] %in% 5)
+
+lu_q5 <- function(sub) {
+  by_class <- sub %>% group_by(ua_class) %>%
+    summarise(cells = n(), populated_cells = sum(Total_Population > 0), population = sum(Total_Population),
+              median_canopy_pct = median(street_canopy_pct, na.rm = TRUE),
+              top_quintile_linear = sum(top_linear), top_quintile_log1p = sum(top_log1p), .groups = "drop") %>%
+    arrange(desc(cells)) %>% mutate(pct_cells = 100 * cells / sum(cells), .after = cells)
+  total <- sub %>% summarise(ua_class = "Total", cells = n(), pct_cells = 100, populated_cells = sum(Total_Population > 0),
+                             population = sum(Total_Population), median_canopy_pct = median(street_canopy_pct, na.rm = TRUE),
+                             top_quintile_linear = sum(top_linear), top_quintile_log1p = sum(top_log1p))
+  bind_rows(by_class, total)
+}
+
+zero9  <- c9 %>% filter(!ua_not_eligible, !is.na(street_canopy_pct), street_canopy_pct == 0)
+enter9 <- c9 %>% filter(top_log1p, !top_linear)
+leave9 <- c9 %>% filter(top_linear, !top_log1p)
+stopifnot(nrow(zero9) == 1447)
+cat("Cells: zero canopy", nrow(zero9), "; enter top quintile under log10(x + 1)", nrow(enter9),
+    "; leave it", nrow(leave9), "\n")
+
+t9e_zero  <- lu_q5(zero9);  ktab(t9e_zero,  "9e. Cells with a street buffer and 0% canopy, by Urban Atlas 2021 class", 1)
+t9e_enter <- lu_q5(enter9); ktab(t9e_enter, "9e. Cells entering the top quintile under log10(x + 1) (not top under linear)", 1)
+t9e_leave <- lu_q5(leave9); ktab(t9e_leave, "9e. Cells leaving the top quintile under log10(x + 1) (top under linear)", 1)
+
+readr::write_csv(bind_rows(t9e_zero %>% mutate(set = "Zero canopy", .before = 1),
+                           t9e_enter %>% mutate(set = "Enter top quintile (log10(x + 1))", .before = 1),
+                           t9e_leave %>% mutate(set = "Leave top quintile (log10(x + 1))", .before = 1)),
+                 file.path(OUT_DIR, "movers_by_landuse_canopy.csv"))
+```
+
+# Step 10. Urban street definition
+
+Step 9e showed that most cells with 0% street canopy are rural roads through fields. Step 10 restricts the
+indicator to streets inside the built up zone. Main version (10a, 10b): built up zone from Microsoft
+building footprints. Sensitivity version (10d): agricultural and open land classes of Urban Atlas 2021 as
+not applicable. In both, cells with no urban street get criterion score 0 (not applicable, spec 4.2).
+Nothing in the main scoring notebook changes.
+
+## 10a and 10b. Built up zone and urban street canopy
+
+Built up zone = Microsoft building footprints buffered by 30 m, dissolved. Urban street buffer = the 10 m
+street buffer (Step 3) intersected with the built up zone. `street_canopy_urban_pct` = share of the urban
+street buffer covered by canopy of 3 m or more, per cell.
+
+```{r step10-extract}
+CACHE10 <- file.path(CANOPY_DIR, "canopy_extract_urban.rds")
+if (!file.exists(CACHE10)) {
+  built  <- st_union(st_buffer(bld_ms, 30, nQuadSegs = 4))
+  sb10   <- st_union(st_buffer(streets, 10))
+  urb    <- st_intersection(sb10, built)
+  pieces <- suppressWarnings(st_intersection(grid, urb)) %>% st_collection_extract("POLYGON") %>%
+    group_by(gid) %>% summarise(do_union = TRUE, .groups = "drop") %>% mutate(buffer_m2 = as.numeric(st_area(.)))
+  r_list <- lapply(tiles, function(t) rast(file.path(CANOPY_DIR, paste0("chm_", t, ".tif"))))
+  ext_m  <- ext(vect(st_transform(st_buffer(st_as_sfc(st_bbox(malta)), 300), 3857)))
+  r <- do.call(merge, lapply(r_list, function(x) crop(x, intersect(ext(x), ext_m))))
+  shares <- function(v, cf) {
+    ok <- !is.na(v); w <- cf[ok]; v <- v[ok]
+    data.frame(valid_px = sum(w), c3 = sum(w * (v >= 3)) / sum(w))
+  }
+  e10 <- exact_extract(r, st_transform(pieces, 3857), fun = shares, progress = FALSE)
+  saveRDS(list(ext = bind_cols(st_drop_geometry(pieces), e10),
+               built_km2 = as.numeric(st_area(built)) / 1e6,
+               built_in_grid_km2 = as.numeric(st_area(st_intersection(built, grid_union))) / 1e6,
+               street_buffer_km2 = as.numeric(st_area(sb10)) / 1e6, urban_buffer_km2 = as.numeric(st_area(urb)) / 1e6),
+          CACHE10)
+}
+ex10 <- readRDS(CACHE10)
+cat("Built up zone:", round(ex10$built_in_grid_km2, 1), "km2 inside the grid (grid:",
+    round(as.numeric(st_area(grid_union)) / 1e6, 1), "km2)\n")
+cat("Street buffer:", round(ex10$street_buffer_km2, 2), "km2; urban street buffer:", round(ex10$urban_buffer_km2, 2),
+    "km2 (", round(100 * ex10$urban_buffer_km2 / ex10$street_buffer_km2, 1), "% )\n")
+
+RURAL <- c(`21000` = "Arable land", `22000` = "Permanent crops", `23000` = "Pastures",
+           `24000` = "Complex and mixed cultivation", `32000` = "Herbaceous vegetation",
+           `33000` = "Open spaces with little or no vegetation")
+c10 <- cells %>% select(gid, NAME, Total_Population, ua_not_eligible, street_canopy_pct, street_buffer_m2) %>%
+  left_join(ex10$ext %>% transmute(gid, urban_buffer_m2 = buffer_m2, street_canopy_urban_pct = 100 * c3), by = "gid") %>%
+  left_join(d0 %>% select(gid, ua_code_2021), by = "gid") %>%
+  mutate(ua_code_2021 = as.character(ua_code_2021),
+         ua_class = coalesce(unname(ua_lab[ua_code_2021]), ua_code_2021),
+         street_canopy_class_pct = ifelse(ua_code_2021 %in% names(RURAL), NA_real_, street_canopy_pct))
+stopifnot(identical(c10$gid, d0$gid), !any(!is.na(c10$street_canopy_urban_pct) & is.na(c10$street_canopy_pct)))
+
+e10 <- c10 %>% filter(!ua_not_eligible)
+summary(e10$street_canopy_urban_pct)
+summary(e10$urban_buffer_m2)
+cat("Eligible cells with an urban street buffer below 50 m2:", sum(e10$urban_buffer_m2 < 50, na.rm = TRUE), "\n")
+ktab(bind_rows(lapply(c("street_canopy_pct", "street_canopy_urban_pct", "street_canopy_class_pct"), function(v) {
+  x <- e10[[v]]
+  tibble(indicator = v, cells_with_value = sum(!is.na(x)), not_applicable = sum(is.na(x)),
+         median = median(x, na.rm = TRUE), zero_pct = 100 * mean(x[!is.na(x)] == 0),
+         p98 = quantile(x, 0.98, na.rm = TRUE), skewness = skew(x), skewness_log10_plus1 = skew(log10(x + 1)))
+})), "10b. Street canopy indicators, eligible cells", 2)
+hist(e10$street_canopy_urban_pct, breaks = 60, main = "street_canopy_urban_pct (%)", xlab = "")
+```
+
+```{r step10-map, fig.width=8, fig.height=7}
+m10 <- malta %>% select(gid) %>% mutate(v = ifelse(elig, c10$street_canopy_urban_pct, NA)) %>% filter(elig)
+cap10 <- quantile(m10$v, 0.98, na.rm = TRUE)
+p10 <- ggplot(m10) + geom_sf(aes(fill = pmin(v, cap10), colour = pmin(v, cap10)), linewidth = 0.05) +
+  geom_sf(data = border, fill = NA, colour = "grey30", linewidth = 0.3) +
+  scale_fill_gradient(low = "#f7fcf5", high = "#00441b", na.value = "grey80", name = "Urban street\ncanopy (%)",
+                      aesthetics = c("fill", "colour")) +
+  lancet_scale_bar() + theme_lancet_map()
+p10
+save_figure_lancet(p10, "street_canopy_urban_map_canopy", OUT_DIR, height_mm = 150)
+```
+
+Grey: not applicable (no urban street); values capped at the p98.
+
+## 10c. Cells that become not applicable
+
+```{r step10c}
+new_na <- e10 %>% filter(!is.na(street_canopy_pct), is.na(street_canopy_urban_pct))
+na_tab <- function(sub) {
+  sub %>% group_by(ua_class) %>%
+    summarise(cells = n(), populated_cells = sum(Total_Population > 0), population = sum(Total_Population),
+              median_canopy_pct = median(street_canopy_pct), .groups = "drop") %>%
+    arrange(desc(cells)) %>% mutate(pct_cells = 100 * cells / sum(cells), .after = cells) %>%
+    bind_rows(sub %>% summarise(ua_class = "Total", cells = n(), pct_cells = 100, populated_cells = sum(Total_Population > 0),
+                                population = sum(Total_Population), median_canopy_pct = median(street_canopy_pct)))
+}
+cat("Eligible cells with a street buffer:", sum(!is.na(e10$street_canopy_pct)),
+    "| with an urban street buffer:", sum(!is.na(e10$street_canopy_urban_pct)),
+    "| newly not applicable:", nrow(new_na), "\n")
+t10c <- na_tab(new_na)
+ktab(t10c, "10c. Cells with a street buffer but no urban street buffer (newly not applicable), by Urban Atlas 2021 class", 1)
+
+z10 <- e10 %>% filter(!is.na(street_canopy_pct), street_canopy_pct == 0)
+stopifnot(nrow(z10) == 1447)
+t10c_zero <- tibble(zero_canopy_cells = nrow(z10),
+                    drop_out_not_applicable = sum(is.na(z10$street_canopy_urban_pct)),
+                    stay_urban_canopy_0 = sum(z10$street_canopy_urban_pct == 0, na.rm = TRUE),
+                    stay_urban_canopy_above_0 = sum(z10$street_canopy_urban_pct > 0, na.rm = TRUE),
+                    population_drop_out = sum(z10$Total_Population[is.na(z10$street_canopy_urban_pct)]),
+                    population_stay = sum(z10$Total_Population[!is.na(z10$street_canopy_urban_pct)]))
+ktab(t10c_zero, "10c. The 1,447 cells with 0% street canopy under the urban street definition", 1)
+```
+
+## 10d. Sensitivity: agricultural and open land classes as not applicable
+
+Cells whose Urban Atlas 2021 class is arable land, permanent crops, pastures, complex and mixed
+cultivation, herbaceous vegetation or open spaces with little or no vegetation get street greenery
+criterion score 0 (not applicable). All other cells keep `street_canopy_pct` (10 m buffer).
+
+```{r step10d}
+new_na_d <- e10 %>% filter(!is.na(street_canopy_pct), is.na(street_canopy_class_pct))
+t10d <- na_tab(new_na_d)
+ktab(t10d, "10d. Cells made not applicable by the class rule, by Urban Atlas 2021 class", 1)
+cat("Of the 1,447 cells with 0% canopy, not applicable under the class rule:", sum(is.na(z10$street_canopy_class_pct)), "\n")
+ktab(tibble(urban_streets = c("not applicable", "not applicable", "applicable", "applicable"),
+            class_rule = c("not applicable", "applicable", "not applicable", "applicable"),
+            cells = c(sum(is.na(e10$street_canopy_urban_pct) & is.na(e10$street_canopy_class_pct) & !is.na(e10$street_canopy_pct)),
+                      sum(is.na(e10$street_canopy_urban_pct) & !is.na(e10$street_canopy_class_pct)),
+                      sum(!is.na(e10$street_canopy_urban_pct) & is.na(e10$street_canopy_class_pct)),
+                      sum(!is.na(e10$street_canopy_urban_pct) & !is.na(e10$street_canopy_class_pct)))),
+     "10d. Cells with a street buffer: urban street definition vs class rule")
+```
+
+## 10e. Linear and log10(x + 1) under both definitions
+
+Normalisations as in Step 9: linear = 1 minus min max, 0 to p98; log10(x + 1) = 1 minus min max of
+log10(x + 1), 0 to p98 of the log. Bounds over eligible cells with a value of each indicator. Not
+applicable = 0 (option b).
+
+```{r step10e-scores}
+x_u <- c10$street_canopy_urban_pct; x_c <- c10$street_canopy_class_pct
+runs10 <- list(
+  `Urban streets, linear`        = score_variant(to_opt_b(norm_cost(x_u))),
+  `Urban streets, log10(x + 1)`  = score_variant(to_opt_b(as.numeric(norm_cost_log1p(x_u)))),
+  `Class rule, linear`           = score_variant(to_opt_b(norm_cost(x_c))),
+  `Class rule, log10(x + 1)`     = score_variant(to_opt_b(as.numeric(norm_cost_log1p(x_c)))))
+stopifnot(all(sapply(runs10, function(r) identical(r$scored, cur$scored))))
+canopy10 <- list(`Urban streets, linear` = x_u, `Urban streets, log10(x + 1)` = x_u,
+                 `Class rule, linear` = x_c, `Class rule, log10(x + 1)` = x_c)
+cat("p98 bounds: urban streets", round(quantile(x_u[elig], 0.98, na.rm = TRUE), 2), "%; class rule",
+    round(quantile(x_c[elig], 0.98, na.rm = TRUE), 2), "%\n")
+
+cmp_row <- function(lab, ra, rb) {
+  pa <- pair_cmp(ra, rb); pp <- pair_cmp(ra, rb, popd)
+  tibble(comparison = lab, spearman_all = pa[["spearman"]], top_quintile_overlap_all_pct = pa[["top_quintile_overlap_pct"]],
+         cells_changing_quintile_pct = pa[["cells_changing_quintile_pct"]],
+         spearman_populated = pp[["spearman"]], top_quintile_overlap_populated_pct = pp[["top_quintile_overlap_pct"]])
+}
+t10e <- bind_rows(
+  lapply(names(runs10), function(nm) cmp_row(paste(nm, "vs current"), cur, runs10[[nm]])),
+  cmp_row("Urban streets: log10(x + 1) vs linear", runs10[[1]], runs10[[2]]),
+  cmp_row("Class rule: log10(x + 1) vs linear", runs10[[3]], runs10[[4]]),
+  cmp_row("Linear: urban streets vs class rule", runs10[[1]], runs10[[3]]),
+  cmp_row("Urban streets linear vs Step 9 linear", lin9, runs10[[1]]))
+ktab(t10e, "10e. Agreement (quintiles over all scored cells)", 3)
+
+all_runs <- c(list(`Current (Street Tree Layer)` = cur, `Step 9 linear` = lin9, `Step 9 log10(x + 1)` = l19), runs10)
+t10e_share <- tibble(score = names(all_runs),
+                     street_greenery_share_top_quintile_pct = sapply(all_runs, contrib_tree),
+                     population_in_top_quintile_pct = sapply(all_runs, pop_q5))
+ktab(t10e_share, "10e. Street greenery share of the score and population in top quintile cells (%)", 1)
+
+top5 <- function(rv) council_top(rv) %>% slice(1:5) %>% transmute(x = paste0(NAME, " ", sprintf("%.1f", top_quintile_pct))) %>% pull(x)
+ct10 <- as_tibble(c(list(rank = 1:5), lapply(c(list(`Current (Street Tree Layer)` = cur), runs10), top5)))
+ktab(ct10, "10e. Top 5 councils by share of scored cells in the top quintile (%)")
+```
+
+### Cells entering and leaving the top quintile
+
+Entering = in the top quintile of the second score but not of the first; leaving = the reverse. Median
+canopy = the second score's indicator (NA cells, not applicable, left out of the median).
+
+```{r step10e-movers, results='asis'}
+movers <- function(ra, rb, canopy) {
+  qa <- top_q(ra$priority) %in% 5; qb <- top_q(rb$priority) %in% 5
+  d <- c10 %>% mutate(canopy = canopy, move = case_when(qb & !qa ~ "enter", qa & !qb ~ "leave", TRUE ~ NA_character_)) %>%
+    filter(!is.na(move))
+  one <- function(m) d %>% filter(move == m) %>% group_by(ua_class) %>%
+    summarise(cells = n(), population = sum(Total_Population), median_canopy_pct = median(canopy, na.rm = TRUE), .groups = "drop") %>%
+    bind_rows(d %>% filter(move == m) %>% summarise(ua_class = "Total", cells = n(), population = sum(Total_Population),
+                                                    median_canopy_pct = median(canopy, na.rm = TRUE)))
+  full_join(one("enter"), one("leave"), by = "ua_class", suffix = c("_enter", "_leave")) %>%
+    mutate(across(c(cells_enter, cells_leave, population_enter, population_leave), ~ coalesce(., 0))) %>%
+    arrange(ua_class == "Total", desc(cells_enter + cells_leave))
+}
+mv_list <- c(
+  setNames(lapply(names(runs10), function(nm) movers(cur, runs10[[nm]], canopy10[[nm]])), paste(names(runs10), "vs current")),
+  list(`Urban streets: log10(x + 1) vs linear` = movers(runs10[[1]], runs10[[2]], x_u),
+       `Class rule: log10(x + 1) vs linear` = movers(runs10[[3]], runs10[[4]], x_c)))
+for (nm in names(mv_list)) {
+  out <- ktab(mv_list[[nm]], paste("10e. Entering and leaving the top quintile:", nm), 1)
+  if (knitting()) cat(out, "\n\n")
+}
+```
+
+```{r step10-save}
+readr::write_csv(c10 %>% select(gid, street_buffer_m2, urban_buffer_m2, street_canopy_pct, street_canopy_urban_pct,
+                                street_canopy_class_pct, ua_code_2021, ua_not_eligible),
+                 file.path(OUT_DIR, "street_canopy_urban_cells_canopy.csv"))
+readr::write_csv(bind_rows(t10c %>% mutate(set = "Urban streets", .before = 1), t10d %>% mutate(set = "Class rule", .before = 1)),
+                 file.path(OUT_DIR, "not_applicable_urban_canopy.csv"))
+readr::write_csv(t10e, file.path(OUT_DIR, "agreement_urban_canopy.csv"))
+readr::write_csv(t10e_share, file.path(OUT_DIR, "share_top_quintile_urban_canopy.csv"))
+readr::write_csv(ct10, file.path(OUT_DIR, "top_councils_urban_canopy.csv"))
+readr::write_csv(bind_rows(mv_list, .id = "comparison"), file.path(OUT_DIR, "movers_urban_canopy.csv"))
+```
+
+# Outputs
+
+```{r outputs}
+readr::write_csv(cells %>% select(gid, street_buffer_m2, street_canopy_pct, cell_canopy_pct, street_canopy_pct_2m,
+                                  street_canopy_pct_5m, street_buffer15_m2, street_canopy_pct_buf15, ua_not_eligible),
+                 here::here("data/malta/street_greenery_canopy_cells.csv"))
+readr::write_csv(cmp_tab, file.path(OUT_DIR, "score_comparison_canopy.csv"))
+readr::write_csv(s3_tab, file.path(OUT_DIR, "step3_canopy.csv"))
+readr::write_csv(ct, file.path(OUT_DIR, "top_councils_canopy.csv"))
+readr::write_csv(qtab, file.path(OUT_DIR, "indicator_distribution_canopy.csv"))
+readr::write_csv(dates, file.path(OUT_DIR, "acquisition_dates_canopy.csv"))
+saveRDS(tibble(gid = d0$gid, scored_canopy = runs[[2]]$scored, priority_citizen_canopy = runs[[2]]$priority),
+        here::here("data/malta/malta_priority_canopy.rds"))
+```
+
+```{r session}
+sessionInfo()
+```

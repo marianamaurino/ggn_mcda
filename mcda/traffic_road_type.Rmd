@@ -1,0 +1,552 @@
+---
+title: "Traffic: road type criterion (Option B)"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 9, fig.height = 5)
+```
+
+Exploration of a road type traffic criterion from OpenStreetMap for both cities. Instruction:
+`mcda/Traffic_instructions.Rmd`, section 2 (24 November 2026). Rules: `mcda/MCDA_paper_results_spec.md`.
+No score file is changed: the priority scores in Step 3f are recomputed in memory only. Background: the CAMS-REG
+check (`mcda/traffic_cams_reg_check.Rmd`) found that neither CAMS-REG nor the current OpenTransportMap criterion
+ranks the Klagenfurt counting stations correctly.
+
+```{r libs}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(sf)
+library(ggplot2)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+source(here::here("R/theme_lancet.R"))
+sf_use_s2(FALSE)
+
+CRS_M   <- 3035
+ARCHIVE <- dirname(normalizePath(here::here("data")))
+OUT_DIR <- here::here("output/figures_mcda/traffic_road_type")
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+MIN_M   <- 10   # a class is present in a cell if at least 10 m of it lie inside the cell
+
+knitting <- function() isTRUE(getOption("knitr.in.progress"))
+ktab <- function(x, caption, digits = 1) {
+  x <- x %>% mutate(across(where(is.double), ~ round(., digits)))
+  if (!knitting()) { cat("\n", caption, "\n", sep = ""); print(as.data.frame(x), row.names = FALSE); return(invisible(x)) }
+  x %>% kable(caption = caption) %>% kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+}
+top_q <- function(p) { q <- rep(NA_integer_, length(p)); q[!is.na(p)] <- ntile(p[!is.na(p)], 5); q }
+lw_pt <- function(pt) pt / (ggplot2::.pt * 0.75)
+save_fig <- function(p, name, h, w = 180) invisible(save_figure_lancet(p, name, OUT_DIR, height_mm = h, width_mm = w))
+```
+
+# Step 0. Data
+
+```{r step0-files}
+osm_files <- c(Malta      = "data/malta/accessibility_malta/own_routing/osm_highways_raw.gpkg",
+               Klagenfurt = "data/klagenfurt/accessibility_klagenfurt/own_routing/osm_highways_raw.gpkg")
+ktab(tibble(city = names(osm_files), file = osm_files,
+            stated_download = c("5 November 2026", "11 November 2026"),
+            file_modified = format(file.mtime(here::here(osm_files)), "%d %B %Y %H:%M")),
+     "0. OSM extracts (the ones used for walking)")
+```
+
+```{r step0-grids}
+malta <- readRDS(here::here("data/malta/malta_mcda_processed_realloc.rds")) %>% mutate(gid = as.character(gid))
+klag  <- readRDS(here::here("data/klagenfurt/klagenfurt_mcda_priority_may.rds"))
+stopifnot(nrow(malta) == 10657, n_distinct(malta$gid) == 10657, nrow(klag) == 12418, n_distinct(klag$ID) == 12418)
+
+grids <- list(
+  Malta = malta %>% transmute(cell = gid, elig = !ua_not_eligible, pop = Total_Population, unit = NAME,
+                              current = norm_traffic, no2 = no2_avg_21, noise = Lden),
+  Klagenfurt = klag %>% transmute(cell = as.character(ID), elig = TRUE, pop = popdense_2020,
+                                  current = norm_traffic_cat, no2 = no2_final, pm25 = pm25_final,
+                                  air_composite = (norm_no2 + norm_pm25) / 2))
+grids <- lapply(grids, st_transform, CRS_M)
+# Klagenfurt districts: statistical counting districts (Zaehlsprengel, Statistik Austria, code g_id; no names
+# in the file), assigned by cell centroid
+zsp <- st_read(here::here("data/klagenfurt/klagenfurt_zsp_aest.gpkg"), quiet = TRUE) %>% st_transform(CRS_M) %>% select(g_id)
+grids$Klagenfurt$unit <- as.character(zsp$g_id[sapply(st_intersects(st_centroid(st_geometry(grids$Klagenfurt)), zsp),
+                                                       function(i) if (length(i)) i[1] else NA)])
+areas <- list(Malta = st_sf(geometry = readRDS(here::here("data/malta/malta_union_boundary.rds")), crs = CRS_M),
+              Klagenfurt = readRDS(here::here("data/klagenfurt/klagenfurt_boundary.rds")) %>% st_transform(CRS_M) %>%
+                st_union() %>% st_sf(geometry = .))
+councils <- st_read(here::here("data/malta/Population_Malta_Districts.geojson"), quiet = TRUE) %>%
+  st_transform(CRS_M) %>% group_by(NAME) %>% summarise(.groups = "drop") %>% st_intersection(st_union(areas$Malta))
+ktab(tibble(city = names(grids), cells = sapply(grids, nrow), eligible = sapply(grids, function(g) sum(g$elig)),
+            population = sapply(grids, function(g) sum(g$pop, na.rm = TRUE)),
+            current_traffic_missing = sapply(grids, function(g) sum(is.na(g$current)))),
+     "0. Grids (Malta airport and port cells not eligible, spec 1.3)", 0)
+```
+
+```{r step0-roads}
+CLASSES <- c("motorway", "trunk", "primary", "secondary", "tertiary", "unclassified", "residential", "living_street")
+read_roads <- function(cn) {
+  st_read(here::here(osm_files[[cn]]), quiet = TRUE) %>% st_transform(CRS_M) %>%
+    mutate(class = sub("_link$", "", highway)) %>% filter(class %in% CLASSES) %>%
+    st_intersection(st_union(areas[[cn]])) %>% st_collection_extract("LINESTRING") %>%
+    mutate(class = factor(class, levels = CLASSES), m = as.numeric(st_length(.)))
+}
+roads <- lapply(c(Malta = "Malta", Klagenfurt = "Klagenfurt"), read_roads)
+# Pieces of road inside each cell
+pieces <- lapply(names(roads), function(cn) {
+  suppressWarnings(st_intersection(roads[[cn]] %>% select(osm_id, class, name), grids[[cn]] %>% select(cell))) %>%
+    st_collection_extract("LINESTRING") %>% mutate(m = as.numeric(st_length(.))) %>% st_drop_geometry()
+}) %>% setNames(names(roads))
+cell_class <- lapply(names(pieces), function(cn) {
+  pieces[[cn]] %>% group_by(cell, class) %>% summarise(m = sum(m), .groups = "drop") %>% filter(m >= MIN_M)
+}) %>% setNames(names(pieces))
+for (cn in names(roads)) {
+  g <- grids[[cn]]
+  hc <- cell_class[[cn]] %>% group_by(cell) %>% summarise(highest = CLASSES[min(as.integer(class))])
+  grids[[cn]] <- g %>% left_join(hc, by = "cell") %>%
+    mutate(highest = factor(coalesce(highest, "no road"), levels = c(CLASSES, "no road")))
+}
+sapply(roads, nrow)
+```
+
+# Step 1. Road inventory
+
+## 1a. Km and cells by class
+
+```{r step1a}
+inv <- bind_rows(lapply(names(roads), function(cn) {
+  g <- st_drop_geometry(grids[[cn]]); e <- g$elig
+  km <- st_drop_geometry(roads[[cn]]) %>% group_by(class) %>% summarise(km = sum(m) / 1000, .groups = "drop")
+  cc <- cell_class[[cn]] %>% inner_join(g %>% select(cell, elig, pop), by = "cell") %>% filter(elig) %>%
+    group_by(class) %>% summarise(cells = n(), pop = sum(pop, na.rm = TRUE), .groups = "drop")
+  tibble(class = factor(CLASSES, levels = CLASSES)) %>% left_join(km, by = "class") %>% left_join(cc, by = "class") %>%
+    mutate(across(c(km, cells, pop), ~ coalesce(., 0)), city = cn, .before = 1) %>%
+    mutate(km_pct = 100 * km / sum(km), cells_pct_eligible = 100 * cells / sum(e),
+           pop_pct = 100 * pop / sum(g$pop[e], na.rm = TRUE)) %>%
+    select(city, class, km, km_pct, cells_crossed = cells, cells_pct_eligible, pop_pct)
+}))
+ktab(inv, "1a. Road inventory by OSM class (links in their parent class; cells crossed = at least 10 m inside)")
+ktab(inv %>% filter(class == "unclassified") %>% select(city, km, cells_crossed, cells_pct_eligible),
+     "1a. Unclassified roads (local in all candidates)")
+```
+
+## 1b. Highest class per cell
+
+```{r step1b}
+hi_tab <- bind_rows(lapply(names(grids), function(cn) {
+  g <- st_drop_geometry(grids[[cn]]) %>% filter(elig)
+  g %>% group_by(highest) %>% summarise(cells = n(), pop = sum(pop, na.rm = TRUE), .groups = "drop") %>%
+    complete(highest, fill = list(cells = 0, pop = 0)) %>%
+    mutate(city = cn, cells_pct = 100 * cells / sum(cells), pop_pct = 100 * pop / sum(pop), .before = 1) %>%
+    select(city, highest, cells, cells_pct, pop_pct)
+}))
+ktab(hi_tab, "1b. Highest class present in each eligible cell")
+```
+
+## 1c. Figures
+
+```{r step1c-palette}
+class_cols <- c(motorway = "#67000d", trunk = "#cb181d", primary = "#f16913", secondary = "#fdae6b",
+                tertiary = "#3182bd", unclassified = "#9ecae1", residential = "#969696", living_street = "#d9d9d9",
+                `no road` = "white")
+ras <- function(g) {
+  xy <- st_coordinates(st_centroid(st_geometry(g))); ox <- median(xy[, 1] %% 100); oy <- median(xy[, 2] %% 100)
+  tibble(x = round((xy[, 1] - ox) / 100) * 100 + ox, y = round((xy[, 2] - oy) / 100) * 100 + oy)
+}
+xy <- lapply(grids, ras)
+map_base <- function(cn, bar = TRUE) {
+  b <- areas[[cn]]; bb <- st_bbox(b)
+  mask <- st_sf(geometry = st_difference(st_as_sfc(st_bbox(st_buffer(b, 2000))), st_union(b)))
+  list(geom_sf(data = mask, fill = "white", colour = NA),
+       if (cn == "Malta") geom_sf(data = councils, fill = NA, colour = "grey75", linewidth = lw_pt(0.15)),
+       geom_sf(data = b, fill = NA, colour = "grey25", linewidth = lw_pt(0.3)),
+       if (bar) lancet_scale_bar("bl"),
+       coord_sf(xlim = bb[c("xmin", "xmax")], ylim = bb[c("ymin", "ymax")], crs = CRS_M, datum = NA),
+       theme_lancet_map(base_size = 8), theme(legend.position = "bottom"))
+}
+raster_panel <- function(cn, fill, scale, tag, bar = FALSE, elig_only = TRUE) {
+  d <- bind_cols(xy[[cn]], st_drop_geometry(grids[[cn]])) %>% mutate(f = fill)
+  if (elig_only) d <- filter(d, elig)
+  ggplot() + geom_raster(data = d, aes(x, y, fill = f)) + scale + map_base(cn, bar) + labs(tag = tag, x = NULL, y = NULL) +
+    theme(plot.tag = element_text(size = 8, face = "bold"))
+}
+```
+
+```{r step1c-roads, fig.width=11, fig.height=6}
+road_map <- function(cn) {
+  r <- roads[[cn]] %>% arrange(desc(as.integer(class)))
+  ggplot() + geom_sf(data = r, aes(colour = class), linewidth = lw_pt(0.4)) +
+    scale_colour_manual(values = class_cols, name = "OSM class", drop = FALSE) + map_base(cn) + labs(tag = cn) +
+    theme(plot.tag = element_text(size = 8, face = "bold"))
+}
+f1c_roads <- road_map("Malta") + road_map("Klagenfurt") + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+f1c_roads
+save_fig(f1c_roads, "roads_by_class", 110)
+```
+
+```{r step1c-bars, fig.width=9, fig.height=4}
+f1c_bars <- ggplot(inv, aes(class, km, fill = class)) + geom_col() + facet_wrap(~ city, scales = "free_y") +
+  scale_fill_manual(values = class_cols, guide = "none") + labs(x = NULL, y = "Road length (km)") +
+  theme_lancet() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+f1c_bars
+save_fig(f1c_bars, "km_by_class", 80)
+```
+
+```{r step1c-highest, fig.width=11, fig.height=6}
+f1c_hi <- raster_panel("Malta", grids$Malta$highest, scale_fill_manual(values = class_cols, name = "Highest class in the cell", drop = FALSE), "Malta", TRUE) +
+  raster_panel("Klagenfurt", grids$Klagenfurt$highest, scale_fill_manual(values = class_cols, name = "Highest class in the cell", drop = FALSE), "Klagenfurt", TRUE) +
+  plot_layout(guides = "collect") & theme(legend.position = "bottom")
+f1c_hi
+save_fig(f1c_hi, "highest_class_per_cell", 110)
+```
+
+## 1d. Longest named roads per class, and known roads
+
+```{r step1d-longest}
+longest <- bind_rows(lapply(names(roads), function(cn) st_drop_geometry(roads[[cn]]) %>% filter(!is.na(name)) %>%
+  group_by(city = cn, class, name) %>% summarise(km = sum(m) / 1000, .groups = "drop") %>%
+  group_by(city, class) %>% slice_max(km, n = 10, with_ties = FALSE) %>% ungroup()))
+ktab(longest %>% filter(city == "Malta"), "1d. Malta: 10 longest named roads per class", 2)
+ktab(longest %>% filter(city == "Klagenfurt"), "1d. Klagenfurt: 10 longest named roads per class", 2)
+```
+
+Known roads. Malta by name (the Regional Road is Triq Reġjonali; Kappara and Marsa junction roads by name
+pattern). Klagenfurt by road number from the OSM `ref` tag (Overpass extract of 24 November 2026 cached in the
+archive by the CAMS-REG check), plus Villacher Ring and Südring by name.
+
+```{r step1d-known}
+known_m <- tibble(road = c("Regional Road (Triq Reġjonali)", "Kappara", "Marsa", "Aldo Moro (Marsa junction)"),
+                  pattern = c("re[gġ]jonali", "kappara", "marsa", "aldo moro"))
+known_malta <- bind_rows(lapply(seq_len(nrow(known_m)), function(i) st_drop_geometry(roads$Malta) %>%
+  filter(grepl(known_m$pattern[i], tolower(name))) %>% group_by(class) %>%
+  summarise(km = sum(m) / 1000, names = paste(head(unique(name), 4), collapse = "; "), .groups = "drop") %>%
+  mutate(road = known_m$road[i], .before = 1)))
+ktab(known_malta, "1d. Malta known roads: km by OSM class", 2)
+
+ov <- jsonlite::fromJSON(file.path(ARCHIVE, "cams_reg", "klagenfurt_osm_ref_ways.json"), simplifyVector = FALSE)$elements
+tag <- function(e, k) if (is.null(e$tags[[k]])) NA_character_ else e$tags[[k]]
+ref_ways <- st_sf(
+  osm_id = sapply(ov, function(e) e$id), ref = sapply(ov, tag, "ref"), name = sapply(ov, tag, "name"),
+  highway = sapply(ov, tag, "highway"),
+  geometry = st_sfc(lapply(ov, function(e) st_linestring(do.call(rbind, lapply(e$geometry, function(g) c(g$lon, g$lat))))),
+                    crs = 4326)) %>% st_transform(CRS_M) %>% mutate(ref_n = gsub("\\s", "", ref))
+REFS <- c("A2", "B70", "B70c", "B70d", "B83", "B91")
+known_klag <- bind_rows(
+  bind_rows(lapply(REFS, function(rf) {
+    ids <- ref_ways$osm_id[sapply(strsplit(ref_ways$ref_n, ";"), function(r) rf %in% r)]
+    st_drop_geometry(roads$Klagenfurt) %>% filter(osm_id %in% as.character(ids) | osm_id %in% ids) %>%
+      group_by(class) %>% summarise(km = sum(m) / 1000, .groups = "drop") %>% mutate(road = rf, .before = 1)
+  })),
+  bind_rows(lapply(c("Villacher Ring", "Südring"), function(nm) st_drop_geometry(roads$Klagenfurt) %>%
+    filter(name == nm) %>% group_by(class) %>% summarise(km = sum(m) / 1000, .groups = "drop") %>% mutate(road = nm, .before = 1))))
+ktab(known_klag, "1d. Klagenfurt known roads: km by OSM class (our extract, matched by OSM way id or name)", 2)
+```
+
+# Step 2. Candidate categorisations
+
+Each cell takes the class of the highest road with at least 10 m inside it; cells with no kept road are in
+the lowest class (score 0). Unclassified is local in all candidates.
+
+```{r step2}
+cand_map <- tibble(class = c(CLASSES, "no road"),
+                   K2 = c(1, 1, 1, 1, 0, 0, 0, 0, 0),
+                   K3 = c(1, 1, 1, 0.5, 0.5, 0, 0, 0, 0),
+                   K4 = c(1, 1, 0.67, 0.33, 0.33, 0, 0, 0, 0),
+                   K5 = c(1, 1, 0.75, 0.5, 0.25, 0, 0, 0, 0))
+ktab(cand_map, "2. Candidate scores by highest class in the cell", 2)
+CANDS <- c("K2", "K3", "K4", "K5")
+for (cn in names(grids)) {
+  grids[[cn]] <- grids[[cn]] %>% left_join(cand_map, by = c("highest" = "class"))
+  stopifnot(!anyNA(st_drop_geometry(grids[[cn]])[, CANDS]))
+}
+```
+
+# Step 3. Comparison
+
+## 3a. Class sizes
+
+```{r step3a}
+sizes <- bind_rows(lapply(names(grids), function(cn) bind_rows(lapply(CANDS, function(k) {
+  g <- st_drop_geometry(grids[[cn]]) %>% filter(elig)
+  g %>% group_by(score = .data[[k]]) %>% summarise(cells = n(), pop = sum(pop, na.rm = TRUE), .groups = "drop") %>%
+    mutate(city = cn, candidate = k, cells_pct = 100 * cells / sum(cells), pop_pct = 100 * pop / sum(pop), .before = 1)
+})))) %>%
+  right_join(bind_rows(lapply(names(grids), function(cn) bind_rows(lapply(CANDS, function(k)
+    tibble(city = cn, candidate = k, score = sort(unique(cand_map[[k]]))))))), by = c("city", "candidate", "score")) %>%
+  mutate(across(c(cells, pop, cells_pct, pop_pct), ~ coalesce(., 0)), under_2pct = cells_pct < 2) %>%
+  arrange(city, candidate, score) %>% select(city, candidate, score, cells, cells_pct, pop_pct, under_2pct)
+ktab(sizes, "3a. Class sizes, eligible cells (flag: under 2% of cells)")
+top_share <- sizes %>% group_by(city, candidate) %>% filter(score == max(score)) %>% ungroup() %>%
+  select(city, candidate, top_class_cells_pct = cells_pct) %>%
+  bind_rows(bind_rows(lapply(names(grids), function(cn) { g <- st_drop_geometry(grids[[cn]]) %>% filter(elig)
+    tibble(city = cn, candidate = "Current", top_class_cells_pct = 100 * mean(g$current == max(g$current)))})))
+ktab(top_share %>% arrange(city, candidate), "3a. Share of eligible cells in the top class (Step 3 tie rule target: 20%)")
+ggplot(sizes, aes(factor(score), cells_pct, fill = under_2pct)) + geom_col() + facet_grid(city ~ candidate, scales = "free_x") +
+  geom_hline(yintercept = 2, linetype = "dashed", colour = "grey40") +
+  scale_fill_manual(values = c(`FALSE` = "grey50", `TRUE` = "#d73027"), name = "Under 2% of cells") +
+  labs(x = "Class score", y = "% of eligible cells") + theme_lancet() + theme(legend.position = "bottom") -> f3a
+f3a
+save_fig(f3a, "class_sizes", 100)
+```
+
+## 3b. Agreement with the current criterion
+
+```{r step3b}
+agree_cur <- bind_rows(lapply(names(grids), function(cn) bind_rows(lapply(CANDS, function(k) {
+  g <- st_drop_geometry(grids[[cn]]) %>% filter(elig)
+  tibble(city = cn, candidate = k, spearman = cor(g$current, g[[k]], method = "spearman"))
+}))))
+ktab(agree_cur, "3b. Spearman of each candidate with the current traffic criterion (eligible cells)", 3)
+xtabs3b <- lapply(names(grids), function(cn) lapply(setNames(CANDS, CANDS), function(k) {
+  g <- st_drop_geometry(grids[[cn]]) %>% filter(elig)
+  table(current = g$current, new = g[[k]])
+})) %>% setNames(names(grids))
+for (cn in names(xtabs3b)) for (k in CANDS) {
+  print(ktab(as.data.frame.matrix(xtabs3b[[cn]][[k]]) %>% tibble::rownames_to_column("current class"),
+             paste0("3b. ", cn, ": current class (rows) x ", k, " class (columns), eligible cells"), 0))
+}
+```
+
+```{r step3b-maps, fig.width=12, fig.height=9}
+sc <- scale_fill_distiller(palette = "Purples", direction = 1, limits = c(0, 1), name = "Traffic score")
+maps_cur <- function(cn, bar_first = TRUE) {
+  g <- st_drop_geometry(grids[[cn]])
+  ps <- c(list(raster_panel(cn, g$current, sc, paste(cn, "current"), bar_first)),
+          lapply(CANDS, function(k) raster_panel(cn, g[[k]], sc, k)))
+  wrap_plots(ps, nrow = 1)
+}
+f3b <- (maps_cur("Malta") / maps_cur("Klagenfurt")) + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+f3b
+save_fig(f3b, "current_vs_candidates_maps", 130)
+
+diff_tab <- bind_rows(lapply(names(grids), function(cn) { g <- st_drop_geometry(grids[[cn]]) %>% filter(elig)
+  d <- g$K3 - g$current
+  tibble(city = cn, cells = nrow(g), differ_more_than_one_class = sum(abs(d) > 0.5),
+         pct = 100 * mean(abs(d) > 0.5), K3_higher = sum(d > 0.5), K3_lower = sum(d < -0.5)) }))
+ktab(diff_tab, "3b. Cells where current and K3 differ by more than one K3 class (|score difference| > 0.5)")
+diff_panel <- function(cn) {
+  g <- st_drop_geometry(grids[[cn]]); d <- g$K3 - g$current
+  f <- factor(case_when(d > 0.5 ~ "K3 higher", d < -0.5 ~ "K3 lower", TRUE ~ "Within one class"),
+              levels = c("K3 higher", "K3 lower", "Within one class"))
+  raster_panel(cn, f, scale_fill_manual(values = c(`K3 higher` = "#d73027", `K3 lower` = "#4575b4", `Within one class` = "grey90"),
+                                        name = "Current vs K3", drop = FALSE), cn, TRUE)
+}
+f3b_diff <- diff_panel("Malta") + diff_panel("Klagenfurt") + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+f3b_diff
+save_fig(f3b_diff, "current_vs_K3_difference", 110)
+```
+
+## 3c. Agreement between candidates
+
+```{r step3c, fig.width=8, fig.height=4}
+cmat <- bind_rows(lapply(names(grids), function(cn) {
+  g <- st_drop_geometry(grids[[cn]]) %>% filter(elig)
+  m <- cor(g[, c("current", CANDS)], method = "spearman")
+  as.data.frame(as.table(m)) %>% setNames(c("a", "b", "rho")) %>% mutate(city = cn)
+}))
+ktab(cmat %>% filter(a != "current", b != "current") %>% pivot_wider(names_from = b, values_from = rho) %>%
+       relocate(city), "3c. Spearman matrix between candidates (eligible cells)", 3)
+f3c <- ggplot(cmat, aes(a, b, fill = rho)) + geom_tile() + geom_text(aes(label = sprintf("%.2f", rho)), size = 2.5) +
+  facet_wrap(~ city) + scale_fill_distiller(palette = "Blues", direction = 1, limits = c(0, 1), name = "Spearman") +
+  labs(x = NULL, y = NULL) + theme_lancet()
+f3c
+save_fig(f3c, "candidates_spearman", 80)
+```
+
+## 3d. Overlap with other criteria
+
+```{r step3d, fig.width=8, fig.height=4}
+others <- list(Malta = c(NO2 = "no2", Noise = "noise"),
+               Klagenfurt = c(`Air quality composite` = "air_composite", NO2 = "no2", `PM2.5` = "pm25"))
+red <- bind_rows(lapply(names(grids), function(cn) bind_rows(lapply(c("current", CANDS), function(k)
+  bind_rows(lapply(names(others[[cn]]), function(o) {
+    g <- st_drop_geometry(grids[[cn]]) %>% filter(elig)
+    v <- g[[others[[cn]][[o]]]]; ok <- !is.na(v)
+    tibble(city = cn, candidate = k, criterion = o, cells = sum(ok), spearman = cor(g[[k]][ok], v[ok], method = "spearman"))
+  }))))))
+ktab(red %>% mutate(at_or_above_0.70 = abs(spearman) >= 0.70), "3d. Spearman with the other pollution criteria (eligible cells, raw indicators; composite = mean of the two normalised scores)", 3)
+f3d <- ggplot(red, aes(candidate, criterion, fill = spearman)) + geom_tile() + geom_text(aes(label = sprintf("%.2f", spearman)), size = 2.5) +
+  facet_wrap(~ city, scales = "free_y") + scale_fill_distiller(palette = "RdBu", limits = c(-1, 1), name = "Spearman") +
+  labs(x = NULL, y = NULL) + theme_lancet()
+f3d
+save_fig(f3d, "redundancy_heatmap", 70)
+```
+
+## 3e. Klagenfurt counting stations
+
+The 22 stations placed in `traffic_cams_reg_check.Rmd` (same placement: intersection of the road, by OSM `ref`,
+with the named cross street; T junctions within 15 m). Class = class of the cell that contains the station.
+
+```{r step3e}
+stations <- tribble(
+  ~ref,  ~station,                 ~jdtv_2019,
+  "B70",  "Schachterlweg",          21850,
+  "B70",  "Ramsauerstraße",         19574,
+  "B70",  "Rosenbergstraße",        19574,
+  "B70",  "Enzenbergerstraße",      21531,
+  "B70c", "Mießtalerstraße",        20812,
+  "B70c", "Lastenstraße",           20812,
+  "B70c", "Bahnhofstraße",          15610,
+  "B70c", "10. Oktober Straße",     13975,
+  "B70c", "Rosentaler Straße",      13944,
+  "B70c", "Waidmannsdorfer Straße", 14386,
+  "B70c", "Koschatstraße",          18679,
+  "B70d", "Ebenthaler Straße",      18250,
+  "B70d", "Gerberweg",              19389,
+  "B70d", "Kirchengasse",           18018,
+  "B70d", "St. Ruprechter Str.",    16940,
+  "B70d", "Flatschacher Straße",    17251,
+  "B70d", "Rosentaler Straße",      20670,
+  "B70d", "Waidmannsdorfer Straße", 13538,
+  "B70d", "Siebenhügelstraße",      12165,
+  "B70d", "Süduferstraße",          10308,
+  "B83",  "Waltendorfer Straße",    17690,
+  "B83",  "Deutenhofenstraße",      21018,
+  "B83",  "Radetzkystraße",         18398,
+  "B83",  "Koschatstraße",          23351,
+  "B91",  "Villacher Ring",         25876,
+  "B91",  "Maximilianstraße",       27460,
+  "B91",  "Hirschenwirtstraße",     25665,
+  "B91",  "Südring",                28517)
+norm_name <- function(x) {
+  x <- tolower(x); x <- gsub("ß", "ss", x); x <- gsub("str\\.?$", "strasse", x)
+  x <- gsub("[^a-zäöü0-9]", "", x); x
+}
+osm_k <- st_read(here::here(osm_files[["Klagenfurt"]]), quiet = TRUE) %>% st_transform(CRS_M) %>%
+  filter(!is.na(name)) %>% mutate(name_n = norm_name(name))
+place <- function(rf, station) {
+  road <- ref_ways[sapply(strsplit(ref_ways$ref_n, ";"), function(r) rf %in% r), ]
+  cross <- osm_k %>% filter(name_n == norm_name(station))
+  if (nrow(road) == 0 || nrow(cross) == 0) return(NULL)
+  ix <- suppressWarnings(st_intersection(st_union(road), st_union(cross)))
+  if (length(ix) == 0 || st_is_empty(ix)) {
+    if (as.numeric(st_distance(st_union(road), st_union(cross))) > 15) return(NULL)
+    ix <- st_cast(st_nearest_points(st_union(cross), st_union(road)), "POINT")[2]
+  }
+  st_sf(ref = rf, station = station, geometry = st_centroid(st_union(st_cast(ix, "POINT"))))
+}
+pts <- do.call(rbind, Filter(Negate(is.null), Map(place, stations$ref, stations$station))) %>%
+  left_join(stations, by = c("ref", "station"))
+cat("Stations placed:", nrow(pts), "\n")
+gk <- grids$Klagenfurt
+ix <- sapply(st_intersects(pts, gk), function(i) if (length(i)) i[1] else NA)
+st_tab <- st_drop_geometry(pts) %>%
+  bind_cols(st_drop_geometry(gk)[ix, c("highest", "current", CANDS)]) %>%
+  select(ref, station, jdtv_2019, highest_class_in_cell = highest, current, all_of(CANDS))
+second <- function(k) sort(unique(cand_map[[k]]), decreasing = TRUE)[2]
+st_tab <- st_tab %>% mutate(across(all_of(CANDS), ~ . >= second(cur_column()), .names = "{.col}_top_or_second"))
+ktab(st_tab, "3e. Klagenfurt counting stations: class of the station cell under each candidate", 2)
+st_sum <- tibble(candidate = CANDS, stations = nrow(st_tab),
+                 in_top_or_second = sapply(CANDS, function(k) sum(st_tab[[paste0(k, "_top_or_second")]])),
+                 spearman_with_jdtv = sapply(CANDS, function(k) cor(st_tab$jdtv_2019, st_tab[[k]], method = "spearman")))
+ktab(st_sum, "3e. Stations in the top or second class", 3)
+st_long <- st_tab %>% select(station, ref, all_of(CANDS)) %>% pivot_longer(all_of(CANDS), names_to = "candidate", values_to = "score")
+f3e <- ggplot(st_long, aes(candidate, paste(ref, station), fill = score)) + geom_tile(colour = "white") +
+  scale_fill_distiller(palette = "Purples", direction = 1, limits = c(0, 1), name = "Class score") +
+  labs(x = NULL, y = NULL) + theme_lancet()
+f3e
+save_fig(f3e, "stations_classes", 110, 120)
+```
+
+## 3f. Effect on the priority score (in memory only)
+
+Citizen weights recovered from the saved scores (regression without intercept on the criterion scores; exact).
+Spec 4.2: score = sum(w_i s_i) / sum(w_i) over available criteria, cells scored as in the saved file (the traffic
+criterion has no missing values, so the scored set does not change).
+
+```{r step3f}
+crit <- list(Malta = c("norm_lst", "norm_imd", "norm_dist_bs", "norm_Lden", "norm_traffic", "norm_no2", "norm_tree",
+                       "norm_green_time", "norm_dist_rec", "norm_green_exp"),
+             Klagenfurt = c("norm_lst", "norm_dist_bs", "norm_no2", "norm_pm25", "norm_green_time", "norm_traffic_cat",
+                            "norm_income_weighted"))
+tr_var <- c(Malta = "norm_traffic", Klagenfurt = "norm_traffic_cat")
+sc_dat <- list(Malta = st_drop_geometry(malta), Klagenfurt = st_drop_geometry(klag))
+get_w <- function(d, v) {
+  cc <- d[complete.cases(d[, v]) & !is.na(d$priority_citizen), ]
+  f <- lm(reformulate(v, "priority_citizen", intercept = FALSE), data = cc)
+  stopifnot(max(abs(residuals(f))) < 1e-8); coef(f)[v]
+}
+wlc <- function(d, w, keep) {
+  S <- as.matrix(d[, names(w)]); A <- !is.na(S); S[!A] <- 0
+  out <- as.numeric(S %*% w) / as.numeric(A %*% w); out[!keep] <- NA; out
+}
+scores <- lapply(names(sc_dat), function(cn) {
+  d <- sc_dat[[cn]]; w <- get_w(d, crit[[cn]])
+  re <- wlc(d, w, d$scored); stopifnot(max(abs(re - d$priority_citizen), na.rm = TRUE) < 1e-10)
+  out <- tibble(current = d$priority_citizen)
+  for (k in CANDS) { d2 <- d; d2[[tr_var[[cn]]]] <- st_drop_geometry(grids[[cn]])[[k]]; out[[k]] <- wlc(d2, w, d$scored) }
+  out
+}) %>% setNames(names(sc_dat))
+ktab(bind_rows(lapply(names(sc_dat), function(cn) tibble(city = cn, criterion = crit[[cn]],
+  weight_pct = 100 * get_w(sc_dat[[cn]], crit[[cn]])))), "3f. Citizen weights recovered from the saved scores (%)")
+
+eff <- bind_rows(lapply(names(scores), function(cn) bind_rows(lapply(CANDS, function(k) {
+  a <- scores[[cn]]$current; b <- scores[[cn]][[k]]; k2 <- !is.na(a) & !is.na(b)
+  qa <- top_q(a); qb <- top_q(b)
+  tibble(city = cn, candidate = k, scored_cells = sum(k2), spearman = cor(a[k2], b[k2], method = "spearman"),
+         top_quintile_overlap_pct = 100 * mean(qb[which(qa == 5)] == 5))
+}))))
+ktab(eff, "3f. Priority score with each candidate vs the current score", 3)
+
+units_top <- bind_rows(lapply(names(scores), function(cn) bind_rows(lapply(c("current", CANDS), function(k) {
+  q <- top_q(scores[[cn]][[k]]); u <- st_drop_geometry(grids[[cn]])$unit
+  tibble(unit = u, q = q) %>% filter(q == 5, !is.na(unit)) %>% count(unit, name = "top_cells") %>%
+    slice_max(top_cells, n = 5, with_ties = FALSE) %>% mutate(city = cn, version = k, rank = row_number())
+}))))
+ktab(units_top %>% mutate(lbl = paste0(unit, " (", top_cells, ")")) %>% select(city, version, rank, lbl) %>%
+       pivot_wider(names_from = version, values_from = lbl),
+     "3f. Five councils (Malta) or statistical districts (Klagenfurt, Zaehlsprengel code) with most top quintile cells", 0)
+```
+
+```{r step3f-maps, fig.width=12, fig.height=9}
+tq_cols <- c(`Top quintile` = "#d73027", Other = "grey88")
+tq_maps <- function(cn) {
+  ps <- lapply(c("current", CANDS), function(k) {
+    q <- top_q(scores[[cn]][[k]])
+    f <- factor(ifelse(!is.na(q) & q == 5, "Top quintile", "Other"), levels = names(tq_cols))
+    raster_panel(cn, f, scale_fill_manual(values = tq_cols, name = "Priority", drop = FALSE),
+                 if (k == "current") paste(cn, "current") else k, k == "current", elig_only = FALSE)
+  })
+  wrap_plots(ps, nrow = 1)
+}
+f3f <- (tq_maps("Malta") / tq_maps("Klagenfurt")) + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+f3f
+save_fig(f3f, "top_quintile_current_vs_candidates", 130)
+```
+
+# Step 4. Decision criteria (not a choice)
+
+```{r step4}
+crit1 <- sizes %>% group_by(candidate) %>% summarise(c1_every_class_2pct_both_cities = all(!under_2pct))
+crit2 <- st_sum %>% transmute(candidate, c2_stations_top_or_second = paste0(in_top_or_second, " of ", stations))
+crit3 <- red %>% filter(candidate %in% CANDS, criterion %in% c("NO2", "Noise")) %>% group_by(candidate) %>%
+  summarise(c3_max_abs_spearman_no2_noise = max(abs(spearman)), c3_below_0.70 = all(abs(spearman) < 0.70))
+dec <- crit1 %>% left_join(crit2, by = "candidate") %>% left_join(crit3, by = "candidate") %>%
+  mutate(classes = c(2, 3, 4, 5), .after = candidate)
+ktab(dec, "4. Decision criteria 1 to 3 (criterion 2 also needs the known road tables in 1d)", 3)
+```
+
+```{r outputs}
+readr::write_csv(inv, file.path(OUT_DIR, "road_inventory_by_class.csv"))
+readr::write_csv(hi_tab, file.path(OUT_DIR, "highest_class_per_cell.csv"))
+readr::write_csv(longest, file.path(OUT_DIR, "longest_named_roads.csv"))
+readr::write_csv(bind_rows(known_malta %>% mutate(city = "Malta"), known_klag %>% mutate(city = "Klagenfurt")),
+                 file.path(OUT_DIR, "known_roads_by_class.csv"))
+readr::write_csv(sizes, file.path(OUT_DIR, "candidate_class_sizes.csv"))
+readr::write_csv(agree_cur, file.path(OUT_DIR, "candidates_vs_current.csv"))
+readr::write_csv(red, file.path(OUT_DIR, "candidates_redundancy.csv"))
+readr::write_csv(st_tab, file.path(OUT_DIR, "stations_classes.csv"))
+readr::write_csv(eff, file.path(OUT_DIR, "priority_effect.csv"))
+readr::write_csv(units_top, file.path(OUT_DIR, "top_units.csv"))
+readr::write_csv(dec, file.path(OUT_DIR, "decision_criteria.csv"))
+readr::write_csv(bind_rows(st_drop_geometry(grids$Malta) %>% transmute(city = "Malta", cell, highest = as.character(highest), K2, K3, K4, K5),
+                           st_drop_geometry(grids$Klagenfurt) %>% transmute(city = "Klagenfurt", cell, highest = as.character(highest), K2, K3, K4, K5)),
+                 file.path(OUT_DIR, "road_type_cells.csv"))
+```
+
+```{r session}
+sessionInfo()
+```

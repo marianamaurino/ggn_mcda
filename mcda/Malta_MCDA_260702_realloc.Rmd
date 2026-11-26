@@ -377,9 +377,7 @@ e2sfca_own <- read_csv(
 ) %>%
   transmute(gid = as.character(gid),
             green_m2_e2sfca_per_person_gauss = green_m2_e2sfca_gauss_newpop,
-            green_m2_e2sfca_per_person       = green_m2_e2sfca_step_newpop,
-            # sensitivity, walking speed 4 km/h (spec 5.3)
-            green_m2_e2sfca_per_person_gauss_4kmh = green_m2_e2sfca_gauss_newpop_4kmh)
+            green_m2_e2sfca_per_person       = green_m2_e2sfca_step_newpop)
 
 exposure_e2sfca <- read_parquet(
   here::here("mcda/exposure/final_metrics.parquet")
@@ -676,6 +674,8 @@ Over 75% of cells have zero street-tree cover, reflecting Malta's position as on
 
 <!-- TODO: update text (2026-11-19): the p98 of perc_tree is now computed from the data (11.70%), not 14.18%. -->
 
+<!-- TODO: update text (2026-11-23): street greenery is now street canopy (street_canopy_pct, spec 3.6, see the normalization chunk); this section and the chunk below describe perc_tree, which is kept only for the sensitivity analysis. -->
+
 ```{r tree-extremes}
 p98_tree <- quantile(malta$perc_tree, 0.98, na.rm = TRUE)
 ggplot() +
@@ -750,6 +750,8 @@ vars_corr <- c("lst", "imd", "dist_bs", "Lden", "new_trafficvol",
 run_cor(malta, vars_corr, "Spearman rank correlations: 10 MCDA indicators")
 ```
 
+<!-- TODO: update text (2026-11-23): the correlation matrix above still uses perc_tree; the score now uses street_canopy_pct (spec 3.6). -->
+
 The strongest correlation is **noise vs traffic** (r ≈ 0.55), consistent with traffic being the main source of urban noise — though each captures a distinct spatial dimension. All remaining pairs fall below |r| = 0.50, well under the |r| = 0.70 redundancy threshold.
 
 # Eligibility
@@ -763,27 +765,33 @@ Added 2026-11-05 (UT2026 poster). Under the available weight rule below, airport
 entered the top quintile, so cells whose majority Urban Atlas 2021 class is 12400 (airports) or
 12300 (port areas) get no score.
 
+<!-- TODO: update text (2026-11-25): water cells (majority class 50000) are now part of the constraint (spec 1.3); the heading and text above mention airport and port only. -->
+
 ```{r eligibility-mask}
-ua21 <- st_read(here::here("data/urban_atlas/Malta_UA21/CLMS_UA_LCU_S2021_V025ha_MT001L1_VALLETTA_03035_V01_R00_20241025.fgb"),
-                quiet = TRUE, wkt_filter = st_as_text(st_as_sfc(st_bbox(malta)))) %>%
-  select(code_2021) %>%
-  st_make_valid()
-ua_major <- st_intersection(malta %>% select(gid), ua21) %>%
-  mutate(a = as.numeric(st_area(.))) %>%
-  st_drop_geometry() %>%
-  group_by(gid) %>%
-  slice_max(a, n = 1, with_ties = FALSE) %>%
-  ungroup() %>%
-  select(gid, ua_code_2021 = code_2021)
+# Constraint (spec 1.3; water added 2026-11-25): majority Urban Atlas 2021 class (largest total area in the cell,
+# since 2026-11-25; before: largest single piece)
+# is airport (12400), port (12300) or water (50000). Shared function with Klagenfurt: mcda/ua_constraint.R.
+source(here::here("mcda/ua_constraint.R"))
+ua_major <- ua_pieces_from_polygons(
+  malta, "gid",
+  here::here("data/urban_atlas/Malta_UA21/CLMS_UA_LCU_S2021_V025ha_MT001L1_VALLETTA_03035_V01_R00_20241025.fgb")) %>%
+  ua_majority() %>%
+  transmute(gid = id, ua_code_2021 = ua_code, water_share_ua = water_share)
 malta <- malta %>%
-  select(-any_of(c("ua_code_2021", "ua_not_eligible"))) %>%
+  select(-any_of(c("ua_code_2021", "ua_not_eligible", "water_share_ua", "water_cell"))) %>%
   left_join(ua_major, by = "gid") %>%
-  mutate(ua_not_eligible = ua_code_2021 %in% c("12400", "12300"))
+  mutate(ua_not_eligible = ua_constrained(ua_code_2021, "Malta"),
+         water_cell      = ua_code_2021 %in% WATER_CODE)
+stopifnot(nrow(malta) == 10657, !anyNA(malta$ua_code_2021))
 
 table(malta$ua_code_2021[malta$ua_not_eligible], useNA = "ifany")
+cat("Constraint cells:", sum(malta$ua_not_eligible), "| water:", sum(malta$water_cell),
+    "| water share > 50% (information only):", sum(malta$water_share_ua > 0.5, na.rm = TRUE), "\n")
+summary(malta$water_share_ua)
+hist(malta$water_share_ua[malta$water_share_ua > 0], breaks = 40, main = "Water share of the cell (cells with any water)", xlab = "")
 ggplot(malta) +
-  geom_sf(aes(fill = ua_not_eligible), colour = NA) +
-  scale_fill_manual(values = c(`FALSE` = "grey85", `TRUE` = "#c0392b"), name = "Airport or port") +
+  geom_sf(aes(fill = case_when(water_cell ~ "Water", ua_not_eligible ~ "Airport or port", TRUE ~ "Eligible")), colour = NA) +
+  scale_fill_manual(values = c(Eligible = "grey85", `Airport or port` = "#c0392b", Water = "#2c7fb8"), name = "Constraint") +
   theme_void()
 ```
 
@@ -795,6 +803,7 @@ All variables are normalized to [0, 1] where 1 = highest priority for greening. 
 
 For recreational facilities, cells within 300 m walking distance receive minimum priority (WHO recommended access threshold).
 
+<!-- TODO: update text (2026-11-24): traffic is now OSM road type K3 (spec 3.4); the OpenTransportMap classes below are norm_traffic_otm, sensitivity only. -->
 Traffic uses an ordinal classification based on natural breaks in the density plot (Section 4.1).
 
 ```{r normalization}
@@ -826,12 +835,66 @@ norm_gpp_log <- function(x, populated, eligible) {
 gpp_populated <- malta$Total_Population > 0
 gpp_eligible  <- !malta$ua_not_eligible
 
+# Street greenery (spec 3.6, decided 2026-11-23): share of the 10 m street buffer covered by canopy of
+# 3 m or more (Meta and WRI canopy height v2), built in mcda/street_greenery_canopy_malta.Rmd. NA = no
+# street buffer in the cell (not applicable, spec 4.2). Variants for the sensitivity analysis: 15 m
+# buffer, 2 m and 5 m height, whole cell canopy. perc_tree (Street Tree Layer 2018) is kept for the
+# sensitivity analysis.
+canopy <- read_csv(here::here("data/malta/street_greenery_canopy_cells.csv"), show_col_types = FALSE) %>%
+  transmute(gid = as.character(gid), street_canopy_pct, street_canopy_pct_buf15, street_canopy_pct_2m,
+            street_canopy_pct_5m, cell_canopy_pct)
+stopifnot(nrow(canopy) == 10657, setequal(canopy$gid, malta$gid))
+malta <- malta %>%
+  select(-any_of(setdiff(names(canopy), "gid"))) %>%
+  left_join(canopy, by = "gid")
+
+# Cost criterion, linear: 1 minus min max, 0 to p98 over eligible cells with a value, capped at p98.
+# Cells with no street buffer: 0 (not applicable). na_as_zero = FALSE gives the option (a) variant (NA).
+norm_canopy <- function(x, na_as_zero = TRUE) {
+  up  <- quantile(x[!malta$ua_not_eligible], 0.98, na.rm = TRUE)
+  out <- 1 - normalize_minmax(x, lower = 0, upper = up)
+  if (na_as_zero) out[is.na(x)] <- 0
+  out
+}
+# Sensitivity: log10(x + 1), bounds 0 and the p98 of the log over eligible cells with a value
+norm_canopy_log1p <- function(x) {
+  lx <- log10(x + 1)
+  up <- quantile(lx[!malta$ua_not_eligible], 0.98, na.rm = TRUE)
+  out <- 1 - pmin(lx, up) / up
+  out[is.na(x)] <- 0
+  out
+}
+# The Urban Atlas class rule variant (agricultural and open land not applicable) was dropped on 2026-11-26:
+# eligibility of farmland is a question for the whole map, not for one criterion (CHANGELOG).
+
+# Traffic (spec 3.4, decided 2026-11-24): OSM road type in three classes (K3), tunnels excluded, built by
+# mcda/traffic_road_type_k3.R (same function in both cities). K2 and K5 kept for the sensitivity analysis.
+# The previous OpenTransportMap classes (new_trafficvol) are kept as norm_traffic_otm.
+source(here::here("mcda/traffic_road_type_k3.R"))
+rt_malta <- road_type_k3(
+  malta, "gid",
+  osm_path  = here::here("data/malta/accessibility_malta/own_routing/osm_highways_raw.gpkg"),
+  tags_path = here::here("data/malta/accessibility_malta/own_routing/osm_tunnel_covered_tags_2026-11-24.json"),
+  boundary  = st_sf(geometry = readRDS(here::here("data/malta/malta_union_boundary.rds")), crs = 3035))
+malta <- malta %>%
+  select(-any_of(c("road_class", "traffic_k2", "traffic_k3", "traffic_k5"))) %>%
+  left_join(rt_malta$cells %>% transmute(gid = as.character(gid), road_class,
+                                         traffic_k2 = K2, traffic_k3 = K3, traffic_k5 = K5), by = "gid")
+stopifnot(!anyNA(malta$traffic_k3))
+# Sensitivity: CAMS-REG vehicle km per cell (mcda/traffic_cams_reg_check.Rmd, Step 3, without service and track;
+# copied from output/figures_mcda/traffic_cams_reg_check/ to data/ on 2026-11-25, md5 identical)
+cams_vkm <- read_csv(here::here("data/malta/traffic_vkm_malta_cams.csv"),
+                     show_col_types = FALSE) %>% transmute(gid = as.character(gid), traffic_vkm_cams = traffic_vkm)
+stopifnot(nrow(cams_vkm) == 10657)
+malta <- malta %>% select(-any_of("traffic_vkm_cams")) %>% left_join(cams_vkm, by = "gid")
+
 malta <- malta %>%
   mutate(
     # Capped at p98 — relative indicator of intra-urban thermal variation
+    # Bounds over eligible cells only (constraint cells excluded from every bound, 2026-11-25)
     norm_lst = normalize_minmax(lst,
-                                lower = min(lst, na.rm = TRUE),
-                                upper = quantile(lst, 0.98, na.rm = TRUE)),
+                                lower = min(lst[!ua_not_eligible], na.rm = TRUE),
+                                upper = quantile(lst[!ua_not_eligible], 0.98, na.rm = TRUE)),
 
     # Natural bounds 0–100
     norm_imd = normalize_minmax(imd, lower = 0, upper = 100),
@@ -839,15 +902,23 @@ malta <- malta %>%
     # Capped at p98
     norm_dist_bs = normalize_minmax(dist_bs,
                                     lower = 0,
-                                    upper = quantile(dist_bs, 0.98, na.rm = TRUE)),
+                                    upper = quantile(dist_bs[!ua_not_eligible], 0.98, na.rm = TRUE)),
 
     # Capped at p98
     norm_Lden = normalize_minmax(Lden,
-                                 lower = min(Lden, na.rm = TRUE),
-                                 upper = quantile(Lden, 0.98, na.rm = TRUE)),
+                                 lower = min(Lden[!ua_not_eligible], na.rm = TRUE),
+                                 upper = quantile(Lden[!ua_not_eligible], 0.98, na.rm = TRUE)),
 
+    # Traffic (spec 3.4, since 2026-11-24): OSM road type, K3 (main 1, distributor 0.5, local or none 0)
+    norm_traffic = traffic_k3,
+    # Sensitivity variants (spec 5.3): K2, K5, CAMS-REG vehicle km (log10(x + 1), min max 0 to the p98 of
+    # eligible cells, capped), and the previous OpenTransportMap classes (main criterion until 2026-11-23)
+    norm_traffic_k2 = traffic_k2,
+    norm_traffic_k5 = traffic_k5,
+    norm_traffic_cams = normalize_minmax(log10(traffic_vkm_cams + 1), lower = 0,
+                                         upper = quantile(log10(traffic_vkm_cams + 1)[!ua_not_eligible], 0.98)),
     # Ordinal classification based on natural breaks in the density plot
-    norm_traffic = case_when(
+    norm_traffic_otm = case_when(
       new_trafficvol <= 3   ~ 0.00,
       new_trafficvol <= 30  ~ 0.25,
       new_trafficvol <= 100 ~ 0.50,
@@ -857,14 +928,22 @@ malta <- malta %>%
 
     # Capped at p98
     norm_no2 = normalize_minmax(no2_avg_21,
-                                lower = min(no2_avg_21, na.rm = TRUE),
-                                upper = quantile(no2_avg_21, 0.98, na.rm = TRUE)),
+                                lower = min(no2_avg_21[!ua_not_eligible], na.rm = TRUE),
+                                upper = quantile(no2_avg_21[!ua_not_eligible], 0.98, na.rm = TRUE)),
 
-    # Inverted: more trees = less priority. Capped at p98 of the current data (11.70% on
-    # 2026-11-19; spec 3.4, never hardcoded). Before, a hardcoded 14.18% from an earlier version.
-    # Cells above are parks/golf, captured by accessibility variable.
-    norm_tree = 1 - normalize_minmax(perc_tree, lower = 0,
-                                     upper = quantile(perc_tree, 0.98, na.rm = TRUE)),
+    # Street greenery (spec 3.6, since 2026-11-23): street canopy, linear, no street = 0
+    norm_tree = norm_canopy(street_canopy_pct),
+    # Sensitivity variants (spec 3.6)
+    norm_tree_log1p = norm_canopy_log1p(street_canopy_pct),
+    norm_tree_buf15 = norm_canopy(street_canopy_pct_buf15),
+    norm_tree_2m    = norm_canopy(street_canopy_pct_2m),
+    norm_tree_5m    = norm_canopy(street_canopy_pct_5m),
+    norm_tree_cell  = norm_canopy(cell_canopy_pct),
+    norm_tree_na    = norm_canopy(street_canopy_pct, na_as_zero = FALSE),
+    # Previous indicator (until 2026-11-22), sensitivity only: Street Tree Layer 2018, inverted,
+    # capped at the p98 (over all cells until 2026-11-24; over eligible cells since 2026-11-25).
+    norm_tree_stl = 1 - normalize_minmax(perc_tree, lower = 0,
+                                         upper = quantile(perc_tree[!ua_not_eligible], 0.98, na.rm = TRUE)),
 
     # Capped at p98 of eligible cells (airport and port excluded; decided 2026-11-20)
     norm_green_time = normalize_minmax(nearest_green_min,
@@ -880,7 +959,7 @@ malta <- malta %>%
     # Cells within 300 m walking distance = minimum priority (WHO threshold)
     norm_dist_rec = normalize_minmax(walk_dist_m,
                                      lower = 300,
-                                     upper = quantile(walk_dist_m, 0.98, na.rm = TRUE)),
+                                     upper = quantile(walk_dist_m[!ua_not_eligible], 0.98, na.rm = TRUE)),
 
     # Green per person: log10 version (see norm_gpp_log above). NAs stay missing and are handled
     # by the available weight rule (compute-wlc).
@@ -888,10 +967,10 @@ malta <- malta %>%
                                              gpp_populated, gpp_eligible)),
 
     # Sensitivity (spec 3.3): the score's version until 2026-11-19, raw m2 per person, min max
-    # capped at p98 over all cells, unpopulated cells included.
+    # capped at p98 over eligible cells (all cells until 2026-11-24), unpopulated cells included.
     norm_green_exp_minmax = 1 - normalize_minmax(green_m2_e2sfca_per_person_gauss,
                                                  lower = 0,
-                                                 upper = quantile(green_m2_e2sfca_per_person_gauss,
+                                                 upper = quantile(green_m2_e2sfca_per_person_gauss[!ua_not_eligible],
                                                                   0.98, na.rm = TRUE))
   )
 
@@ -910,6 +989,32 @@ ggplot(malta) +
   geom_sf(aes(fill = norm_green_exp), colour = NA) +
   scale_fill_viridis_c(option = "magma", direction = -1, na.value = "grey90",
                        name = "norm_green_exp\n(grey = unpopulated\nor unrouted)") +
+  theme_void()
+
+# Sanity checks for the street greenery criterion (spec 3.6)
+cat("Street canopy p98 (eligible cells with a street buffer):",
+    round(quantile(malta$street_canopy_pct[!malta$ua_not_eligible], 0.98, na.rm = TRUE), 2), "%\n")
+cat("Eligible cells with no street buffer (norm_tree = 0, not applicable):",
+    sum(is.na(malta$street_canopy_pct) & !malta$ua_not_eligible), "\n")
+summary(malta$street_canopy_pct)
+summary(malta$norm_tree)
+hist(malta$street_canopy_pct, breaks = 60, main = "street_canopy_pct (cells with a street buffer)", xlab = "%")
+ggplot(malta %>% filter(!ua_not_eligible)) +
+  geom_sf(aes(fill = norm_tree), colour = NA) +
+  scale_fill_viridis_c(option = "magma", direction = -1, name = "norm_tree\n(0 = no street\nor most canopy)") +
+  theme_void()
+
+# Sanity checks for the traffic criterion (spec 3.4, K3 since 2026-11-24)
+cat("Road type tunnels dropped (km by class):\n")
+print(st_drop_geometry(rt_malta$tunnels) %>% group_by(class) %>% summarise(km = round(sum(km), 2), ways = n()))
+cat("Cells whose class changes with the tunnel rule:", sum(rt_malta$cells$K3 != rt_malta$cells$K3_with_tunnels), "\n")
+table(road_class = malta$road_class, norm_traffic = malta$norm_traffic)
+summary(malta$norm_traffic)
+summary(malta$norm_traffic_cams)
+ggplot(malta %>% filter(!ua_not_eligible)) +
+  geom_sf(aes(fill = factor(norm_traffic, levels = c(0, 0.5, 1), labels = c("Local or none", "Distributor", "Main"))),
+          colour = NA) +
+  scale_fill_manual(values = c("grey90", "#9e9ac8", "#54278f"), name = "Traffic (K3)") +
   theme_void()
 
 norm_vars <- c("norm_lst", "norm_imd", "norm_dist_bs", "norm_Lden",
@@ -1175,6 +1280,8 @@ ggplot(malta) +
   theme_void()
 ```
 
+<!-- TODO: update text (2026-11-23): written for the Street Tree Layer score; check against the street canopy score. -->
+
 The neighbourhoods of **Valletta, Qormi, Ħamrun, Pietà, Marsa and Tarxien** receive higher priority under citizen weights (grey infrastructure, traffic and lack of street trees concentrate here). The **southwest periphery (Rabat area)** drops in priority mainly because citizens gave distance-to-blue-space only 3.3% of the budget vs 11.1% under equal weights.
 
 ```{r blue-space-driver}
@@ -1359,6 +1466,8 @@ cat("Correlation with vs without traffic:",
 
 ## Categorical vs log normalization for traffic
 
+<!-- TODO: update text (2026-11-24): this section compares the OpenTransportMap log version with the K3 main score; it is no longer in Table S6 (replaced by "Traffic variants" below), and the conclusion paragraph at the end refers to the old categorical criterion. -->
+
 ```{r traffic-log-norm}
 malta_b <- malta %>%
   mutate(
@@ -1535,6 +1644,8 @@ The two priority surfaces are nearly indistinguishable, confirming that the choi
 
 ## Green sufficiency: min max normalisation (sensitivity, added 2026-11-19)
 
+<!-- TODO: update text (2026-11-25): the p98 of this variant is now over eligible cells (constraint cells excluded), not all cells. -->
+
 The score's normalisation of green per person until 2026-11-19 (raw m² per person, min max capped at
 p98 over all cells, unpopulated cells included; spec 3.3). All other variables and weights are unchanged.
 
@@ -1561,35 +1672,49 @@ tibble(
   kable_styling(full_width = FALSE)
 ```
 
-## Sensitivity: ATGreen walking time and walking speed 4 km/h
+## Green per person: not applicable in unpopulated cells (sensitivity, added 2026-11-25)
+
+Green per person = 0 (not applicable, no need) in unpopulated cells instead of missing, consistent with
+the street greenery rule (spec 4.2). Everything else as in the main score. The scored set is recomputed
+with the available weight rule, so unpopulated cells that now reach 80% of the weight become scored.
+
+```{r green-exp-na0-sensitivity}
+malta_na0 <- malta %>% mutate(norm_green_exp = ifelse(!gpp_populated, 0, norm_green_exp))
+wa_na0 <- as.numeric((!is.na(crit_mat(malta_na0, weights))) %*% weights) / sum(weights)
+scored_na0 <- wa_na0 >= MIN_WEIGHT_AVAILABLE - 1e-12 & !malta$ua_not_eligible
+malta <- malta %>% mutate(priority_gpp_na0 = wlc_avail(malta_na0, weights, keep = scored_na0))
+stopifnot(all(scored_na0[malta$scored]))   # every main scored cell stays scored
+
+summary(malta_na0$norm_green_exp)
+hist(malta$priority_gpp_na0[scored_na0 & !malta$scored], breaks = 30,
+     main = "Variant score of newly scored cells", xlab = "priority_gpp_na0")
+ok_na0 <- !is.na(malta$priority_citizen) & !is.na(malta$priority_gpp_na0)
+q_m_na0 <- dplyr::ntile(malta$priority_citizen[ok_na0], 5); q_v_na0 <- dplyr::ntile(malta$priority_gpp_na0[ok_na0], 5)
+tibble(
+  check = c("Cells scored, main", "Cells scored, variant", "Cells newly scored (now reach 80% of the weight)",
+            "Spearman r (cells scored in both)", "Main top quintile also top in the variant (%)",
+            "Cells changing quintile by 2 or more"),
+  value = c(sum(malta$scored), sum(scored_na0), sum(scored_na0 & !malta$scored),
+            round(cor(malta$priority_citizen[ok_na0], malta$priority_gpp_na0[ok_na0], method = "spearman"), 3),
+            round(100 * mean(q_v_na0[q_m_na0 == 5] == 5), 1), sum(abs(q_v_na0 - q_m_na0) >= 2))
+) %>%
+  kable(caption = "Main vs green per person = 0 in unpopulated cells") %>%
+  kable_styling(full_width = FALSE)
+ggplot(malta %>% mutate(newly = scored_na0 & !scored)) +
+  geom_sf(aes(fill = newly), colour = NA) +
+  scale_fill_manual(values = c(`FALSE` = "grey85", `TRUE` = "#d95f02"), name = "Newly scored\nin the variant") +
+  theme_void()
+```
+
+## Sensitivity: ATGreen walking time
 
 `priority_atg_walk`: walking time from ATGreen (Valhalla) instead of our routing (2026-11-20).
 The "without green per person" check is replaced by the leave one out analysis below (2026-11-20).
 
-```{r walk-atg-and-4kmh-sensitivity}
+```{r walk-atg-sensitivity}
+# The walking speed 4 km/h variant was removed on 2026-11-25 (spec 5.3; see CHANGELOG).
 malta <- malta %>%
   mutate(priority_atg_walk = wlc_avail(malta %>% mutate(norm_green_time = norm_green_time_atg), weights))
-
-# Sensitivity, walking speed 4 km/h instead of 5 (spec 5.3). Walking time scales by 5/4, so its
-# normalised value is unchanged (min max with a p98 cap is scale invariant); green per person changes
-# because the Gaussian kernel (sigma 5 min) and the 15 min cutoff stay fixed in minutes.
-malta <- malta %>%
-  mutate(norm_green_time_4kmh = normalize_minmax(nearest_green_min * 5 / 4, lower = 0,
-                                                 upper = quantile((nearest_green_min * 5 / 4)[!ua_not_eligible],
-                                                                  0.98, na.rm = TRUE)),
-         norm_green_exp_4kmh = as.numeric(norm_gpp_log(green_m2_e2sfca_per_person_gauss_4kmh,
-                                                       gpp_populated, gpp_eligible)))
-cat("4 km/h: max abs change in norm_green_time:",
-    signif(max(abs(malta$norm_green_time_4kmh - malta$norm_green_time), na.rm = TRUE), 3),
-    "| Spearman green per person 4 vs 5 km/h:",
-    round(cor(malta$green_m2_e2sfca_per_person_gauss_4kmh, malta$green_m2_e2sfca_per_person_gauss,
-              method = "spearman", use = "complete.obs"), 3), "\n")
-summary(malta$green_m2_e2sfca_per_person_gauss_4kmh)
-hist(log10(malta$green_m2_e2sfca_per_person_gauss_4kmh[malta$green_m2_e2sfca_per_person_gauss_4kmh > 0]),
-     breaks = 50, main = "Green per person at 4 km/h (log10 m2, > 0)", xlab = "")
-malta <- malta %>%
-  mutate(priority_4kmh = wlc_avail(malta %>% mutate(norm_green_time = norm_green_time_4kmh,
-                                                    norm_green_exp = norm_green_exp_4kmh), weights))
 
 cmp_main <- function(x) {
   ok <- !is.na(malta$priority_citizen) & !is.na(x)
@@ -1599,8 +1724,7 @@ cmp_main <- function(x) {
     cells_changing_quintile_pct = round(100 * mean(q_x != q_m), 1),
     cells = sum(ok))
 }
-bind_rows(`ATGreen walking time` = cmp_main(malta$priority_atg_walk),
-          `Walking speed 4 km/h` = cmp_main(malta$priority_4kmh), .id = "variant") %>%
+bind_rows(`ATGreen walking time` = cmp_main(malta$priority_atg_walk), .id = "variant") %>%
   kable(caption = "Main score vs sensitivity variants (cells scored in both)") %>%
   kable_styling(full_width = FALSE)
 ```
@@ -1636,6 +1760,54 @@ ggplot(loo_m, aes(reorder(criterion_dropped, spearman), spearman)) + geom_col(fi
   coord_flip() + labs(x = NULL, y = "Spearman vs main score") + theme_minimal()
 ```
 
+## Street greenery variants (spec 3.6)
+
+Added 2026-11-23 with the switch to street canopy. Each variant replaces `norm_tree`, citizen weights,
+available weight rule. For option (a) (no street = missing instead of 0) the scored cells are recomputed
+with the 80% rule; comparisons use the cells scored in both.
+
+```{r street-greenery-variants}
+tree_variants <- c(`Street greenery: log10(x + 1)`                       = "norm_tree_log1p",
+                   `Street greenery: 15 m buffer`                        = "norm_tree_buf15",
+                   `Street greenery: canopy 2 m or more`                 = "norm_tree_2m",
+                   `Street greenery: canopy 5 m or more`                 = "norm_tree_5m",
+                   `Street greenery: whole cell canopy`                  = "norm_tree_cell",
+                   `Street greenery: no street as missing (option a)`    = "norm_tree_na",
+                   `Street greenery: Street Tree Layer 2018 (previous)`  = "norm_tree_stl")
+tree_scores <- map(tree_variants, function(v) {
+  d <- malta %>% mutate(norm_tree = .data[[v]])
+  wa <- as.numeric((!is.na(crit_mat(d, weights))) %*% weights) / sum(weights)
+  keep <- wa >= MIN_WEIGHT_AVAILABLE - 1e-12 & !d$ua_not_eligible
+  wlc_avail(d, weights, keep = keep)
+})
+tree_sens <- imap_dfr(tree_scores, ~ sens_cmp(.x) %>% mutate(variant = .y, scored_cells = sum(!is.na(.x)), .before = 1))
+tree_sens %>% mutate(across(where(is.double), ~ round(., 3))) %>%
+  kable(caption = "Street greenery variants vs the main score (cells scored in both)") %>%
+  kable_styling(full_width = FALSE)
+malta <- malta %>% mutate(priority_tree_stl = tree_scores[["Street greenery: Street Tree Layer 2018 (previous)"]],
+                          priority_tree_log1p = tree_scores[["Street greenery: log10(x + 1)"]])
+```
+
+## Traffic variants (spec 5.3)
+
+Added 2026-11-24 with the switch to road type K3. Each variant replaces `norm_traffic`, citizen weights,
+available weight rule; traffic has no missing values, so the scored cells do not change. Traffic excluded is
+in the leave one out table.
+
+```{r traffic-variants}
+traffic_variants <- c(`Traffic: road type K2`                          = "norm_traffic_k2",
+                      `Traffic: road type K5`                          = "norm_traffic_k5",
+                      `Traffic: CAMS-REG vehicle km (log10(x + 1))`    = "norm_traffic_cams",
+                      `Traffic: OpenTransportMap classes (previous)`   = "norm_traffic_otm")
+traffic_scores <- map(traffic_variants, function(v) wlc_avail(malta %>% mutate(norm_traffic = .data[[v]]), weights))
+traffic_sens <- imap_dfr(traffic_scores, ~ sens_cmp(.x) %>% mutate(variant = .y, scored_cells = sum(!is.na(.x)), .before = 1))
+traffic_sens %>% mutate(across(where(is.double), ~ round(., 3))) %>%
+  kable(caption = "Traffic variants vs the main score (cells scored in both)") %>%
+  kable_styling(full_width = FALSE)
+malta <- malta %>% mutate(priority_traffic_k2   = traffic_scores[[1]], priority_traffic_k5 = traffic_scores[[2]],
+                          priority_traffic_cams = traffic_scores[[3]], priority_traffic_otm = traffic_scores[[4]])
+```
+
 ## Sensitivity summary (Table S6)
 
 All variants against the main score on the cells scored in both: Spearman, top quintile retained,
@@ -1662,12 +1834,13 @@ malta_sensitivity <- bind_rows(
   loo_m %>% transmute(test_name = paste("Without", tolower(criterion_dropped)), spearman_r = fmt_r(spearman),
                       class_agreement = fmt_p(top_quintile_retained_pct),
                       cells_changing_quintile = fmt_p(cells_changing_quintile_pct)),
-  row_of("Traffic: log continuous instead of categorical", malta_b$priority_citizen_b),
+  imap_dfr(traffic_scores, ~ row_of(.y, .x)),
   row_of("Green per person: step weights E2SFCA", malta$priority_step_exp),
   row_of("Green per person: ATGreen E2SFCA", malta$priority_atg_exp),
   row_of("Green per person: min max instead of log", malta$priority_gpp_minmax),
+  row_of("Green per person: 0 in unpopulated cells (not applicable)", malta$priority_gpp_na0),
   row_of("Walking time: ATGreen (Valhalla)", malta$priority_atg_walk),
-  row_of("Walking speed 4 km/h", malta$priority_4kmh))
+  imap_dfr(tree_scores, ~ row_of(.y, .x)))
 malta_sensitivity %>% kable(caption = "Sensitivity summary, Malta") %>% kable_styling(full_width = FALSE)
 saveRDS(malta_sensitivity, file.path(data_dir, "malta_sensitivity.rds"))
 ```

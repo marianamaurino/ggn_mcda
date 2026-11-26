@@ -54,14 +54,15 @@ klag_master <- readRDS(here::here("data/klagenfurt/klagenfurt_master_full.rds"))
 klag_joins  <- readRDS(here::here("data/klagenfurt/klagenfurt_mcda_priority_may.rds")) %>%
   st_drop_geometry() %>%
   distinct(ID, .keep_all = TRUE) %>%
-  select(ID, nearest_green_min, no2_final, pm25_final, income_weighted)
+  select(ID, nearest_green_min, no2_final, pm25_final, income_weighted, norm_traffic_cat, ua_not_eligible)
 klag <- klag_master %>%
   select(ID, popdense_2020, lst, dist_bs, new_trafficvol) %>%
   left_join(klag_joins, by = "ID") %>%
   mutate(
-    # composite as the score reads it (Klagenfurt_MCDA_260520.Rmd, normalization)
-    air_composite = (minmax(log1p(no2_final), log1p(min(no2_final, na.rm = TRUE)), log1p(p98(no2_final))) +
-                     minmax(pm25_final, min(pm25_final, na.rm = TRUE), p98(pm25_final))) / 2)
+    # composite as the score reads it (Klagenfurt_MCDA_260520.Rmd, normalization; bounds over eligible cells)
+    air_composite = (minmax(log1p(no2_final), log1p(min(no2_final[!ua_not_eligible], na.rm = TRUE)),
+                            log1p(p98(no2_final[!ua_not_eligible]))) +
+                     minmax(pm25_final, min(pm25_final[!ua_not_eligible], na.rm = TRUE), p98(pm25_final[!ua_not_eligible]))) / 2)
 klag_border <- readRDS(here::here("data/klagenfurt/klagenfurt_boundary.rds")) %>% st_transform(3035)
 
 # ---- Checks (spec 1.1) --------------------------------------------------------------------
@@ -71,12 +72,14 @@ stopifnot(nrow(malta) == 10657, n_distinct(malta$gid) == 10657,
           nrow(klag) == 12418, n_distinct(klag$ID) == 12418, !anyNA(malta$pop_nso))
 
 # ---- Shared scale limits (spec 8.3: criteria in both cities; LST excepted, own scale per city) --
+# Legend limits over eligible cells only (constraint cells excluded, as in the score's bounds; 2026-11-25)
+e_m <- !malta$ua_not_eligible; e_k <- !klag$ua_not_eligible
+stopifnot(!anyNA(e_m), !anyNA(e_k))
 both <- function(a, b, lo = NULL) c(if (is.null(lo)) min(a, b, na.rm = TRUE) else lo, max(p98(a), p98(b)))
 LIM <- list(
-  no2        = both(malta$no2_avg_21, klag$no2_final),
-  dist_bs    = both(malta$dist_bs, klag$dist_bs, lo = 0),
-  traffic    = both(malta$new_trafficvol, klag$new_trafficvol, lo = 0),
-  green_time = both(malta$nearest_green_min, klag$nearest_green_min, lo = 0)
+  no2        = both(malta$no2_avg_21[e_m], klag$no2_final[e_k]),
+  dist_bs    = both(malta$dist_bs[e_m], klag$dist_bs[e_k], lo = 0),
+  green_time = both(malta$nearest_green_min[e_m], klag$nearest_green_min[e_k], lo = 0)
 )
 
 # ---- Raster drawing -----------------------------------------------------------------------
@@ -108,8 +111,9 @@ map_panel <- function(df, border, internal, fill_scale, tag, bar, guide = "colou
     (if (bar) lancet_scale_bar(bar_loc) else NULL) +
     coord_sf(xlim = bb[c("xmin", "xmax")], ylim = bb[c("ymin", "ymax")], crs = 3035,
              datum = NA, expand = TRUE) +
-    guides(fill = guide_colourbar(title.position = "top", barwidth = unit(30, "mm"),
-                                  barheight = unit(2, "mm"))) +
+    (if (inherits(fill_scale, "ScaleContinuous"))
+       guides(fill = guide_colourbar(title.position = "top", barwidth = unit(30, "mm"), barheight = unit(2, "mm")))
+     else guides(fill = guide_legend(title.position = "top", keywidth = unit(3, "mm"), keyheight = unit(2, "mm")))) +
     labs(tag = tag, x = NULL, y = NULL) +
     theme_lancet_map(base_size = 8) +
     theme(legend.position = "bottom", legend.title.position = "top",
@@ -143,8 +147,11 @@ PAL <- list(
 )
 sc <- list(
   no2     = grad(PAL$no2, LIM$no2, expression(NO[2] ~ "(µg/m³)")),
-  traffic = grad(PAL$traffic, LIM$traffic, "Traffic volume (vehicles, log scale)", trans = "log1p",
-                 breaks = c(0, 10, 100, 1000)),
+  # Traffic (spec 3.4, since 2026-11-24): OSM road type, three classes as the score reads them (K3);
+  # discrete legend, one palette for both cities
+  traffic = scale_fill_manual(values = c(`Local or none` = PAL$traffic[1], Distributor = PAL$traffic[3],
+                                         Main = PAL$traffic[5]),
+                              name = "Road type (highest road in the cell)", drop = FALSE, na.value = "grey88"),
   green_t = grad(PAL$green_t, LIM$green_time, "Walking time to green space (min)"),
   blue    = grad(PAL$blue, LIM$dist_bs, "Distance to blue space (m)")
 )
@@ -156,8 +163,9 @@ pop_scale <- function(x) {
 }
 
 # ---- Panel specs (order: spec 3.1 and 3.2, population first) ------------------------------
+traffic_class <- function(v) factor(v, levels = c(0, 0.5, 1), labels = c("Local or none", "Distributor", "Main"))
 mp <- pop_scale(malta$pop_nso)
-rec_cap <- p98(malta$walk_dist_m)
+rec_cap <- p98(malta$walk_dist_m[e_m])
 # Green per person as the score reads it (Malta_MCDA_260702_realloc.Rmd, norm_gpp_log, 2026-11-19):
 # log10 scale, bounds p2 and p98 of the log over eligible populated cells, zero = lowest value
 # (drawn at the lower bound), unpopulated cells missing (grey, like unrouted cells)
@@ -169,19 +177,23 @@ malta <- malta %>%
 stopifnot(identical(is.na(malta$gpp_map), is.na(malta$norm_green_exp)))   # same cells as the score
 malta_specs <- list(
   population = list("Population", "pop_nso", mp$scale, prep = function(v) if_else(v > 0, v, NA_real_)),
-  lst        = list("Urban heat", "lst", lst_scale(malta$lst)),
+  lst        = list("Urban heat", "lst", lst_scale(malta$lst[e_m])),
   no2        = list("Air quality", "no2_avg_21", sc$no2),
-  traffic    = list("Traffic", "new_trafficvol", sc$traffic),
+  traffic    = list("Traffic", "norm_traffic", sc$traffic, prep = function(v) traffic_class(v)),
   green_time = list("Green proximity", "nearest_green_min", sc$green_t),
   dist_bs    = list("Blue space", "dist_bs", sc$blue),
-  tree       = list("Street greenery", "perc_tree",
-                    grad(PAL$tree, c(0, p98(malta$perc_tree)), "Street tree cover (%)")),
+  # Street greenery as the score reads it (spec 3.6, since 2026-11-23): canopy share of the 10 m street
+  # buffer, cap at the p98 of eligible cells with a street buffer; grey = no street (not applicable,
+  # criterion score 0)
+  tree       = list("Street greenery", "street_canopy_pct",
+                    grad(PAL$tree, c(0, p98(malta$street_canopy_pct[!malta$ua_not_eligible])),
+                         "Street canopy cover (%; grey: no street)")),
   imd        = list("Grey infrastructure", "imd", grad(PAL$imd, c(0, 100), "Imperviousness (%)")),
   green_pp   = list("Green per person", "gpp_map",
                     grad(PAL$green_pp, gpp_lim, "Green space per person (m², E2SFCA, log scale)",
                          trans = "log10", breaks = c(0.1, 1, 10),
                          labels = scales::label_number(drop0trailing = TRUE))),
-  noise      = list("Noise", "Lden", grad(PAL$noise, c(min(malta$Lden, na.rm = TRUE), p98(malta$Lden)),
+  noise      = list("Noise", "Lden", grad(PAL$noise, c(min(malta$Lden[e_m], na.rm = TRUE), p98(malta$Lden[e_m])),
                                           expression("Noise," ~ L[den] ~ "(dB)"))),
   recreation = list("Recreation", "walk_dist_m",
                     grad(PAL$rec, c(0, rec_cap), "Walking distance to recreation (m)",
@@ -193,21 +205,21 @@ malta_specs <- list(
 kp <- pop_scale(klag$popdense_2020)
 klag_specs <- list(
   population = list("Population", "popdense_2020", kp$scale, prep = function(v) if_else(v > 0, v, NA_real_)),
-  lst        = list("Urban heat", "lst", lst_scale(klag$lst)),
+  lst        = list("Urban heat", "lst", lst_scale(klag$lst[e_k])),
   air        = list("Air quality", "air_composite",
                     grad(PAL$no2, c(0, 1), "Air quality index (0 to 1)",
                          accuracy = 0.1)),
-  traffic    = list("Traffic", "new_trafficvol", sc$traffic),
+  traffic    = list("Traffic", "norm_traffic_cat", sc$traffic, prep = function(v) traffic_class(v)),
   green_time = list("Green proximity", "nearest_green_min", sc$green_t),
   dist_bs    = list("Blue space", "dist_bs", sc$blue),
   income     = list("Low income areas", "income_weighted",
-                    grad(PAL$income, c(p02(klag$income_weighted), p98(klag$income_weighted)),
+                    grad(PAL$income, c(p02(klag$income_weighted[e_k]), p98(klag$income_weighted[e_k])),
                          "Income, spatially weighted (€)"))
 )
 klag_supp <- list(
   no2  = list("NO2", "no2_final", sc$no2),
   pm25 = list("PM2.5", "pm25_final",
-              grad(PAL$pm25, c(min(klag$pm25_final, na.rm = TRUE), p98(klag$pm25_final)),
+              grad(PAL$pm25, c(min(klag$pm25_final[e_k], na.rm = TRUE), p98(klag$pm25_final[e_k])),
                    expression(PM[2.5] ~ "(µg/m³)"), accuracy = 0.1))
 )
 
@@ -225,7 +237,7 @@ draw_city <- function(city, grid, border, internal, specs, fig_name, height_mm, 
     if (!is.null(s$prep)) df$value <- s$prep(df$value)
     extra <- if (!is.null(s$extra)) s$extra(df) else NULL
     lim <- s[[3]]$get_limits()
-    limits_report[[paste(city, id)]] <<- switch(s[[3]]$trans$name,
+    limits_report[[paste(city, id)]] <<- if (!inherits(s[[3]], "ScaleContinuous")) "three classes" else switch(s[[3]]$trans$name,
       log1p    = paste(round(expm1(lim), 1), collapse = " to "),
       `log-10` = paste(signif(10^lim, 3), collapse = " to "),
       paste(signif(lim, 4), collapse = " to "))

@@ -1,0 +1,550 @@
+---
+title: "Traffic: CAMS-REG check"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 9, fig.height = 5)
+```
+
+Check of CAMS-REG road traffic (Hohenberger et al. 2026, Earth Syst. Sci. Data 18, 3959 to 3978,
+doi 10.5194/essd-18-3959-2026; data Zenodo 10.5281/zenodo.15688722) as a traffic source for both cities.
+Instruction: `mcda/Traffic_instructions.Rmd` (24 November 2026). Rules: `mcda/MCDA_paper_results_spec.md`.
+Nothing is normalised and no score is changed or rerun.
+
+```{r libs}
+library(dplyr)
+library(tidyr)
+library(sf)
+library(ggplot2)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+source(here::here("R/theme_lancet.R"))
+
+CRS_M <- 3035
+# Archive root = parent of the folder that data/ links to (../ggn_analysis_archive), not in git
+ARCHIVE  <- dirname(normalizePath(here::here("data")))
+CAMS_DIR <- file.path(ARCHIVE, "cams_reg")
+GPKG     <- file.path(CAMS_DIR, "spatial_distribution_transport_cams_reg_v8.1_files", "em_vkm_vector_dataset_4326.gpkg")
+README   <- file.path(CAMS_DIR, "spatial_distribution_transport_cams_reg_v8.1_files", "Readme.txt")
+OUT_DIR  <- here::here("output/figures_mcda/traffic_cams_reg_check")
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+knitting <- function() isTRUE(getOption("knitr.in.progress"))
+ktab <- function(x, caption, digits = 3) {
+  x <- x %>% mutate(across(where(is.double), ~ round(., digits)))
+  if (!knitting()) { cat("\n", caption, "\n", sep = ""); print(as.data.frame(x), row.names = FALSE); return(invisible(x)) }
+  x %>% kable(caption = caption) %>% kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+}
+skew <- function(x) e1071::skewness(x[!is.na(x)], type = 2)
+top_q <- function(p) { q <- rep(NA_integer_, length(p)); q[!is.na(p)] <- ntile(p[!is.na(p)], 5); q }
+```
+
+# Step 0. Data
+
+```{r step0-version}
+md5 <- readLines(file.path(CAMS_DIR, "md5_check.txt"))
+cat(md5, sep = "\n")
+```
+
+Readme.txt, verbatim:
+
+```{r step0-readme, comment=""}
+cat(readLines(README), sep = "\n")
+```
+
+```{r step0-layer}
+lay <- st_layers(GPKG)
+lay
+LAYER <- lay$name[1]
+```
+
+# Step 1. Coverage
+
+```{r step1-areas}
+malta_grid <- readRDS(here::here("data/malta/malta_mcda_processed_realloc.rds")) %>%
+  transmute(gid = as.character(gid), NAME, Total_Population, ua_not_eligible, scored, new_trafficvol, norm_traffic)
+klag_grid <- readRDS(here::here("data/klagenfurt/klagenfurt_mcda_priority_may.rds")) %>%
+  transmute(ID, popdense_2020 = if ("popdense_2020" %in% names(.)) popdense_2020 else NA_real_, scored,
+            new_trafficvol, norm_traffic_cat)
+stopifnot(nrow(malta_grid) == 10657, n_distinct(malta_grid$gid) == 10657,
+          nrow(klag_grid) == 12418, n_distinct(klag_grid$ID) == 12418)
+areas <- list(
+  Malta      = st_sf(geometry = readRDS(here::here("data/malta/malta_union_boundary.rds")), crs = CRS_M),
+  Klagenfurt = readRDS(here::here("data/klagenfurt/klagenfurt_boundary.rds")) %>% st_transform(CRS_M) %>%
+                 st_union() %>% st_sf(geometry = .))
+areas <- lapply(areas, function(a) st_sf(geometry = st_union(st_geometry(a))))
+osm_files <- c(Malta = "data/malta/accessibility_malta/own_routing/osm_highways_raw.gpkg",
+               Klagenfurt = "data/klagenfurt/accessibility_klagenfurt/own_routing/osm_highways_raw.gpkg")
+```
+
+```{r step1-read}
+# Spatial filter: bounding box of the study area plus 500 m, read through the gpkg spatial index.
+# Clipped extracts cached in the archive.
+read_cams <- function(city) {
+  cache <- file.path(CAMS_DIR, paste0("cams_reg_", tolower(city), ".gpkg"))
+  if (!file.exists(cache)) {
+    bb <- st_as_sfc(st_bbox(st_buffer(areas[[city]], 500))) %>% st_transform(4326)
+    x <- st_read(GPKG, layer = LAYER, wkt_filter = st_as_text(bb), quiet = TRUE)
+    st_write(x, cache, quiet = TRUE)
+  }
+  x <- st_read(cache, quiet = TRUE) %>% st_transform(CRS_M)
+  x <- x[st_intersects(x, st_buffer(areas[[city]], 500), sparse = FALSE)[, 1], ]
+  x %>% mutate(len_km = as.numeric(st_length(.)) / 1000)
+}
+cams <- lapply(c(Malta = "Malta", Klagenfurt = "Klagenfurt"), read_cams)
+names(cams[[1]])
+for (cn in names(cams)) {
+  cat("\n", cn, ": links", nrow(cams[[cn]]), "\n")
+  print(summary(cams[[cn]]$trafficvol_final))
+}
+```
+
+```{r step1-coverage}
+cov_tab <- bind_rows(lapply(names(cams), function(cn) st_drop_geometry(cams[[cn]]) %>%
+  group_by(city = cn, ISO3_CODE, highway) %>% summarise(links = n(), km = sum(len_km), .groups = "drop"))) %>%
+  arrange(city, desc(km))
+ktab(cov_tab, "1. CAMS-REG links in each study area (500 m margin) by country and OSM class", 1)
+ktab(cov_tab %>% group_by(city, ISO3_CODE) %>% summarise(links = sum(links), km = sum(km), .groups = "drop"),
+     "1. By country", 1)
+stopifnot(any(cams$Malta$ISO3_CODE %in% c("MLT", "MT")), any(cams$Klagenfurt$ISO3_CODE %in% c("AUT", "AT")))
+```
+
+## Traffic source of each link
+
+`osm_otm` and `osm_otm_motorway`: random forest with OpenTransportMap attributes (links that matched
+OpenTransportMap); `osm_only` and `osm_only_motorway`: random forest without OpenTransportMap; `smallroads_4`,
+`smallroads_5`: spatial gap filling (30% and 15% of the mean tertiary AADT in 5 x 5 km cells). Definitions
+from Readme.txt and the paper.
+
+```{r step1-source}
+src_tab <- bind_rows(lapply(names(cams), function(cn) st_drop_geometry(cams[[cn]]) %>%
+  group_by(city = cn, source = trafficvol_final_source) %>% summarise(links = n(), km = sum(len_km), .groups = "drop") %>%
+  mutate(links_pct = 100 * links / sum(links), km_pct = 100 * km / sum(km))))
+ktab(src_tab, "1. Traffic source, share of links and of road length", 1)
+src_class <- bind_rows(lapply(names(cams), function(cn) st_drop_geometry(cams[[cn]]) %>%
+  group_by(city = cn, highway, source = trafficvol_final_source) %>% summarise(km = sum(len_km), .groups = "drop") %>%
+  group_by(city, highway) %>% mutate(km_pct = 100 * km / sum(km)) %>% ungroup() %>%
+  select(-km) %>% pivot_wider(names_from = source, values_from = km_pct, values_fill = 0)))
+ktab(src_class, "1. Traffic source by class, % of the class length", 1)
+otm_malta <- src_tab %>% filter(city == "Malta", grepl("otm", source)) %>% summarise(km = sum(km), links = sum(links))
+cat("Malta links with OpenTransportMap attributes:", otm_malta$links, "(", round(otm_malta$km, 1), "km )\n")
+```
+
+## Geometry: CAMS-REG vs our OSM extract
+
+Drivable classes = spec 3.6 classes plus motorway (and links). Our extract: the walking network extract
+(`own_routing/osm_highways_raw.gpkg`, November 2026). A road counts as missing where no CAMS-REG link is
+within 10 m (pieces of at most 20 m).
+
+```{r step1-geometry, fig.width=10, fig.height=6}
+DRIVE <- c("motorway", "trunk", "primary", "secondary", "tertiary", "unclassified", "residential",
+           "living_street", "pedestrian", paste0(c("motorway", "trunk", "primary", "secondary", "tertiary"), "_link"))
+osm <- lapply(names(osm_files), function(cn) {
+  st_read(here::here(osm_files[[cn]]), quiet = TRUE) %>% st_transform(CRS_M) %>%
+    filter(highway %in% DRIVE) %>% st_intersection(st_geometry(st_buffer(areas[[cn]], 500))) %>%
+    st_collection_extract("LINESTRING") %>% mutate(len_km = as.numeric(st_length(.)) / 1000)
+}) %>% setNames(names(osm_files))
+km_cmp <- bind_rows(lapply(names(cams), function(cn) full_join(
+  st_drop_geometry(cams[[cn]]) %>% group_by(highway) %>% summarise(cams_km = sum(len_km)),
+  st_drop_geometry(osm[[cn]]) %>% group_by(highway) %>% summarise(osm_km = sum(len_km)), by = "highway") %>%
+  mutate(city = cn, .before = 1))) %>% mutate(across(c(cams_km, osm_km), ~ coalesce(., 0))) %>% arrange(city, desc(osm_km))
+ktab(km_cmp, "1. km by class: CAMS-REG vs our OSM extract", 1)
+
+missing <- lapply(names(cams), function(cn) {
+  pcs <- st_segmentize(osm[[cn]], 20) %>% st_cast("LINESTRING", warn = FALSE)
+  pcs <- suppressWarnings(st_cast(st_cast(pcs, "MULTIPOINT"), "POINT"))  # vertices every <= 20 m
+  # rebuild 20 m pieces from consecutive vertices of each way
+  pcs <- pcs %>% group_by(osm_id, highway) %>% mutate(i = row_number()) %>% ungroup()
+  xy <- st_coordinates(pcs)
+  nxt <- c(seq_len(nrow(pcs))[-1], NA)
+  ok <- !is.na(nxt) & c(pcs$osm_id[-1], NA) == pcs$osm_id & c(pcs$i[-1], NA) == pcs$i + 1
+  segs <- st_sfc(lapply(which(ok), function(k) st_linestring(rbind(xy[k, 1:2], xy[nxt[k], 1:2]))), crs = CRS_M)
+  segs <- st_sf(highway = pcs$highway[ok], geometry = segs) %>% mutate(len_km = as.numeric(st_length(.)) / 1000)
+  near <- lengths(st_is_within_distance(segs, cams[[cn]], 10)) > 0
+  segs %>% mutate(missing = !near, city = cn)
+}) %>% setNames(names(cams))
+miss_tab <- bind_rows(lapply(missing, st_drop_geometry)) %>% group_by(city, highway) %>%
+  summarise(osm_km = sum(len_km), missing_km = sum(len_km[missing]), .groups = "drop") %>%
+  mutate(missing_pct = 100 * missing_km / osm_km) %>% arrange(city, desc(missing_km))
+ktab(miss_tab, "1. Our OSM drivable roads with no CAMS-REG link within 10 m", 1)
+ktab(miss_tab %>% group_by(city) %>% summarise(osm_km = sum(osm_km), missing_km = sum(missing_km)) %>%
+       mutate(missing_pct = 100 * missing_km / osm_km), "1. Missing, total", 1)
+
+p_miss <- lapply(names(missing), function(cn) ggplot() +
+  geom_sf(data = areas[[cn]], fill = "grey97", colour = "grey25", linewidth = 0.3) +
+  geom_sf(data = cams[[cn]], colour = "grey70", linewidth = 0.15) +
+  geom_sf(data = filter(missing[[cn]], missing), colour = "#d7301f", linewidth = 0.35) +
+  lancet_scale_bar("bl") + labs(tag = cn) + theme_lancet_map())
+p_m <- wrap_plots(p_miss, ncol = 2)
+p_m
+save_figure_lancet(p_m, "missing_roads_cams", OUT_DIR, height_mm = 100, width_mm = 180)
+```
+
+Grey: CAMS-REG links; red: our OSM drivable roads with no CAMS-REG link within 10 m.
+
+# Step 2. Plausibility
+
+```{r step2-dist}
+dist_tab <- bind_rows(lapply(names(cams), function(cn) st_drop_geometry(cams[[cn]]) %>%
+  group_by(city = cn, highway) %>%
+  summarise(links = n(), km = sum(len_km), aadt_median = median(trafficvol_final),
+            aadt_p10 = quantile(trafficvol_final, 0.1), aadt_p90 = quantile(trafficvol_final, 0.9),
+            at_minimum_pct = 100 * mean(trafficvol_final %in% c(15, 8)), .groups = "drop"))) %>%
+  arrange(city, desc(aadt_median))
+ktab(dist_tab, "2. AADT by class (vehicles per day); minimum = 15 or 8", 1)
+```
+
+## Malta: Regional Road
+
+Reference: about 57,000 vehicles per day, annual average daily traffic on Regional Road in 2019, as reported
+by AIS Environment ("Beyond the traffic: what Malta's roads reveal about growth"); not a Transport Malta
+publication, and a road wide figure, not a count at a stated point. No public count was found for the
+Kappara and Marsa junction roads.
+
+```{r step2-malta}
+osm_names_m <- st_read(here::here(osm_files[["Malta"]]), quiet = TRUE) %>% st_drop_geometry() %>%
+  transmute(osm_id = as.numeric(osm_id), name)
+rr <- cams$Malta %>% mutate(osm_id = as.numeric(osm_id)) %>% left_join(osm_names_m, by = "osm_id") %>%
+  filter(grepl("Reġjonali|Regjonali|Regional Road", name, ignore.case = TRUE))
+cat("Regional Road links matched by OSM name:", nrow(rr), "| km:", round(sum(rr$len_km), 2), "\n")
+print(table(rr$name, rr$highway))
+rr_tab <- st_drop_geometry(rr) %>%
+  summarise(links = n(), km = sum(len_km),
+            aadt_length_weighted_median = matrixStats::weightedMedian(trafficvol_final, len_km),
+            aadt_min = min(trafficvol_final), aadt_max = max(trafficvol_final)) %>%
+  mutate(official_2019 = 57000, ratio_median = aadt_length_weighted_median / official_2019)
+ktab(rr_tab, "2. Malta Regional Road: CAMS-REG AADT vs about 57,000 vehicles per day (2019)", 2)
+ggplot() + geom_sf(data = areas$Malta, fill = "grey97", colour = "grey40") +
+  geom_sf(data = cams$Malta, colour = "grey80", linewidth = 0.1) +
+  geom_sf(data = rr, aes(colour = trafficvol_final), linewidth = 0.8) +
+  scale_colour_viridis_c(name = "CAMS-REG AADT") + theme_lancet_map()
+```
+
+## Klagenfurt: Carinthia counting stations
+
+Source: Land Kärnten, Abteilung 9, "Verkehrsdaten 2019 Landesstraßen B" (strassenbau.ktn.gv.at, Verkehrszählung),
+JDTV 2019 (all motor vehicles, both directions). Stations are listed by road and section name, without
+coordinates. Stations named after a cross street are placed at the intersection of the road (OSM `ref`,
+Overpass extract cached in the archive) with the street of that name in our OSM extract; stations named after
+places or landmarks are not placed. Several sections carry the same JDTV (one counter assigned to neighbouring
+sections). No ASFINAG station level data for the A2 in the study area were found online.
+
+```{r step2-stations}
+stations <- tribble(
+  ~ref,  ~station,                 ~jdtv_2019,
+  "B70",  "Schachterlweg",          21850,
+  "B70",  "Ramsauerstraße",         19574,
+  "B70",  "Rosenbergstraße",        19574,
+  "B70",  "Enzenbergerstraße",      21531,
+  "B70c", "Mießtalerstraße",        20812,
+  "B70c", "Lastenstraße",           20812,
+  "B70c", "Bahnhofstraße",          15610,
+  "B70c", "10. Oktober Straße",     13975,
+  "B70c", "Rosentaler Straße",      13944,
+  "B70c", "Waidmannsdorfer Straße", 14386,
+  "B70c", "Koschatstraße",          18679,
+  "B70d", "Ebenthaler Straße",      18250,
+  "B70d", "Gerberweg",              19389,
+  "B70d", "Kirchengasse",           18018,
+  "B70d", "St. Ruprechter Str.",    16940,
+  "B70d", "Flatschacher Straße",    17251,
+  "B70d", "Rosentaler Straße",      20670,
+  "B70d", "Waidmannsdorfer Straße", 13538,
+  "B70d", "Siebenhügelstraße",      12165,
+  "B70d", "Süduferstraße",          10308,
+  "B83",  "Waltendorfer Straße",    17690,
+  "B83",  "Deutenhofenstraße",      21018,
+  "B83",  "Radetzkystraße",         18398,
+  "B83",  "Koschatstraße",          23351,
+  "B91",  "Villacher Ring",         25876,
+  "B91",  "Maximilianstraße",       27460,
+  "B91",  "Hirschenwirtstraße",     25665,
+  "B91",  "Südring",                28517)
+
+norm_name <- function(x) {
+  x <- tolower(x); x <- gsub("ß", "ss", x); x <- gsub("str\\.?$", "strasse", x)
+  x <- gsub("[^a-zäöü0-9]", "", x); x
+}
+# OSM ways with a ref tag (motorway to tertiary), Overpass extract of 24 November 2026, cached in the archive
+ov <- jsonlite::fromJSON(file.path(CAMS_DIR, "klagenfurt_osm_ref_ways.json"), simplifyVector = FALSE)$elements
+tag <- function(e, k) if (is.null(e$tags[[k]])) NA_character_ else e$tags[[k]]
+ref_ways <- st_sf(
+  osm_id = sapply(ov, function(e) e$id), ref = sapply(ov, tag, "ref"), name = sapply(ov, tag, "name"),
+  highway = sapply(ov, tag, "highway"), oneway = sapply(ov, tag, "oneway"),
+  geometry = st_sfc(lapply(ov, function(e) st_linestring(do.call(rbind, lapply(e$geometry, function(g) c(g$lon, g$lat))))),
+                    crs = 4326)) %>%
+  st_transform(CRS_M) %>% mutate(ref_n = gsub("\\s", "", ref))
+cat("OSM ways with ref:", nrow(ref_ways), "\n"); print(table(ref_ways$ref_n))
+osm_k <- st_read(here::here(osm_files[["Klagenfurt"]]), quiet = TRUE) %>% st_transform(CRS_M) %>%
+  filter(!is.na(name)) %>% mutate(name_n = norm_name(name))
+cams_k <- cams$Klagenfurt %>% mutate(osm_id = as.numeric(osm_id))
+
+locate <- function(rf, station) {
+  road <- ref_ways[sapply(strsplit(ref_ways$ref_n, ";"), function(r) rf %in% r), ]
+  cross <- osm_k %>% filter(name_n == norm_name(station))
+  if (nrow(road) == 0 || nrow(cross) == 0) return(NULL)
+  ix <- suppressWarnings(st_intersection(st_union(road), st_union(cross)))
+  if (length(ix) == 0 || st_is_empty(ix)) {
+    # cross street ends near the road (T junction): nearest point within 15 m
+    d <- st_distance(st_union(road), st_union(cross))
+    if (as.numeric(d) > 15) return(NULL)
+    ix <- st_cast(st_nearest_points(st_union(cross), st_union(road)), "POINT")[2]
+  }
+  pt <- st_centroid(st_union(st_cast(ix, "POINT")))
+  # CAMS-REG links of the same road (OSM way id) within 30 m; dual carriageway: one way per direction,
+  # so the AADT of the two directions is summed (each direction's maximum)
+  ids <- as.numeric(road$osm_id)
+  near <- cams_k[cams_k$osm_id %in% ids & lengths(st_is_within_distance(cams_k, pt, 30)) > 0, ]
+  if (nrow(near) == 0) return(st_sf(ref = rf, station = station, cams_aadt = NA_real_, cams_aadt_any_main = NA_real_,
+                                    cams_links = 0L, oneway = NA, geometry = pt))
+  ow <- road$oneway[match(near$osm_id, as.numeric(road$osm_id))] %in% c("yes", "-1", "true", "1")
+  val <- if (all(ow)) {
+    # group links by bearing (direction of travel), max per direction, sum
+    bear <- sapply(st_geometry(near), function(g) { xy <- st_coordinates(g); atan2(xy[nrow(xy), 2] - xy[1, 2], xy[nrow(xy), 1] - xy[1, 1]) })
+    dir <- cos(bear - bear[which.max(near$trafficvol_final)]) > 0
+    sum(tapply(near$trafficvol_final, dir, max))
+  } else max(near$trafficvol_final)
+  # Robustness: highest AADT of any main road link within 30 m, without matching the road
+  any_main <- cams_k[cams_k$highway %in% c("motorway", "trunk", "primary", "secondary", "tertiary") &
+                     lengths(st_is_within_distance(cams_k, pt, 30)) > 0, ]
+  st_sf(ref = rf, station = station, cams_aadt = val, cams_aadt_any_main = max(c(NA, any_main$trafficvol_final), na.rm = TRUE),
+        cams_links = nrow(near), oneway = all(ow), geometry = pt)
+}
+pts <- do.call(rbind, Filter(Negate(is.null), Map(locate, stations$ref, stations$station))) %>%
+  left_join(stations, by = c("ref", "station"))
+cat("Stations placed:", nrow(pts), "of", nrow(stations), "| with a CAMS-REG value:", sum(!is.na(pts$cams_aadt)), "\n")
+setdiff(paste(stations$ref, stations$station), paste(pts$ref, pts$station))
+pt_tab <- st_drop_geometry(pts) %>% mutate(ratio = cams_aadt / jdtv_2019) %>%
+  select(ref, station, official_jdtv_2019 = jdtv_2019, cams_aadt, ratio, cams_aadt_any_main, cams_links, oneway)
+ktab(pt_tab, "2. Klagenfurt: official JDTV 2019 vs CAMS-REG AADT", 2)
+ok <- !is.na(pt_tab$cams_aadt)
+sp_all <- cor(pt_tab$official_jdtv_2019[ok], pt_tab$cams_aadt[ok], method = "spearman")
+# distinct counts only (sections that share one counter value counted once)
+dd <- pt_tab[ok, ] %>% group_by(ref, official_jdtv_2019) %>% summarise(cams_aadt = median(cams_aadt), .groups = "drop")
+sp_dist <- cor(dd$official_jdtv_2019, dd$cams_aadt, method = "spearman")
+sp_any <- cor(pt_tab$official_jdtv_2019[ok], pt_tab$cams_aadt_any_main[ok], method = "spearman")
+ktab(tibble(set = c("All placed stations", "Distinct JDTV values per road", "All placed stations, highest main road link within 30 m"),
+            points = c(sum(ok), nrow(dd), sum(ok)),
+            spearman = c(sp_all, sp_dist, sp_any),
+            median_ratio = c(median(pt_tab$ratio[ok]), median(dd$cams_aadt / dd$official_jdtv_2019),
+                             median(pt_tab$cams_aadt_any_main[ok] / pt_tab$official_jdtv_2019[ok]))),
+     "2. Klagenfurt: rank agreement across counting points", 3)
+ggplot(pt_tab[ok, ], aes(official_jdtv_2019, cams_aadt, colour = ref)) + geom_point() +
+  geom_abline(linetype = "dashed", colour = "grey50") + labs(x = "Official JDTV 2019", y = "CAMS-REG AADT") + theme_lancet()
+```
+
+## Units check
+
+Readme.txt: `trafficvol_final` = "Estimated AADT"; `road_length` in metres; `vkm_*` = "VKM per road segment
+(thousands/day)". If `trafficvol_final` is vehicles per day for all vehicles on the link, then
+`trafficvol_final x road_length / 1000` (vehicle km per day) equals `vkm_abs_sum_speed_based_urh x 1000`.
+Ratios are computed on the full CAMS-REG links of each study area (500 m margin), before clipping to cells.
+
+```{r units-vkm}
+u_tab <- bind_rows(lapply(names(cams), function(cn) st_drop_geometry(cams[[cn]]) %>%
+  filter(road_length > 0, vkm_abs_sum_speed_based_urh > 0) %>%
+  mutate(r_readme = (trafficvol_final * road_length / 1000) / (vkm_abs_sum_speed_based_urh * 1000),
+         r_no_thousands = (trafficvol_final * road_length / 1000) / vkm_abs_sum_speed_based_urh) %>%
+  group_by(city = cn, highway) %>%
+  summarise(links = n(), median_ratio_x1000 = median(r_readme), min_ratio_x1000 = min(r_readme),
+            max_ratio_x1000 = max(r_readme), median_ratio_no_x1000 = median(r_no_thousands),
+            min_ratio_no_x1000 = min(r_no_thousands), max_ratio_no_x1000 = max(r_no_thousands), .groups = "drop") %>%
+  arrange(city, desc(links))))
+ktab(u_tab, "Units. (trafficvol_final x road_length / 1000) / (vkm_abs_sum_speed_based_urh x 1000), by class; also without the x 1000", 4)
+# road_length vs the geometry length (checks that road_length is the full link in metres)
+ktab(bind_rows(lapply(names(cams), function(cn) st_drop_geometry(cams[[cn]]) %>%
+  summarise(city = cn, median_road_length_over_geom = median(road_length / (len_km * 1000)),
+            p01 = quantile(road_length / (len_km * 1000), 0.01), p99 = quantile(road_length / (len_km * 1000), 0.99)))),
+  "Units. road_length / geometry length", 3)
+```
+
+Counting stations with CAMS-REG doubled on oneway links: a oneway link is taken to carry one direction, so its
+AADT is doubled; where the links of both directions (both carriageways) are found at the station, the
+direction maxima are summed and not doubled. Current criterion at the stations: `new_trafficvol` of the
+Klagenfurt grid (OpenTransportMap, value of the 100 m cell that contains the station point; also the highest
+value of the cells within 50 m).
+
+```{r units-stations}
+cams_dir_aadt <- function(rf, pt) {
+  road <- ref_ways[sapply(strsplit(ref_ways$ref_n, ";"), function(r) rf %in% r), ]
+  near <- cams_k[cams_k$osm_id %in% as.numeric(road$osm_id) & lengths(st_is_within_distance(cams_k, pt, 30)) > 0, ]
+  if (nrow(near) == 0) return(tibble(cams_aadt_oneway2 = NA_real_, directions = NA_integer_))
+  ow <- road$oneway[match(near$osm_id, as.numeric(road$osm_id))] %in% c("yes", "-1", "true", "1")
+  if (all(ow)) {
+    bear <- sapply(st_geometry(near), function(g) { xy <- st_coordinates(g); atan2(xy[nrow(xy), 2] - xy[1, 2], xy[nrow(xy), 1] - xy[1, 1]) })
+    dir <- cos(bear - bear[which.max(near$trafficvol_final)]) > 0
+    nd <- length(unique(dir))
+    v <- if (nd == 2) sum(tapply(near$trafficvol_final, dir, max)) else 2 * max(near$trafficvol_final)
+    tibble(cams_aadt_oneway2 = v, directions = nd)
+  } else tibble(cams_aadt_oneway2 = max(near$trafficvol_final * ifelse(ow, 2, 1)), directions = NA_integer_)
+}
+st2 <- bind_cols(pt_tab, bind_rows(lapply(seq_len(nrow(pts)), function(i) cams_dir_aadt(pts$ref[i], st_geometry(pts)[i]))))
+kg <- klag_grid %>% select(new_trafficvol)
+st2$otm_cell <- kg$new_trafficvol[sapply(st_intersects(pts, kg), function(i) if (length(i)) i[1] else NA)]
+st2$otm_max50 <- sapply(st_is_within_distance(pts, kg, 50), function(i) max(kg$new_trafficvol[i]))
+ktab(st2 %>% select(ref, station, official_jdtv_2019, oneway, directions, cams_aadt, cams_aadt_oneway2, otm_cell, otm_max50),
+     "Units. Stations: CAMS-REG as used, CAMS-REG doubled on oneway links, current OpenTransportMap cell value", 2)
+ok2 <- !is.na(st2$cams_aadt)
+sp_row <- function(lab, x) tibble(set = lab, points = sum(ok2 & !is.na(x)),
+  spearman = cor(st2$official_jdtv_2019[ok2], x[ok2], method = "spearman", use = "complete.obs"),
+  median_ratio = median(x[ok2] / st2$official_jdtv_2019[ok2], na.rm = TRUE))
+units_sp <- bind_rows(sp_row("CAMS-REG as in Step 2", st2$cams_aadt),
+                      sp_row("CAMS-REG doubled on oneway links", st2$cams_aadt_oneway2),
+                      sp_row("Current criterion new_trafficvol, station cell", st2$otm_cell),
+                      sp_row("Current criterion new_trafficvol, max of cells within 50 m", st2$otm_max50))
+ktab(units_sp, "Units. Klagenfurt counting stations: Spearman and median ratio to official JDTV 2019", 3)
+```
+
+# Step 3. Cell indicator
+
+`traffic_vkm` = sum over links in the cell of AADT x length inside the cell (km) = vehicle km per day.
+Main: all CAMS-REG classes except service and track. Sensitivity: all classes; main roads only. Cells with no
+kept link: 0.
+
+```{r step3-vkm}
+MAIN_ROADS <- c("motorway", "trunk", "primary", "secondary", "tertiary",
+                paste0(c("motorway", "trunk", "primary", "secondary", "tertiary"), "_link"))
+grids <- list(Malta = malta_grid %>% select(cell = gid), Klagenfurt = klag_grid %>% select(cell = ID))
+vkm_cells <- function(cn) {
+  cache <- file.path(CAMS_DIR, paste0("cams_reg_vkm_pieces_", tolower(cn), ".rds"))
+  if (!file.exists(cache)) {
+    p <- suppressWarnings(st_intersection(cams[[cn]] %>% select(highway, trafficvol_final), grids[[cn]])) %>%
+      st_collection_extract("LINESTRING") %>% mutate(km = as.numeric(st_length(.)) / 1000) %>% st_drop_geometry()
+    saveRDS(p, cache)
+  }
+  p <- readRDS(cache)
+  agg <- function(keep) p %>% filter(keep(highway)) %>% group_by(cell) %>% summarise(v = sum(trafficvol_final * km))
+  out <- st_drop_geometry(grids[[cn]]) %>%
+    left_join(agg(function(h) !h %in% c("service", "track")) %>% rename(traffic_vkm = v), by = "cell") %>%
+    left_join(agg(function(h) rep(TRUE, length(h))) %>% rename(traffic_vkm_all = v), by = "cell") %>%
+    left_join(agg(function(h) h %in% MAIN_ROADS) %>% rename(traffic_vkm_main = v), by = "cell") %>%
+    mutate(across(starts_with("traffic_vkm"), ~ coalesce(., 0)))
+  stopifnot(nrow(out) == nrow(grids[[cn]]))
+  out
+}
+vkm <- lapply(names(grids), vkm_cells) %>% setNames(names(grids))
+stopifnot(nrow(vkm$Malta) == 10657, nrow(vkm$Klagenfurt) == 12418)
+desc_vkm <- bind_rows(lapply(names(vkm), function(cn) bind_rows(lapply(c("traffic_vkm", "traffic_vkm_all", "traffic_vkm_main"), function(v) {
+  x <- vkm[[cn]][[v]]; elig <- if (cn == "Malta") !malta_grid$ua_not_eligible else rep(TRUE, length(x)); x <- x[elig]
+  tibble(city = cn, version = v, cells = length(x), zero_pct = 100 * mean(x == 0), median_above_0 = median(x[x > 0]),
+         q25_above_0 = quantile(x[x > 0], 0.25), q75_above_0 = quantile(x[x > 0], 0.75), skewness = skew(x),
+         skewness_log10_plus1 = skew(log10(x + 1)), p98 = quantile(x, 0.98))
+}))))
+ktab(desc_vkm, "3. traffic_vkm per cell (vehicle km per day), eligible cells", 2)
+for (cn in names(vkm)) { cat("\n", cn, "\n"); print(summary(vkm[[cn]]$traffic_vkm)) }
+h3 <- bind_rows(lapply(names(vkm), function(cn) tibble(city = cn, x = vkm[[cn]]$traffic_vkm)))
+ggplot(filter(h3, x > 0), aes(x)) + geom_histogram(bins = 60, fill = "grey40") + scale_x_log10() +
+  facet_wrap(~ city, scales = "free_y") + labs(x = "traffic_vkm, cells above 0 (log scale)", y = "Cells") + theme_lancet()
+```
+
+# Step 4. Comparison with the current criterion (OpenTransportMap)
+
+Malta current indicator: `new_trafficvol`; Klagenfurt current traffic score: `norm_traffic_cat` (3 classes;
+raw `new_trafficvol` also shown). Spearman and top quintile overlap (spec 5.1, 5.2) on eligible cells (Malta
+airport and port excluded) and on cells above 0 in either.
+
+```{r step4-compare}
+cur <- list(Malta = malta_grid %>% st_drop_geometry() %>% transmute(cell = gid, elig = !ua_not_eligible,
+                                                                    current = new_trafficvol, current_class = norm_traffic),
+            Klagenfurt = klag_grid %>% st_drop_geometry() %>% transmute(cell = ID, elig = TRUE,
+                                                                        current = norm_traffic_cat, current_raw = new_trafficvol,
+                                                                        current_class = norm_traffic_cat))
+cmp <- function(a, b, k) {
+  qa <- top_q(ifelse(k, a, NA)); qb <- top_q(ifelse(k, b, NA))
+  tibble(cells = sum(k), spearman = cor(a[k], b[k], method = "spearman"),
+         top_quintile_overlap_pct = 100 * mean(qb[which(qa == 5)] == 5))
+}
+t4 <- bind_rows(lapply(names(cur), function(cn) {
+  d <- cur[[cn]] %>% left_join(vkm[[cn]], by = "cell")
+  e <- d$elig & !is.na(d$current)
+  bind_rows(
+    cmp(d$current, d$traffic_vkm, e) %>% mutate(set = "Eligible cells"),
+    cmp(d$current, d$traffic_vkm, e & (d$current > 0 | d$traffic_vkm > 0)) %>% mutate(set = "Above 0 in either"),
+    if (cn == "Klagenfurt") cmp(d$current_raw, d$traffic_vkm, e) %>% mutate(set = "Eligible cells, raw new_trafficvol") else NULL) %>%
+    mutate(city = cn, .before = 1)
+}))
+ktab(t4, "4. Current criterion vs traffic_vkm (main version)", 3)
+
+xt <- lapply(names(cur), function(cn) {
+  d <- cur[[cn]] %>% left_join(vkm[[cn]], by = "cell") %>% filter(elig)
+  table(current_class = d$current_class, traffic_vkm_quintile = top_q(d$traffic_vkm))
+}) %>% setNames(names(cur))
+xt
+
+# Klagenfurt top class share with the Step 3 tie rule (>= p80, or > p80 if that class is above 25%)
+topclass <- function(x) { q <- quantile(x, 0.8, na.rm = TRUE); t <- x >= q; if (mean(t, na.rm = TRUE) > 0.25) t <- x > q; t }
+ks <- klag_grid$scored
+ktab(tibble(indicator = c("Current (norm_traffic_cat)", "traffic_vkm"),
+            top_class_pct_scored_cells = 100 * c(mean(topclass(klag_grid$norm_traffic_cat[ks])),
+                                                 mean(topclass(vkm$Klagenfurt$traffic_vkm[ks])))),
+     "4. Klagenfurt: share of scored cells in the top class (tie rule)", 1)
+```
+
+```{r step4-maps, fig.width=11, fig.height=8}
+lw_pt <- function(pt) pt / (ggplot2::.pt * 0.75)
+ras <- function(g) {
+  xy <- st_coordinates(st_centroid(st_geometry(g))); ox <- median(xy[, 1] %% 100); oy <- median(xy[, 2] %% 100)
+  tibble(x = round((xy[, 1] - ox) / 100) * 100 + ox, y = round((xy[, 2] - oy) / 100) * 100 + oy)
+}
+map_city <- function(cn, grid) {
+  d <- cur[[cn]] %>% left_join(vkm[[cn]], by = "cell")
+  q_c <- top_q(ifelse(d$elig, d$current, NA)); q_v <- top_q(ifelse(d$elig, d$traffic_vkm, NA))
+  df <- bind_cols(ras(grid), d) %>% mutate(change2 = !is.na(q_c) & abs(q_c - q_v) >= 2)
+  b <- areas[[cn]]; bb <- st_bbox(b)
+  mask <- st_sf(geometry = st_difference(st_as_sfc(st_bbox(st_buffer(b, 2000))), st_union(b)))
+  base <- function(p, bar) p + geom_sf(data = mask, fill = "white", colour = NA) +
+    geom_sf(data = b, fill = NA, colour = "grey25", linewidth = lw_pt(0.3)) +
+    (if (bar) lancet_scale_bar("bl") else NULL) +
+    coord_sf(xlim = bb[c("xmin", "xmax")], ylim = bb[c("ymin", "ymax")], crs = CRS_M, datum = NA) +
+    theme_lancet_map(base_size = 8) + theme(legend.position = "bottom")
+  p1 <- base(ggplot() + geom_raster(data = filter(df, elig), aes(x, y, fill = factor(current_class))) +
+               scale_fill_brewer(palette = "Purples", name = "Current traffic class") + labs(tag = paste(cn, "A")), TRUE)
+  p2 <- base(ggplot() + geom_raster(data = filter(df, elig), aes(x, y, fill = traffic_vkm + 1)) +
+               scale_fill_viridis_c(trans = "log10", option = "magma", direction = -1, name = "traffic_vkm + 1 (log scale)") +
+               labs(tag = "B"), FALSE)
+  p3 <- base(ggplot() + geom_raster(data = filter(df, elig), aes(x, y, fill = change2)) +
+               scale_fill_manual(values = c(`FALSE` = "grey90", `TRUE` = "#d7301f"), name = "Quintile change >= 2") +
+               labs(tag = "C"), FALSE)
+  p1 + p2 + p3
+}
+m4 <- map_city("Malta", malta_grid) / map_city("Klagenfurt", klag_grid)
+m4
+save_figure_lancet(m4, "traffic_current_vs_cams", OUT_DIR, height_mm = 200, width_mm = 180)
+```
+
+# Step 6. Decision rule
+
+```{r step6}
+dec <- tibble(
+  condition = c("MT present", "AT present", "Traffic field is AADT per link",
+                "Klagenfurt counting point ranks not contradicted (Spearman >= 0.5, at least 5 points)",
+                "Malta counting points (at least 5)", "Malta has OpenTransportMap data inside CAMS-REG"),
+  result = c(any(cams$Malta$ISO3_CODE %in% c("MLT", "MT")), any(cams$Klagenfurt$ISO3_CODE %in% c("AUT", "AT")),
+             TRUE, sum(ok) >= 5 && sp_all >= 0.5, FALSE, otm_malta$links > 0))
+ktab(dec, "6. Decision rule")
+```
+
+```{r outputs}
+readr::write_csv(cov_tab, file.path(OUT_DIR, "coverage_cams.csv"))
+readr::write_csv(src_tab, file.path(OUT_DIR, "traffic_source_cams.csv"))
+readr::write_csv(km_cmp, file.path(OUT_DIR, "km_by_class_cams_vs_osm.csv"))
+readr::write_csv(miss_tab, file.path(OUT_DIR, "missing_roads_cams.csv"))
+readr::write_csv(dist_tab, file.path(OUT_DIR, "aadt_by_class_cams.csv"))
+readr::write_csv(rr_tab, file.path(OUT_DIR, "malta_regional_road_cams.csv"))
+readr::write_csv(pt_tab, file.path(OUT_DIR, "klagenfurt_counts_vs_cams.csv"))
+readr::write_csv(desc_vkm, file.path(OUT_DIR, "traffic_vkm_summary_cams.csv"))
+readr::write_csv(t4, file.path(OUT_DIR, "current_vs_traffic_vkm_cams.csv"))
+readr::write_csv(vkm$Malta %>% rename(gid = cell), file.path(OUT_DIR, "traffic_vkm_malta_cams.csv"))
+readr::write_csv(vkm$Klagenfurt %>% rename(ID = cell), file.path(OUT_DIR, "traffic_vkm_klagenfurt_cams.csv"))
+```
+
+```{r session}
+sessionInfo()
+```

@@ -1,0 +1,54 @@
+# Code-only repo. Data and outputs live in ../ggn_analysis_archive (shared with ggn_analysis)
+# and are reached through symlinks.
+
+# --- data / output symlinks ---
+/data
+/output
+/mcda/exposure
+/mcda/accessibility
+
+# --- render artifacts ---
+*_cache/
+*_files/
+*.html
+*.pdf
+*.log
+*.tex
+*.png
+*.jpg
+*.svg
+*.docx
+*.pptx
+*.xlsx
+*.zip
+.quarto/
+
+# --- data formats, in case one lands outside the folders above ---
+*.csv
+*.rds
+*.Rds
+*.RData
+*.rdata
+*.gpkg
+*.geojson
+*.parquet
+*.feather
+*.tif
+*.tiff
+*.shp
+*.nc
+
+# --- R / OS / tooling ---
+.Rhistory
+.Rhistory*
+.RData*
+.Ruserdata
+.Rproj.user/
+.claude/
+.secrets/
+.httr-oauth
+client_secret*.json
+@eaDir/
+Thumbs.db
+.DS_Store
+*~
